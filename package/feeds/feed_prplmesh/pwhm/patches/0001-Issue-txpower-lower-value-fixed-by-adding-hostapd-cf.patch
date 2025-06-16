@@ -1,0 +1,23 @@
+From 3988fc268120e9dd4cf5338df11d7e8f96d9c6d3 Mon Sep 17 00:00:00 2001
+From: Mohan Raj <mrajraje@qti.qualcomm.com>
+Date: Mon, 16 Jun 2025 18:01:36 +0530
+Subject: [PATCH] qca: Add fix for 6G low txpower
+
+Change-Id: Iaf55a27b8d52c0b8d30f13ed7e2c8853bcc44c3d
+Signed-off-by: Mohan Raj <mrajraje@qti.qualcomm.com>
+
+diff --git a/src/nl80211/wld_hostapd_cfgFile.c b/src/nl80211/wld_hostapd_cfgFile.c
+index ec33e73..c004518 100644
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -452,6 +452,10 @@ void wld_hostapd_cfgFile_setRadioConfig(T_Radio* pRad, swl_mapChar_t* radConfigM
+                 swl_mapChar_add(radConfigMap, "he_spr_srg_partial_bssid", srgPartialBSSIDBitmap);
+             }
+         }
++        if(pRad->operatingFrequencyBand == SWL_FREQ_BAND_EXT_6GHZ) {
++            SAH_TRACEZ_INFO(ME, "%s: Adding 6GHz HE Caps parameters", pRad->Name);
++	    swl_mapCharFmt_addValInt32(radConfigMap, "he_6ghz_reg_pwr_type", 0);   // corresponds to 6GHZ tx power
++        }
+     }
+     if(SWL_BIT_IS_SET(pRad->supportedStandards, SWL_RADSTD_BE)) {
+         swl_mapCharFmt_addValInt32(radConfigMap, "ieee80211be", wld_rad_checkEnabledRadStd(pRad, SWL_RADSTD_BE));
