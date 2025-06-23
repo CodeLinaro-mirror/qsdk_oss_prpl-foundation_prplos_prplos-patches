@@ -1,0 +1,30 @@
+From 935b6d076abcf977d75c634aed14ffef72ad72d1 Mon Sep 17 00:00:00 2001
+From: Mohan Raj <mrajraje@qti.qualcomm.com>
+Date: Mon, 23 Jun 2025 20:13:29 +0530
+Subject: [PATCH] qca: Fix_ODL_generator_producing_invalid_wld.odl
+
+Change-Id: Ibf065268899b0c9a8c072da7ad42583103cc651b
+Signed-off-by: Mohan Raj <mrajraje@qti.qualcomm.com>
+
+diff --git a/files/netlayout_from_uci.sh b/files/netlayout_from_uci.sh
+index 1b7e73d..149ed33 100755
+--- a/files/netlayout_from_uci.sh
++++ b/files/netlayout_from_uci.sh
+@@ -373,7 +373,7 @@ count_matching_lines()
+ wait_for_uci_wireless() {
+	local phy_count
+	local uci_count
+-	local timeout=3
++	local timeout=30
+	local elapsed=0
+	local min_phy=0
+	local timeout_uci=$(uci -q get wireless.vendor.phy_detect_timeout)
+@@ -385,7 +385,7 @@ wait_for_uci_wireless() {
+	phy_count=$(iw phy | grep -c Wiphy)
+	uci_count=$(count_matching_lines 'wifi-device.*radio' /etc/config/wireless)
+
+-	while ([ "$phy_count" -lt "$min_phy" ] || [ "$phy_count" -ne "$uci_count" ]) && [ $elapsed -lt $timeout ]; do
++	while [ $elapsed -lt $timeout ]; do
+		phy_count=$(iw phy | grep -c Wiphy)
+		uci_count=$(count_matching_lines 'wifi-device.*radio' /etc/config/wireless)
+		elapsed=$((elapsed + 1))
