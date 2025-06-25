@@ -1,0 +1,19 @@
+From 36c5d4a70522334980c9defa0bbdb8e422cba4d1 Mon Sep 17 00:00:00 2001
+From: Ram Chandra Jangir <rjangir@qti.qualcomm.com>
+Date: Wed, 25 Jun 2025 22:47:53 +0530
+Subject: [PATCH] pwhm: Add ppe+DS support
+
+Change-Id: I835faea3d2606fb24f71fa9bd5c0eabe2bab3c60
+Signed-off-by: Ram Chandra Jangir <rjangir@qti.qualcomm.com>
+---
+
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -768,6 +768,7 @@ static bool s_setVapCommonConfig(T_Acces
+     if(pRad->dtimPeriod > 0) {
+         swl_mapCharFmt_addValInt32(vapConfigMap, "dtim_period", pRad->dtimPeriod);
+     }
++    swl_mapCharFmt_addValInt32(vapConfigMap, "ppe_vp", 3);
+     swl_mapCharFmt_addValInt32(vapConfigMap, "ap_isolate", pAP->clientIsolationEnable);
+     swl_mapChar_add(vapConfigMap, "ignore_broadcast_ssid", pAP->SSIDAdvertisementEnabled ? "0" : "2");
+     if(!pAP->enable || !pRad->enable) {
