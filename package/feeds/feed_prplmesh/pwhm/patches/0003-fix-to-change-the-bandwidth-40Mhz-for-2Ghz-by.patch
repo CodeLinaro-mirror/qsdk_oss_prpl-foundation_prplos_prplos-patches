@@ -1,0 +1,29 @@
+From 3b41e6c042c77ffe3741f703fe4d8521cb94cc41 Mon Sep 17 00:00:00 2001
+From: Atchaya R <ratchaya@qti.qualcomm.com>
+Date: Thu, 5 Dec 2024 18:25:00 +0530
+Subject: [PATCH] Added fix to change the bandwidth(40Mhz) for 2Ghz by enabling
+ params ht_coex,noscan in hostapd cfg via pwhm
+
+Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
+---
+ src/nl80211/wld_hostapd_cfgFile.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/nl80211/wld_hostapd_cfgFile.c b/src/nl80211/wld_hostapd_cfgFile.c
+index 3668067..a3e2a09 100644
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -242,6 +242,10 @@ void wld_hostapd_cfgFile_setRadioConfig(T_Radio* pRad, swl_mapChar_t* radConfigM
+     if(SWL_BIT_IS_SET(pRad->supportedStandards, SWL_RADSTD_N)) {
+         swl_mapCharFmt_addValInt32(radConfigMap, "ieee80211n", wld_rad_checkEnabledRadStd(pRad, SWL_RADSTD_N));
+     }
++    if (wld_rad_is_24ghz(pRad) && pRad->obssCoexistenceActive == 0) {
++        swl_mapChar_add(radConfigMap, "ht_coex", "0");
++        swl_mapChar_add(radConfigMap, "noscan", "1");
++    }
+     if(wld_rad_checkEnabledRadStd(pRad, SWL_RADSTD_N)) {
+         char htCaps[256] = {0};
+         if(wld_channel_hasChannelWidthCovered(tgtChspec, SWL_BW_40MHZ)) {
+-- 
+2.25.1
+
