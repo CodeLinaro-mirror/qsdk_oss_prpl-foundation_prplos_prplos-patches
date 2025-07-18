@@ -1,0 +1,316 @@
+From 646447c87b42ca83170a37b6cbf02d243a1793f7 Mon Sep 17 00:00:00 2001
+From: Vinu Bharath R <vinubhar@qti.qualcomm.com>
+Date: Mon, 14 Jul 2025 15:51:54 +0530
+Subject: [PATCH] AP MLD Reconfig pWHM Implementation
+
+Signed-off-by: Vinu Bharath R <vinubhar@qti.qualcomm.com>
+---
+ include/wld/wld_accesspoint.h    |  2 +-
+ include/wld/wld_hostapd_ap_api.h |  2 ++
+ include/wld/wld_mld.h            |  2 ++
+ include/wld/wld_radio.h          |  1 +
+ include/wld/wld_ssid.h           |  1 +
+ src/nl80211/wld_hostapd_ap_api.c |  8 +++++++
+ src/wld.c                        |  2 +-
+ src/wld_accesspoint.c            | 18 +++++++-------
+ src/wld_mld.c                    | 23 ++++++++++++++++++
+ src/wld_radio.c                  | 13 +++++++++++
+ src/wld_ssid.c                   | 40 +++++++++++++++++++++++++++++++-
+ 11 files changed, 101 insertions(+), 11 deletions(-)
+
+diff --git a/include/wld/wld_accesspoint.h b/include/wld/wld_accesspoint.h
+index 96fd2aa..b56e46a 100644
+--- a/include/wld/wld_accesspoint.h
++++ b/include/wld/wld_accesspoint.h
+@@ -74,7 +74,7 @@ T_AccessPoint* wld_ap_create(T_Radio* pRad, const char* vapName, uint32_t idx);
+ T_AccessPoint* wld_ap_fromObj(amxd_object_t* apObj);
+ int wld_ap_initializeVendor(T_Radio* pR, T_AccessPoint* pAP, T_SSID* pSSID);
+ int wld_ap_init(T_AccessPoint* pAP);
+-void wld_ap_destroy(T_AccessPoint* pAP);
++void wld_ap_destroy(T_AccessPoint* pAP, bool do_sync);
+ 
+ typedef struct {
+     const char* mac;
+diff --git a/include/wld/wld_hostapd_ap_api.h b/include/wld/wld_hostapd_ap_api.h
+index 7c34770..f7cbe23 100644
+--- a/include/wld/wld_hostapd_ap_api.h
++++ b/include/wld/wld_hostapd_ap_api.h
+@@ -149,4 +149,6 @@ bool wld_hostapd_ap_needWpaCtrlIface(T_AccessPoint* pAP);
+ const char* wld_hostapd_ap_selectApLinkIface(T_AccessPoint* pAP);
+ bool wld_ap_hostapd_isMainStaMldLink(T_AccessPoint* pAP, swl_macBin_t* pMacBin);
+ 
++bool wld_hostapd_ap_remove_link(T_AccessPoint* pAP);
++
+ #endif /* __WLD_AP_API_H__ */
+diff --git a/include/wld/wld_mld.h b/include/wld/wld_mld.h
+index 3ce08e5..6c890b7 100644
+--- a/include/wld/wld_mld.h
++++ b/include/wld/wld_mld.h
+@@ -118,6 +118,8 @@ wld_mldLink_t* wld_mld_getNeighLinkByRad(wld_mldLink_t* pLink, T_Radio* pRad);
+ 
+ wld_mldLink_t* wld_mld_firstNeighLink(wld_mldLink_t* pLink);
+ wld_mldLink_t* wld_mld_nextNeighLink(wld_mldLink_t* pLink);
++// Reconfig - Remove Link
++bool wld_reconfig_remove_link(wld_mldLink_t* pLink);
+ 
+ #define wld_for_eachNeighMldLink(pNeighLink, pRefLink) \
+     for(pNeighLink = wld_mld_firstNeighLink(pRefLink); pNeighLink; pNeighLink = wld_mld_nextNeighLink(pNeighLink))
+diff --git a/include/wld/wld_radio.h b/include/wld/wld_radio.h
+index 385fd5b..7d73be6 100644
+--- a/include/wld/wld_radio.h
++++ b/include/wld/wld_radio.h
+@@ -155,6 +155,7 @@ T_EndPoint* wld_rad_getEpByIndex(T_Radio* pRad, int index);
+ amxd_object_t* ssid_create(amxd_object_t* pBus, T_Radio* pR, const char* name);
+ bool radio_scanresults_to_variant(T_Radio* radio, amxc_var_t* variant_out);
+ bool wld_radio_notify_scanresults(amxd_object_t* obj);
++bool wld_rad_notify_ReconfigComplete(T_Radio *pR, bool success);
+ bool wld_radio_stats_to_variant(T_Radio* a, T_Stats* stats, amxc_var_t* map);
+ bool wld_radio_scanresults_find(T_Radio* pR, const char* ssid, wld_scanResultSSID_t* output);
+ bool wld_radio_scanresults_cleanup(wld_scanResults_t* results);
+diff --git a/include/wld/wld_ssid.h b/include/wld/wld_ssid.h
+index faf22a5..55e28e6 100644
+--- a/include/wld/wld_ssid.h
++++ b/include/wld/wld_ssid.h
+@@ -77,6 +77,7 @@ void wld_ssid_generateMac(T_Radio* pRad, T_SSID* pSSID, uint32_t index, swl_macB
+ void wld_ssid_setMac(T_SSID* pSSID, swl_macBin_t* macBin);
+ bool wld_ssid_hasAutoMacBssIndex(T_SSID* pSSID, int32_t* pBssIndex);
+ int32_t wld_rad_getHighestVapAutoMacBssIndex(T_Radio* pRad);
++void wld_ssid_destroy(T_SSID* pSSID);
+ 
+ T_SSID* wld_ssid_createApSsid(T_AccessPoint* pAP);
+ T_SSID* wld_ssid_fromObj(amxd_object_t* ssidObj);
+diff --git a/src/nl80211/wld_hostapd_ap_api.c b/src/nl80211/wld_hostapd_ap_api.c
+index 73abd92..dc4df36 100644
+--- a/src/nl80211/wld_hostapd_ap_api.c
++++ b/src/nl80211/wld_hostapd_ap_api.c
+@@ -1455,3 +1455,11 @@ const char* wld_hostapd_ap_selectApLinkIface(T_AccessPoint* pAP) {
+     return wld_ssid_getIfName(pLinkSSID);
+ }
+ 
++bool wld_hostapd_ap_remove_link(T_AccessPoint* pAP) {
++    // Remove Link
++    char cmd[256] = {'\0'};
++    uint8_t tbtt_cnt = 10;
++    snprintf(cmd, sizeof(cmd), "LINK_REMOVE %u", tbtt_cnt);
++    // Send WPA_CTRL message to remove link
++    return s_sendHostapdCommand(pAP, cmd, "Reconfig APMLD remove link");
++}
+diff --git a/src/wld.c b/src/wld.c
+index 18be490..47c938a 100644
+--- a/src/wld.c
++++ b/src/wld.c
+@@ -602,7 +602,7 @@ void wld_deleteAllVaps() {
+     wld_for_eachRad(pRad) {
+         amxc_llist_for_each(it, &pRad->llAP) {
+             T_AccessPoint* pAP = wld_ap_fromIt(it);
+-            wld_ap_destroy(pAP);
++            wld_ap_destroy(pAP, true);
+         }
+     }
+ }
+diff --git a/src/wld_accesspoint.c b/src/wld_accesspoint.c
+index f7ff185..3ae3134 100644
+--- a/src/wld_accesspoint.c
++++ b/src/wld_accesspoint.c
+@@ -242,7 +242,7 @@ static void s_setDefaults(T_AccessPoint* pAP, T_Radio* pRad, const char* vapName
+  *
+  * @param accesspoint context
+  */
+-static void s_deinitAP(T_AccessPoint* pAP) {
++static void s_deinitAP(T_AccessPoint* pAP, bool do_sync) {
+     ASSERTS_NOT_NULL(pAP, , ME, "NULL");
+     SAH_TRACEZ_IN(ME);
+     //assume disable ap
+@@ -261,8 +261,10 @@ static void s_deinitAP(T_AccessPoint* pAP) {
+         SAH_TRACEZ_WARNING(ME, "DELETE HOOK %s", pAP->name);
+         /* Destroy vap*/
+         pR->pFA->mfn_wvap_destroy_hook(pAP);
+-        /* Sync Rad */
+-        wld_rad_doSync(pR);
++        if (do_sync) {
++            /* Sync Rad */
++            wld_rad_doSync(pR);
++        }
+         if(pAP->index > 0) {
+             /* Try to delete the requested interface by calling the HW function */
+             pR->pFA->mfn_wrad_delvapif(pR, pAP->alias);
+@@ -290,7 +292,7 @@ static void s_deinitAP(T_AccessPoint* pAP) {
+     if(pSSID != NULL) {
+         memset(pSSID->MACAddress, 0, ETHER_ADDR_LEN);
+         pSSID->AP_HOOK = NULL;
+-        if(pR) {
++        if(pR && do_sync) {
+             pR->pFA->mfn_sync_ssid(pSSID->pBus, pSSID, SET);
+         }
+         pAP->pSSID = NULL;
+@@ -360,7 +362,7 @@ static amxd_status_t _linkApSsid(amxd_object_t* object, amxd_object_t* pSsidObj)
+     T_AccessPoint* pAP = (T_AccessPoint*) object->priv;
+     if(pAP != NULL) {
+         ASSERTI_NOT_EQUALS(pSSID, pAP->pSSID, amxd_status_ok, ME, "same ssid reference");
+-        s_deinitAP(pAP);
++        s_deinitAP(pAP, true);
+     }
+     const char* vapName = amxd_object_get_name(object, AMXD_OBJECT_NAMED);
+     ASSERT_NOT_NULL(vapName, amxd_status_unknown_error, ME, "NULL");
+@@ -454,7 +456,7 @@ amxd_status_t _wld_ap_delInstance_odf(amxd_object_t* object,
+     ASSERTS_EQUALS(amxd_object_get_type(object), amxd_object_instance, status, ME, "obj is not instance");
+     const char* name = amxd_object_get_name(object, AMXD_OBJECT_NAMED);
+     SAH_TRACEZ_INFO(ME, "%s: destroy instance object(%p)", name, object);
+-    wld_ap_destroy(object->priv);
++    wld_ap_destroy(object->priv, true);
+ 
+     SAH_TRACEZ_OUT(ME);
+     return status;
+@@ -1949,13 +1951,13 @@ T_AccessPoint* wld_ap_create(T_Radio* pRad, const char* vapName, uint32_t idx) {
+  * This function Destroys the access point
+  * first deauthentify all associated stations, destroy vap then deletes the accesspoint.
+  */
+-void wld_ap_destroy(T_AccessPoint* pAP) {
++void wld_ap_destroy(T_AccessPoint* pAP, bool do_sync) {
+     ASSERTS_NOT_NULL(pAP, , ME, "NULL");
+ 
+     s_sendChangeEvent(pAP, WLD_VAP_CHANGE_EVENT_DESTROY, NULL);
+     wld_extMod_cleanupDataList(&pAP->extDataList, pAP);
+ 
+-    s_deinitAP(pAP);
++    s_deinitAP(pAP, do_sync);
+ 
+     if(pAP->pBus != NULL) {
+         pAP->pBus->priv = NULL;
+diff --git a/src/wld_mld.c b/src/wld_mld.c
+index bd8a9df..3a60965 100644
+--- a/src/wld_mld.c
++++ b/src/wld_mld.c
+@@ -61,8 +61,11 @@
+ ****************************************************************************/
+ 
+ #include "wld.h"
++#include "wld_hostapd_ap_api.h"
+ #include "wld_mld.h"
+ #include "wld_ssid.h"
++#include "wld_radio.h"
++#include "wld_accesspoint.h"
+ #include "wld_util.h"
+ #include "wld_radioOperatingStandards.h"
+ #include "wld_chanmgt.h"
+@@ -610,3 +613,23 @@ wld_mldLink_t* wld_mld_nextNeighLink(wld_mldLink_t* pLink) {
+     return s_linkFromIt(it);
+ }
+ 
++bool wld_reconfig_remove_link(wld_mldLink_t* pLink) {
++    ASSERT_NOT_NULL(pLink, false, ME, "Link is NULL");
++    ASSERT_NOT_NULL(pLink->pMld, false, ME, "MLD is NULL");
++    ASSERT_NOT_NULL(pLink->pSSID, false, ME, "SSID is NULL");
++    ASSERT_NOT_NULL(pLink->pSSID->AP_HOOK, false, ME, "AP is NULL");
++    ASSERT_TRUE(wld_mld_isLinkEnabled(pLink), false, ME, "Link is disabled");
++    // Hostapd - Remove link
++    SAH_TRACEZ_INFO(ME, "Remove link from Hostapd");
++    if (wld_hostapd_ap_remove_link(pLink->pSSID->AP_HOOK)) {
++        wld_rad_notify_ReconfigComplete(pLink->pSSID->RADIO_PARENT, true);
++        SAH_TRACEZ_INFO(ME, "Link removed successfully");
++        T_AccessPoint* pAP = pLink->pSSID->AP_HOOK;
++        wld_ssid_destroy(pLink->pSSID);
++        wld_ap_destroy(pAP, false);
++        return true;
++    }
++    wld_rad_notify_ReconfigComplete(pLink->pSSID->RADIO_PARENT, false);
++    SAH_TRACEZ_INFO(ME, "Failed to Remove Link");
++    return false;
++}
+diff --git a/src/wld_radio.c b/src/wld_radio.c
+index 2ecb68c..cde8300 100644
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -3234,6 +3234,19 @@ bool wld_radio_notify_scanresults(amxd_object_t* obj) {
+     return true;
+ }
+ 
++bool wld_rad_notify_ReconfigComplete(T_Radio *pR, bool success) {
++    ASSERT_NOT_NULL(pR, , ME, "NULL");
++    char* path = amxd_object_get_path(pR->pBus, AMXD_OBJECT_NAMED);
++    amxc_var_t ret;
++    amxc_var_init(&ret);
++    amxc_var_set_type(&ret, AMXC_VAR_ID_HTABLE);
++    amxc_var_add_key(bool, &ret, "Result", success);
++    SAH_TRACEZ_INFO(ME, "%s: notif reconfig complete @ path=%s %s, Result=%s}", pR->Name, path, "ReconfigComplete", success ? "done" : "error");
++    amxd_object_trigger_signal(pR->pBus, "ReconfigComplete", &ret);
++    amxc_var_clean(&ret);
++    free(path);
++}
++
+ amxd_status_t _getRadioAirStats(amxd_object_t* object,
+                                 amxd_function_t* func _UNUSED,
+                                 amxc_var_t* args _UNUSED,
+diff --git a/src/wld_ssid.c b/src/wld_ssid.c
+index e7e007a..c668a18 100644
+--- a/src/wld_ssid.c
++++ b/src/wld_ssid.c
+@@ -293,6 +293,10 @@ static void s_cleanSSID(T_SSID* pSSID, bool direct) {
+     free(pSSID);
+ }
+ 
++void wld_ssid_destroy(T_SSID* pSSID) {
++    s_cleanSSID(pSSID, false);
++}
++
+ /* Be sure that our attached memory structure is cleared */
+ static void s_destroySsid(amxd_object_t* object) {
+     T_SSID* pSSID = wld_ssid_fromObj(object);
+@@ -697,12 +701,33 @@ static void s_setEnable_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_para
+ static void s_checkMLDUnit(T_SSID* pSSID, int32_t newMldUnit) {
+     SAH_TRACEZ_IN(ME);
+     ASSERT_NOT_NULL(pSSID, , ME, "INVALID");
+-    if(pSSID->mldUnit == newMldUnit) {
++
++    int32_t oldMldUnit = pSSID->mldUnit;
++
++    // No change
++    if(oldMldUnit == newMldUnit) {
+         return;
+     }
+     SAH_TRACEZ_INFO(ME, "%s: SET MLD_UNIT %d %d", pSSID->Name, pSSID->mldUnit, newMldUnit);
+ 
+     pSSID->mldUnit = newMldUnit;
++
++    // Remove Link
++    if((oldMldUnit != -1) && (newMldUnit == -1)) {
++        // MLD Reconfig - Remove Link
++        if(pSSID->pMldLink != NULL){
++            SAH_TRACEZ_INFO(ME, "Triggered MLD Reconfig Remove Link");
++            if(wld_reconfig_remove_link(pSSID->pMldLink)) {
++                return;
++	    } else {
++                // Link Remove failed
++                SAH_TRACEZ_INFO(ME, "MLD Reconfig Remove Link Failed. Remove the link in legacy way");
++            }
++        } else {
++            SAH_TRACEZ_INFO(ME, "MLD Link not present but MLDUnit >= 0");
++	}
++    }
++
+     wld_mld_setLinkConfigured(pSSID->pMldLink, false);
+     if(pSSID->AP_HOOK != NULL) {
+         T_AccessPoint* pAP = pSSID->AP_HOOK;
+@@ -711,6 +736,19 @@ static void s_checkMLDUnit(T_SSID* pSSID, int32_t newMldUnit) {
+     }
+     wld_mld_registerLink(pSSID, pSSID->mldUnit);
+ 
++    // Add Link
++    if((oldMldUnit == -1) && (newMldUnit != -1)) {
++        // Add Link. Could be reconfig or new MLD
++        if(pSSID->pMldLink != NULL) {
++            // Target could be new MLD or existing MLD
++            uint32_t count = wld_mld_countNeighLinks(pSSID->pMldLink);
++            if ((count > 1)) {
++                // MLD Reconfig - Add Link
++                wld_rad_notify_ReconfigComplete(pSSID->RADIO_PARENT, true);
++            }
++        }
++    }
++
+     SAH_TRACEZ_OUT(ME);
+ }
+ 
+-- 
+2.34.1
+
