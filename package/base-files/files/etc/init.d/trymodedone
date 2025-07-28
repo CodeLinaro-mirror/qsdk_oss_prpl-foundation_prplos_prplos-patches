@@ -1,0 +1,166 @@
+#!/bin/sh /etc/rc.common
+#
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+# SPDX-License-Identifier: ISC
+
+START=98
+
+. /lib/upgrade/platform.sh
+
+set_env_vars() {
+	local active0=$1
+	local active1=$2
+
+	eval $(fw_printenv sw_active0_ok 2>/dev/null)
+	[ "$sw_active0_ok" != "$active0" ] && fw_setenv sw_active0_ok $active0
+
+	eval $(fw_printenv sw_active1_ok 2>/dev/null)
+	[ "$sw_active1_ok" != "$active1" ] && fw_setenv sw_active1_ok $active1
+}
+
+Bank_health_check() {
+	local BC0_health=$(cat /proc/boot_info/bootconfig0/health_status)
+	local BC1_health=$(cat /proc/boot_info/bootconfig1/health_status)
+	local BC0_age=$(cat /proc/boot_info/bootconfig0/age)
+	local BC1_age=$(cat /proc/boot_info/bootconfig1/age)
+	local which_bootconfig=$(cat /proc/boot_info/active_bootconfig)
+
+	if [ "$BC0_age" -gt "$BC1_age" ]; then
+		bank="A"
+		health="$BC0_health"
+		expected=1
+	elif [ "$BC1_age" -gt "$BC0_age" ]; then
+		bank="B"
+		health="$BC1_health"
+		expected=2
+	else
+		if [ "$which_bootconfig" -eq 1 ]; then
+			bank="A"
+			health="$BC0_health"
+		else
+			bank="B"
+			health="$BC1_health"
+		fi
+		expected="$which_bootconfig"
+	fi
+
+	if [ "$which_bootconfig" -eq "$expected" ] && [ "$health" -eq 1 ]; then
+		echo "Intended Bank $bank is booted" > /dev/console
+	else
+		echo "Intended Bank $bank is not booted" > /dev/console
+	fi
+}
+
+Bank_health_check_ipq54xx() {
+	if [ ! -e /tmp/bootconfig_members.txt ]; then
+		extract_bootconfig "0:BOOTCONFIG"
+		dumpimage -b 4 &> /dev/null
+	fi
+
+	local boot_set=$(grep "Boot-set" /tmp/bootconfig_members.txt | awk -F: '{print $2}')
+	local image_status=$(grep "Image-set-status" /tmp/bootconfig_members.txt | awk -F: '{print $2}')
+
+	if [ "$boot_set" -eq 0 ]; then
+		bank="A"
+		expected_status=1
+	elif [ "$boot_set" -eq 1 ]; then
+		bank="B"
+		expected_status=2
+	fi
+
+	if [ "$image_status" -ne "$expected_status" ]; then
+		echo "Intended Bank $bank is booted" > /dev/console
+	else
+		echo "Intended Bank $bank is not booted" > /dev/console
+	fi
+}
+
+start() {
+	local trymode_inprogress="/proc/upgrade_info/trymode_inprogress"
+	local board=$(board_name)
+	local is_in_trymode=$(cat /proc/upgrade_info/trymode_inprogress)
+	local ipq54xx_trymode=$(cat /sys/devices/platform/firmware:scm/trymode_inprogress)
+	local age0=$(cat /proc/boot_info/bootconfig0/age)
+	local age1=$(cat /proc/boot_info/bootconfig1/age)
+
+	#clearing milestone bit
+	echo 0 > /sys/devices/platform/firmware:scm/hlos_done
+	case "$board" in
+		qcom,ipq9574-ap-al05 |\
+		qcom,ipq9574-ap-al06 |\
+		qcom,ipq5332-ap-mi01.2-c2)
+			if [ $is_in_trymode -eq 1 ]; then
+				if [ $age0 -le $age1 ]; then
+					eval $(fw_printenv sw_active0_ok 2>/dev/null)
+					[ "$sw_active0_ok" != "1" ] && fw_setenv sw_active0_ok 1
+					eval $(fw_printenv sw_active1_ok 2>/dev/null)
+					[ "$sw_active1_ok" != "0" ] && fw_setenv sw_active1_ok 0
+				else
+					eval $(fw_printenv sw_active1_ok 2>/dev/null)
+					[ "$sw_active1_ok" != "1" ] && fw_setenv sw_active1_ok 1
+					eval $(fw_printenv sw_active0_ok 2>/dev/null)
+					[ "$sw_active0_ok" != "0" ] && fw_setenv sw_active0_ok 0
+				fi
+			else
+				if [ $age0 -ge $age1 ]; then
+					eval $(fw_printenv sw_active0_ok 2>/dev/null)
+					[ "$sw_active0_ok" != "1" ] && fw_setenv sw_active0_ok 1
+					eval $(fw_printenv sw_active1_ok 2>/dev/null)
+					[ "$sw_active1_ok" != "0" ] && fw_setenv sw_active1_ok 0
+				else
+					eval $(fw_printenv sw_active1_ok 2>/dev/null)
+					[ "$sw_active1_ok" != "1" ] && fw_setenv sw_active1_ok 1
+					eval $(fw_printenv sw_active0_ok 2>/dev/null)
+					[ "$sw_active0_ok" != "0" ] && fw_setenv sw_active0_ok 0
+				fi
+			fi
+			Bank_health_check
+			return 1;
+			;;
+		qcom,ipq5424-rdp485*)
+			extract_bootconfig "0:BOOTCONFIG"
+			dumpimage -b 4 &> /dev/null
+			if [ ! -e /tmp/bootconfig_members.txt ]; then
+				echo " Boot info is not available "
+				return 1
+			fi
+
+			upgrade_bank=$(get_upgrade_bank)
+			if [ $ipq54xx_trymode -eq 1 ]; then
+				if [ $upgrade_bank -eq 1 ]; then
+					set_env_vars 0 1
+				else
+					set_env_vars 1 0
+				fi
+			else
+				if [ $upgrade_bank -eq 1 ]; then
+					set_env_vars 1 0
+				else
+					set_env_vars 0 1
+				fi
+			fi
+
+			Bank_health_check_ipq54xx
+			return 1;
+			;;
+		*)
+			if [[ "$board" == *"ipq5424"* ]]; then
+				if [ $ipq54xx_trymode -eq 1 ]; then
+					echo "Updating boot-info" > /dev/console
+					trymode_boot_update
+					echo "Boot-info updated" > /dev/console
+				fi
+				Bank_health_check_ipq54xx
+			else
+				if [ -f "$trymode_inprogress" ]; then
+					if [ $is_in_trymode -eq 1 ]; then
+						echo "Bootconfig: updating age" > /dev/console
+						age_do_upgrade
+						echo "Bootconfig: Age is Updated" > /dev/console
+					fi
+				fi
+				Bank_health_check
+			fi
+			;;
+	esac
+}
