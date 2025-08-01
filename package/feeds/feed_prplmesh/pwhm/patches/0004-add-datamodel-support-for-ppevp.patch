@@ -1,0 +1,156 @@
+From 418fb67a08905f22358639c05620e544e2cc9f0c Mon Sep 17 00:00:00 2001
+From: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+Date: Thu, 31 Jul 2025 18:00:25 +0530
+Subject: [PATCH] add datamodel support for ppevp
+
+Signed-off-by: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+---
+ include/wld/wld.h                 |  7 +++++
+ odl/wld_radio.odl                 | 13 ++++++++
+ src/nl80211/wld_hostapd_cfgFile.c |  4 ++-
+ src/wld_radio.c                   | 51 +++++++++++++++++++++++++++++++
+ 4 files changed, 74 insertions(+), 1 deletion(-)
+
+diff --git a/include/wld/wld.h b/include/wld/wld.h
+index 75f8cdd..c5ba34b 100644
+--- a/include/wld/wld.h
++++ b/include/wld/wld.h
+@@ -375,6 +375,12 @@ typedef enum {
+     AP_TD_MAX,
+ } wld_ap_td_e;
+ 
++typedef enum {
++    PPEVP_TYPE_PASSIVE = 1,
++    PPEVP_TYPE_ACTIVE = 2,
++    PPEVP_TYPE_DS = 3
++} wld_ppevp_type_e;
++
+ #define M_AP_TD_WPA3_P (1 << AP_TD_WPA3_P)
+ #define M_AP_TD_SAE_PK (1 << AP_TD_SAE_PK)
+ #define M_AP_TD_WPA3_E (1 << AP_TD_WPA3_E)
+@@ -1569,6 +1575,7 @@ struct WLD_RADIO {
+     uint32_t beaconPeriod;                          /* Beaconing period in ms */
+     uint32_t dtimPeriod;                            /* Delivery Traffic Information Map period, in nrBeacons*/
+     wld_preamble_type_e preambleType;               /* Longer preamble are needed by 802.11g to coexist with legacy systems 802.11 and 802.11b */
++    wld_ppevp_type_e ppevpType;                     /* PPEVPType: 1 = Passive, 2 = Active, 3 = DS */
+     bool packetAggregationEnable;                   /* Enable packet Aggregation (commonly called "frame aggregation") */
+     unsigned int DFSChannelChangeEventCounter;      /* Number of DFS channel change events */
+     swl_timeReal_t DFSChannelChangeEventTimestamp;  /* Last DFS channel change event realTime value */
+diff --git a/odl/wld_radio.odl b/odl/wld_radio.odl
+index b19bb22..37b0f08 100644
+--- a/odl/wld_radio.odl
++++ b/odl/wld_radio.odl
+@@ -994,6 +994,19 @@ define probelist_t{
+ 			default true;
+ 		}
+ 
++		/**
++		 * The type of PPE Virtual Port (PPEVP).
++		 * This parameter controls the mode of operation for the PPE Virtual Port.
++		 * Enumeration of:
++		 * * 1 - Passive
++		 * * 2 - Active
++		 * * 3 - Direct Switch (DS)
++                */
++		%persistent uint32 PPEVPType {
++			on action validate call wld_rad_validatePPEVPType_pvf;
++			default 3;
++		}
++
+ 		/**
+ 		* The type of preamble.
+ 		* Longer preambles (more overhead) are needed by 802.11g to coexist with legacy systems 802.11 and 802.11b.
+diff --git a/src/nl80211/wld_hostapd_cfgFile.c b/src/nl80211/wld_hostapd_cfgFile.c
+index 9eb0cc7..e89001d 100644
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -772,7 +772,9 @@ static bool s_setVapCommonConfig(T_AccessPoint* pAP, swl_mapChar_t* vapConfigMap
+     if(pRad->dtimPeriod > 0) {
+         swl_mapCharFmt_addValInt32(vapConfigMap, "dtim_period", pRad->dtimPeriod);
+     }
+-    swl_mapCharFmt_addValInt32(vapConfigMap, "ppe_vp", 3);
++    swl_mapCharFmt_addValInt32(vapConfigMap, "ppe_vp", pRad->ppevpType);
++    SAH_TRACEZ_INFO(ME, "%s: PPEVP set ppe_vp = %u", pRad->Name, pRad->ppevpType);
++
+     swl_mapCharFmt_addValInt32(vapConfigMap, "ap_isolate", pAP->clientIsolationEnable);
+     swl_mapChar_add(vapConfigMap, "ignore_broadcast_ssid", pAP->SSIDAdvertisementEnabled ? "0" : "2");
+     if(!pAP->enable || !pRad->enable) {
+diff --git a/src/wld_radio.c b/src/wld_radio.c
+index cde8300..0a891ad 100644
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -1072,6 +1072,55 @@ static void s_setPreambleType_pwf(void* priv _UNUSED, amxd_object_t* object, amx
+     SAH_TRACEZ_OUT(ME);
+ }
+ 
++amxd_status_t _wld_rad_validatePPEVPType_pvf(amxd_object_t* object,
++                                             amxd_param_t* param _UNUSED,
++                                             amxd_action_t reason _UNUSED,
++                                             const amxc_var_t* const args,
++                                             amxc_var_t* const retval _UNUSED,
++                                             void* priv _UNUSED) {
++    SAH_TRACEZ_IN(ME);
++
++    ASSERTS_FALSE(amxc_var_is_null(args), amxd_status_invalid_value, ME, "Invalid input");
++    ASSERTS_EQUALS(amxd_object_get_type(object), amxd_object_instance, amxd_status_ok, ME, "Object is not instance");
++
++    T_Radio* pRad = wld_rad_fromObj(object);
++    ASSERTI_NOT_NULL(pRad, amxd_status_ok, ME, "Radio is NULL");
++
++    uint32_t val = amxc_var_dyncast(uint32_t, args);
++    if (val < 1 || val > 3) {
++        SAH_TRACEZ_INFO(ME, "%s: Invalid PPEVPType value: %u (must be 1, 2, or 3)", pRad->Name, val);
++        SAH_TRACEZ_OUT(ME);
++        return amxd_status_invalid_value;
++    }
++
++    SAH_TRACEZ_OUT(ME);
++    return amxd_status_ok;
++}
++
++static void s_setPPEVPType_pwf(void* priv _UNUSED,
++                               amxd_object_t* object,
++                               amxd_param_t* param _UNUSED,
++                               const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_Radio* pRad = wld_rad_fromObj(object);
++    if (pRad == NULL) {
++        SAH_TRACEZ_INFO(ME, "Radio is NULL");
++        SAH_TRACEZ_OUT(ME);
++        return;
++    }
++
++    uint32_t val = amxc_var_dyncast(uint32_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: Set PPEVPType = %u", pRad->Name, val);
++
++    if (pRad->ppevpType != val) {
++        pRad->ppevpType = val;
++        wld_rad_doSync(pRad);
++    }
++
++    SAH_TRACEZ_OUT(ME);
++}
++
+ static void s_setPacketAggregationEnable_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
+     SAH_TRACEZ_IN(ME);
+ 
+@@ -2437,6 +2486,7 @@ T_DEBUG_OBJ_STR VerifyRadio[] = {
+     {TPH_UINT32, "LongRetryLimit", TPH_UINT8, offsetof(T_Radio, longRetryLimit)},
+     {TPH_UINT32, "BeaconPeriod", TPH_UINT32, offsetof(T_Radio, beaconPeriod)},
+     {TPH_UINT32, "DTIMPeriod", TPH_UINT32, offsetof(T_Radio, dtimPeriod)},
++    {TPH_UINT32, "PPEVPType", TPH_UINT32, offsetof(T_Radio, ppevpType)},
+     {TPH_BOOL, "TargetWakeTimeEnable", TPH_BOOL, offsetof(T_Radio, twtEnable)},
+     {TPH_BOOL, "OfdmaEnable", TPH_BOOL, offsetof(T_Radio, ofdmaEnable)},
+     {TPH_STR, "HeCapsSupported", TPH_INT32, offsetof(T_Radio, heCapsSupported)},
+@@ -4647,6 +4697,7 @@ SWLA_DM_HDLRS(sRadioDmHdlrs,
+                   SWLA_DM_PARAM_HDLR("BeaconPeriod", s_setBeaconPeriod_pwf),
+                   SWLA_DM_PARAM_HDLR("DTIMPeriod", s_setDtimPeriod_pwf),
+                   SWLA_DM_PARAM_HDLR("PreambleType", s_setPreambleType_pwf),
++                  SWLA_DM_PARAM_HDLR("PPEVPType", s_setPPEVPType_pwf),
+                   SWLA_DM_PARAM_HDLR("PacketAggregationEnable", s_setPacketAggregationEnable_pwf),
+                   SWLA_DM_PARAM_HDLR("TargetWakeTimeEnable", s_setTargetWakeTimeEnable_pwf),
+                   SWLA_DM_PARAM_HDLR("OfdmaEnable", s_setOfdmaEnable_pwf),
+-- 
+2.34.1
+
