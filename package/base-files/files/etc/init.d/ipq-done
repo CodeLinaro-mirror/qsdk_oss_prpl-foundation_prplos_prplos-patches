@@ -1,0 +1,26 @@
+#!/bin/sh /etc/rc.common
+#
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+# SPDX-License-Identifier: ISC
+
+START=99
+opensync_func () {
+
+	uci set minidump.livedump.path='/usr/opensync/log_archive/crash'
+	uci set minidump.livedump.tftp=0
+	uci commit
+}
+boot() {
+
+	hostname=$(uci get system.@system[0].hostname)
+	echo "$hostname" > /proc/sys/kernel/hostname
+	# Clean up file cache
+	echo 3 > /proc/sys/vm/drop_caches
+	/etc/init.d/sysctl start
+	if [ -d /usr/opensync ]; then
+		opensync_func
+	fi
+	echo "|/sbin/core-upload.sh %e %p %u %g %s %t %h %P" > /proc/sys/kernel/core_pattern
+	ulimit -c unlimited
+
+}
