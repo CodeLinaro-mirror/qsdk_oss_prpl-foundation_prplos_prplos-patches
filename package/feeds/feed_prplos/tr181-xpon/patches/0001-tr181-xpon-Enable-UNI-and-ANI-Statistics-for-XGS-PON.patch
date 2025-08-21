@@ -11,8 +11,6 @@ Signed-off-by: Harini Pavithra Elangovan <helangov@qti.qualcomm.com>
  src/dm_info.c                     | 47 +++++++++++++++++++++++++++++--
  4 files changed, 80 insertions(+), 3 deletions(-)
 
-diff --git a/include_priv/dm_info.h b/include_priv/dm_info.h
-index 54c6dc3..27ed6ae 100644
 --- a/include_priv/dm_info.h
 +++ b/include_priv/dm_info.h
 @@ -87,6 +87,8 @@ typedef enum _xpon_object_id {
@@ -21,11 +19,9 @@ index 54c6dc3..27ed6ae 100644
      obj_id_ani_tc_alarms,
 +    obj_id_ani_stats,
 +    obj_id_eth_stats,
-     obj_id_nbr,
-     obj_id_unknown = obj_id_nbr
- } object_id_t;
-diff --git a/odl/tr181-xpon_ANI.odl.m4 b/odl/tr181-xpon_ANI.odl.m4
-index 2fd4535..b1d88e2 100644
+     obj_id_ani_tc_pm_omci,
+     obj_id_ani_tc_pm_phy,
+     obj_id_ani_tc_pm_gem,
 --- a/odl/tr181-xpon_ANI.odl.m4
 +++ b/odl/tr181-xpon_ANI.odl.m4
 @@ -176,6 +176,23 @@
@@ -52,8 +48,6 @@ index 2fd4535..b1d88e2 100644
  
          /**
              This object represents an ITU-T PON TC layer device.
-diff --git a/odl/tr181-xpon_EthernetUNI.odl.m4 b/odl/tr181-xpon_EthernetUNI.odl.m4
-index 176b941..15aa313 100644
 --- a/odl/tr181-xpon_EthernetUNI.odl.m4
 +++ b/odl/tr181-xpon_EthernetUNI.odl.m4
 @@ -231,6 +231,23 @@
@@ -80,11 +74,9 @@ index 176b941..15aa313 100644
  
          ifdef(`CONFIG_SAH_AMX_TR181_XPON_USE_NETDEV_COUNTERS', /**
          * Throughput statistics for this interface.
-diff --git a/src/dm_info.c b/src/dm_info.c
-index c968fd8..1b63c55 100644
 --- a/src/dm_info.c
 +++ b/src/dm_info.c
-@@ -163,6 +163,24 @@ static const param_info_t TC_ALARMS_PARAMS[] = {
+@@ -198,6 +198,24 @@ static const param_info_t TC_ALARMS_PARA
      { .name = "ROGUE", .type = AMXC_VAR_ID_BOOL }
  };
  
@@ -109,7 +101,7 @@ index c968fd8..1b63c55 100644
  /**
   * Array with info about objects in the XPON DM.
   *
-@@ -197,7 +215,7 @@ const object_info_t OBJECT_INFO[obj_id_nbr] = {
+@@ -232,7 +250,7 @@ const object_info_t OBJECT_INFO[obj_id_n
          .name = "EthernetUNI",
          .generic_path = "XPON.ONU.x.EthernetUNI",
          .key_name = NAME_PARAM,
@@ -118,7 +110,7 @@ index c968fd8..1b63c55 100644
          .templates = NULL,
          .params = ETHERNET_UNI_PARAMS,
          .n_params = ARRAY_SIZE(ETHERNET_UNI_PARAMS),
-@@ -208,7 +226,7 @@ const object_info_t OBJECT_INFO[obj_id_nbr] = {
+@@ -243,7 +261,7 @@ const object_info_t OBJECT_INFO[obj_id_n
          .name = "ANI",
          .generic_path = "XPON.ONU.x.ANI",
          .key_name = NAME_PARAM,
@@ -127,9 +119,9 @@ index c968fd8..1b63c55 100644
          .templates = "TC.GEM.Port,Transceiver",
          .params = ANI_PARAMS,
          .n_params = ARRAY_SIZE(ANI_PARAMS),
-@@ -281,7 +299,30 @@ const object_info_t OBJECT_INFO[obj_id_nbr] = {
-         .params = TC_ALARMS_PARAMS,
-         .n_params = ARRAY_SIZE(TC_ALARMS_PARAMS),
+@@ -371,7 +389,30 @@ const object_info_t OBJECT_INFO[obj_id_n
+         .params = PM_GEM_PORT_PARAMS,
+         .n_params = ARRAY_SIZE(PM_GEM_PORT_PARAMS),
          .has_rw_enable = false
 -    }
 +    },
@@ -159,6 +151,3 @@ index c968fd8..1b63c55 100644
  };
  
  
--- 
-2.34.1
-
