@@ -1,0 +1,22 @@
+From 62b714ff904627c593f580856e13e5d7c42eccb5 Mon Sep 17 00:00:00 2001
+From: Ram Chandra Jangir <rjangir@qti.qualcomm.com>
+Date: Thu, 21 Aug 2025 11:19:58 +0530
+Subject: [PATCH] tr181-firewall: Enable ip_forward by default
+
+Change-Id: Ia5929ef804b7df92f47a9697bbad73aafd97a926
+Signed-off-by: Ram Chandra Jangir <rjangir@qti.qualcomm.com>
+---
+--- a/scripts/50-disable-ip-forward.sh
++++ b/scripts/50-disable-ip-forward.sh
+@@ -2,7 +2,7 @@
+ 
+ sysctl_conf=/etc/sysctl.d/10-default.conf
+ 
+-sed -i 's|net.ipv4.ip_forward=1|net.ipv4.ip_forward=0|g' ${sysctl_conf}
+-sed -i 's|net.ipv6.conf.all.forwarding=1|net.ipv6.conf.all.forwarding=0|g' ${sysctl_conf}
++sed -i 's|net.ipv4.ip_forward=0|net.ipv4.ip_forward=1|g' ${sysctl_conf}
++sed -i 's|net.ipv6.conf.all.forwarding=0|net.ipv6.conf.all.forwarding=1|g' ${sysctl_conf}
+ 
+-exit 0
+\ No newline at end of file
++exit 0
