@@ -11,8 +11,6 @@ Signed-off-by: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
  src/wld_radio.c                   | 51 +++++++++++++++++++++++++++++++
  4 files changed, 74 insertions(+), 1 deletion(-)
 
-diff --git a/include/wld/wld.h b/include/wld/wld.h
-index 75f8cdd..c5ba34b 100644
 --- a/include/wld/wld.h
 +++ b/include/wld/wld.h
 @@ -375,6 +375,12 @@ typedef enum {
@@ -36,15 +34,12 @@ index 75f8cdd..c5ba34b 100644
      bool packetAggregationEnable;                   /* Enable packet Aggregation (commonly called "frame aggregation") */
      unsigned int DFSChannelChangeEventCounter;      /* Number of DFS channel change events */
      swl_timeReal_t DFSChannelChangeEventTimestamp;  /* Last DFS channel change event realTime value */
-diff --git a/odl/wld_radio.odl b/odl/wld_radio.odl
-index b19bb22..37b0f08 100644
 --- a/odl/wld_radio.odl
 +++ b/odl/wld_radio.odl
-@@ -994,6 +994,19 @@ define probelist_t{
- 			default true;
+@@ -995,6 +995,19 @@ define probelist_t{
  		}
  
-+		/**
+ 		/**
 +		 * The type of PPE Virtual Port (PPEVP).
 +		 * This parameter controls the mode of operation for the PPE Virtual Port.
 +		 * Enumeration of:
@@ -57,14 +52,13 @@ index b19bb22..37b0f08 100644
 +			default 3;
 +		}
 +
- 		/**
++		/**
  		* The type of preamble.
  		* Longer preambles (more overhead) are needed by 802.11g to coexist with legacy systems 802.11 and 802.11b.
-diff --git a/src/nl80211/wld_hostapd_cfgFile.c b/src/nl80211/wld_hostapd_cfgFile.c
-index 9eb0cc7..e89001d 100644
+ 		* Enumeration of:
 --- a/src/nl80211/wld_hostapd_cfgFile.c
 +++ b/src/nl80211/wld_hostapd_cfgFile.c
-@@ -772,7 +772,9 @@ static bool s_setVapCommonConfig(T_AccessPoint* pAP, swl_mapChar_t* vapConfigMap
+@@ -772,7 +772,9 @@ static bool s_setVapCommonConfig(T_Acces
      if(pRad->dtimPeriod > 0) {
          swl_mapCharFmt_addValInt32(vapConfigMap, "dtim_period", pRad->dtimPeriod);
      }
@@ -75,11 +69,9 @@ index 9eb0cc7..e89001d 100644
      swl_mapCharFmt_addValInt32(vapConfigMap, "ap_isolate", pAP->clientIsolationEnable);
      swl_mapChar_add(vapConfigMap, "ignore_broadcast_ssid", pAP->SSIDAdvertisementEnabled ? "0" : "2");
      if(!pAP->enable || !pRad->enable) {
-diff --git a/src/wld_radio.c b/src/wld_radio.c
-index cde8300..0a891ad 100644
 --- a/src/wld_radio.c
 +++ b/src/wld_radio.c
-@@ -1072,6 +1072,55 @@ static void s_setPreambleType_pwf(void* priv _UNUSED, amxd_object_t* object, amx
+@@ -1072,6 +1072,55 @@ static void s_setPreambleType_pwf(void*
      SAH_TRACEZ_OUT(ME);
  }
  
@@ -151,6 +143,3 @@ index cde8300..0a891ad 100644
                    SWLA_DM_PARAM_HDLR("PacketAggregationEnable", s_setPacketAggregationEnable_pwf),
                    SWLA_DM_PARAM_HDLR("TargetWakeTimeEnable", s_setTargetWakeTimeEnable_pwf),
                    SWLA_DM_PARAM_HDLR("OfdmaEnable", s_setOfdmaEnable_pwf),
--- 
-2.34.1
-

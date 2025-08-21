@@ -39,7 +39,7 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
 +		 * Set value for Multicast to Unicast feature
 +		*/
 +		%persistent bool MulticastToUnicast {
-+			default false;
++			default true;
 +		}
 +
 +		/**
