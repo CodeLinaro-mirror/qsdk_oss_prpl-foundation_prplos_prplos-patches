@@ -1,16 +1,16 @@
-From c3d9efdd0de250f0ab4b5d09544f40ad220f5184 Mon Sep 17 00:00:00 2001
+From e4b4375af0b7d19520a8deb0f379a88be38f71b7 Mon Sep 17 00:00:00 2001
 From: Harini Pavithra Elangovan <helangov@qti.qualcomm.com>
-Date: Tue, 29 Jul 2025 23:44:18 +0530
-Subject: [PATCH 1/1] mod-xpon: Enable UNI and ANI Statistics for XGS-PON
+Date: Thu, 4 Sep 2025 12:21:43 +0530
+Subject: [PATCH 1/1] Enable UNI and ANI Statistics for XGS-PON
 
 Signed-off-by: Harini Pavithra Elangovan <helangov@qti.qualcomm.com>
 ---
  include_priv/dm_info.h |  2 ++
- src/dm_info.c          | 37 +++++++++++++++++++++++++++++++++++++
- 2 files changed, 39 insertions(+)
+ src/dm_info.c          | 36 ++++++++++++++++++++++++++++++++++++
+ 2 files changed, 38 insertions(+)
 
 diff --git a/include_priv/dm_info.h b/include_priv/dm_info.h
-index 6f7e982..b69ad9d 100644
+index 6f7e982..df8baac 100644
 --- a/include_priv/dm_info.h
 +++ b/include_priv/dm_info.h
 @@ -83,6 +83,8 @@ typedef enum _xpon_object_id {
@@ -18,40 +18,39 @@ index 6f7e982..b69ad9d 100644
      obj_id_ani_tc_performance_thresholds,
      obj_id_ani_tc_alarms,
 +    obj_id_ani_stats,
-+    obj_id_eth_stats, 
++    obj_id_eth_stats,
      obj_id_ani_tc_pm_omci,
      obj_id_ani_tc_pm_phy,
      obj_id_ani_tc_pm_gem,
 diff --git a/src/dm_info.c b/src/dm_info.c
-index fc7fd7b..d2c7278 100644
+index fc7fd7b..dcfb9a8 100644
 --- a/src/dm_info.c
 +++ b/src/dm_info.c
-@@ -189,6 +189,24 @@ static const param_info_t TC_ALARMS_PARAMS[] = {
+@@ -188,6 +188,23 @@ static const param_info_t TC_ALARMS_PARAMS[] = {
+     { .bbf_name = "LODS", .prpl_name = "lods", .type = AMXC_VAR_ID_BOOL },
      { .bbf_name = "ROGUE", .prpl_name = "rogue", .type = AMXC_VAR_ID_BOOL }
  };
- 
 +static const param_info_t STATS_PARAMS[] = {
-+    { .bbf_name = "BytesSent", .prpl_name = "bytes_sent", .type = AMXC_VAR_ID_UINT32 },
-+    { .bbf_name = "BytesReceived", .prpl_name = "bytes_received", .type = AMXC_VAR_ID_UINT32 },
-+    { .bbf_name = "PacketsSent", .prpl_name = "packets_sent", .type = AMXC_VAR_ID_UINT32 },
-+    { .bbf_name = "PacketsReceived", .prpl_name = "packets_received", .type = AMXC_VAR_ID_UINT32 },
-+    { .bbf_name = "ErrorsSent", .prpl_name = "errors_sent", .type = AMXC_VAR_ID_UINT32 },
-+    { .bbf_name = "ErrorsReceived", .prpl_name = "errors_received", .type = AMXC_VAR_ID_UINT32 },
-+    { .bbf_name = "UnicastPacketsSent", .prpl_name = "unicast_packets_sent", .type = AMXC_VAR_ID_UINT32 },
-+    { .bbf_name = "UnicastPacketsReceived", .prpl_name = "unicast_packets_received", .type = AMXC_VAR_ID_UINT32 },
-+    { .bbf_name = "DiscardPacketsSent", .prpl_name = "discard_packets_sent", .type = AMXC_VAR_ID_UINT32 },
-+    { .bbf_name = "DiscardPacketsReceived", .prpl_name = "discard_packets_received", .type = AMXC_VAR_ID_UINT32 },
-+    { .bbf_name = "MulticastPacketsSent", .prpl_name = "multicast_packets_sent", .type = AMXC_VAR_ID_UINT32 },
-+    { .bbf_name = "MulticastPacketsReceived", .prpl_name = "multicast_packets_received", .type = AMXC_VAR_ID_UINT32 },
-+    { .bbf_name = "BroadcastPacketsSent", .prpl_name = "broadcast_packets_sent", .type = AMXC_VAR_ID_UINT32 },
-+    { .bbf_name = "BroadcastPacketsReceived", .prpl_name = "broadcast_packets_received", .type = AMXC_VAR_ID_UINT32 },
-+    { .bbf_name = "UnknownProtoPacketsReceived", .prpl_name = "unknown_proto_packets_received", .type = AMXC_VAR_ID_UINT32 }
++    { .bbf_name = "BytesSent", .prpl_name = "bytes_sent", .type = AMXC_VAR_ID_UINT32  },
++    { .bbf_name = "BytesReceived", .prpl_name = "bytes_received", .type = AMXC_VAR_ID_UINT32  },
++    { .bbf_name = "PacketsSent", .prpl_name = "packets_sent", .type = AMXC_VAR_ID_UINT32  },
++    { .bbf_name = "PacketsReceived", .prpl_name = "packets_received", .type = AMXC_VAR_ID_UINT32  },
++    { .bbf_name = "ErrorsSent", .prpl_name = "errors_sent", .type = AMXC_VAR_ID_UINT32  },
++    { .bbf_name = "ErrorsReceived", .prpl_name = "errors_received", .type = AMXC_VAR_ID_UINT32  },
++    { .bbf_name = "UnicastPacketsSent", .prpl_name = "unicast_packets_sent", .type = AMXC_VAR_ID_UINT32  },
++    { .bbf_name = "UnicastPacketsReceived", .prpl_name = "unicast_packets_received", .type = AMXC_VAR_ID_UINT32  },
++    { .bbf_name = "DiscardPacketsSent", .prpl_name = "discard_packets_sent", .type = AMXC_VAR_ID_UINT32  },
++    { .bbf_name = "DiscardPacketsReceived", .prpl_name = "discard_packets_received", .type = AMXC_VAR_ID_UINT32  },
++    { .bbf_name = "MulticastPacketsSent", .prpl_name = "multicast_packets_sent", .type = AMXC_VAR_ID_UINT32  },
++    { .bbf_name = "MulticastPacketsReceived", .prpl_name = "multicast_packets_received", .type = AMXC_VAR_ID_UINT32  },
++    { .bbf_name = "BroadcastPacketsSent", .prpl_name = "broadcast_packets_sent", .type = AMXC_VAR_ID_UINT32  },
++    { .bbf_name = "BroadcastPacketsReceived", .prpl_name = "broadcast_packets_received", .type = AMXC_VAR_ID_UINT32  },
++    { .bbf_name = "UnknownProtoPacketsReceived", .prpl_name = "unknown_proto_packets_received", .type = AMXC_VAR_ID_UINT32  }
 +};
-+
+ 
  /**
   * Array with info about objects in the XPON DM ad the prpl xpon_onu DM.
-  *
-@@ -279,6 +297,24 @@ static const object_info_t OBJECT_INFO[obj_id_nbr] = {
+@@ -279,6 +296,24 @@ static const object_info_t OBJECT_INFO[obj_id_nbr] = {
          .params = TC_ALARMS_PARAMS,
          .n_params = ARRAY_SIZE(TC_ALARMS_PARAMS)
      },
@@ -76,14 +75,14 @@ index fc7fd7b..d2c7278 100644
      {
          .id = obj_id_ani_tc_pm_omci,
          .bbf_path = "XPON.ONU.x.ANI.x.TC.PM.OMCI",
-@@ -342,6 +378,7 @@ static const struct bbf_vs_prpl_entry BBF_vs_PRPL_ENTRIES[] = {
-     { .bbf_name = "ONUActivation", .prpl_name = "onu_activation" },
-     { .bbf_name = "PerformanceThresholds", .prpl_name = "performance_thresholds" },
-     { .bbf_name = "Alarms", .prpl_name = "alarms" },
-+    { .bbf_name = "Stats", .prpl_name = "stats" },
-     { .bbf_name = "PM", .prpl_name = "pm" },
+@@ -346,6 +381,7 @@ static const struct bbf_vs_prpl_entry BBF_vs_PRPL_ENTRIES[] = {
      { .bbf_name = "OMCI", .prpl_name = "omci" },
      { .bbf_name = "PHY", .prpl_name = "phy" },
+     { .bbf_name = "PLOAM", .prpl_name = "ploam" },
++    { .bbf_name = "Stats", .prpl_name = "stats" }
+ };
+ 
+ /**
 -- 
 2.34.1
 
