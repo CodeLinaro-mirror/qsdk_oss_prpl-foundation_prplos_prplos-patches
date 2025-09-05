@@ -1,0 +1,81 @@
+From 39030d09ec4857497f1478bc0e2ad9bd12dcedb0 Mon Sep 17 00:00:00 2001
+From: Harini Pavithra Elangovan <helangov@qti.qualcomm.com>
+Date: Fri, 5 Sep 2025 09:57:57 +0530
+Subject: [PATCH 1/1] Enable PM datamodel in Ubus-cli
+
+Signed-off-by: Harini Pavithra Elangovan <helangov@qti.qualcomm.com>
+---
+ include_priv/dm_info.h |  2 +-
+ src/dm_actions.c       |  2 +-
+ src/dm_info.c          | 10 +++++-----
+ 3 files changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/include_priv/dm_info.h b/include_priv/dm_info.h
+index dde1039..7fb454b 100644
+--- a/include_priv/dm_info.h
++++ b/include_priv/dm_info.h
+@@ -91,7 +91,7 @@ typedef enum _xpon_object_id {
+     obj_id_eth_stats,
+     obj_id_tc_pm_omci,
+     obj_id_tc_pm_phy,
+-    obj_id_ani_tc_pm_gem,
++    obj_id_tc_pm_gem,
+     obj_id_tc_pm_ploam,
+     obj_id_ani_tc_gem_port_pm,
+     obj_id_nbr,
+diff --git a/src/dm_actions.c b/src/dm_actions.c
+index 1803866..80ec36e 100644
+--- a/src/dm_actions.c
++++ b/src/dm_actions.c
+@@ -206,7 +206,7 @@ amxd_status_t _read_param(amxd_object_t* object,
+     /* Do not query the parameters of the PM objects */
+     if((obj_id_tc_pm_omci == obj_id) ||
+        (obj_id_tc_pm_phy == obj_id) ||
+-       (obj_id_ani_tc_pm_gem == obj_id) ||
++       (obj_id_tc_pm_gem == obj_id) ||
+        (obj_id_tc_pm_ploam == obj_id) ||
+        (obj_id_ani_tc_gem_port_pm == obj_id)) {
+         SAH_TRACEZ_DEBUG(ME, "%s: this PM object is not supported", path);
+diff --git a/src/dm_info.c b/src/dm_info.c
+index 0eedc53..910a19a 100644
+--- a/src/dm_info.c
++++ b/src/dm_info.c
+@@ -161,7 +161,7 @@ static const param_info_t TC_PM_PHY[] = {
+     { .name = "UnknownProfile", .type = AMXC_VAR_ID_UINT32 }
+ };
+ 
+-static const param_info_t PM_GEM_PARAMS[] = {
++static const param_info_t TC_PM_GEM[] = {
+     { .name = "FramesSent", .type = AMXC_VAR_ID_UINT64 },
+     { .name = "FramesReceived", .type = AMXC_VAR_ID_UINT64 },
+     { .name = "FrameHeaderHECErrors", .type = AMXC_VAR_ID_UINT32 },
+@@ -261,7 +261,7 @@ const object_info_t OBJECT_INFO[obj_id_nbr] = {
+         .name = "ANI",
+         .generic_path = "XPON.ONU.x.ANI",
+         .key_name = NAME_PARAM,
+-        .singletons = "TC.ONUActivation,TC.PerformanceThresholds,TC.Alarms,Stats,TC.PM.PLOAM,TC.PM.PHY,TC.PM.OMCI",
++        .singletons = "TC.ONUActivation,TC.PerformanceThresholds,TC.Alarms,Stats,TC.PM.PLOAM,TC.PM.PHY,TC.PM.OMCI,TC.PM.GEM",
+         .templates = "TC.GEM.Port,Transceiver",
+         .params = ANI_PARAMS,
+         .n_params = ARRAY_SIZE(ANI_PARAMS),
+@@ -380,14 +380,14 @@ const object_info_t OBJECT_INFO[obj_id_nbr] = {
+         .has_rw_enable = false
+     },
+     {
+-        .id = obj_id_ani_tc_pm_gem,
++        .id = obj_id_tc_pm_gem,
+         .name = "TC.PM.GEM",
+         .generic_path = "XPON.ONU.x.ANI.x.TC.PM.GEM",
+         .key_name = NULL,
+         .singletons = NULL,
+         .templates = NULL,
+-        .params = PM_GEM_PARAMS,
+-        .n_params = ARRAY_SIZE(PM_GEM_PARAMS),
++        .params = TC_PM_GEM,
++        .n_params = ARRAY_SIZE(TC_PM_GEM),
+         .has_rw_enable = false
+     },
+     {
+-- 
+2.34.1
+
