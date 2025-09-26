@@ -16,7 +16,7 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
 
 --- a/src/nl80211/wld_hostapd_cfgFile.c
 +++ b/src/nl80211/wld_hostapd_cfgFile.c
-@@ -775,6 +775,13 @@ static bool s_setVapCommonConfig(T_Acces
+@@ -784,6 +784,13 @@ static bool s_setVapCommonConfig(T_Acces
      swl_mapCharFmt_addValInt32(vapConfigMap, "ppe_vp", pRad->ppevpType);
      SAH_TRACEZ_INFO(ME, "%s: PPEVP set ppe_vp = %u", pRad->Name, pRad->ppevpType);
  
@@ -32,7 +32,7 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
      if(!pAP->enable || !pRad->enable) {
 --- a/odl/wld_radio.odl
 +++ b/odl/wld_radio.odl
-@@ -1008,6 +1008,13 @@ define probelist_t{
+@@ -1047,6 +1047,13 @@ define probelist_t{
  		}
  
  		/**
@@ -48,14 +48,14 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
  		* Enumeration of:
 --- a/include/wld/wld.h
 +++ b/include/wld/wld.h
-@@ -1576,6 +1576,7 @@ struct WLD_RADIO {
-     uint32_t dtimPeriod;                            /* Delivery Traffic Information Map period, in nrBeacons*/
-     wld_preamble_type_e preambleType;               /* Longer preamble are needed by 802.11g to coexist with legacy systems 802.11 and 802.11b */
-     wld_ppevp_type_e ppevpType;                     /* PPEVPType: 1 = Passive, 2 = Active, 3 = DS */
-+    bool multicastTounicast;                        /* Enable multicast to unicast support */
-     bool packetAggregationEnable;                   /* Enable packet Aggregation (commonly called "frame aggregation") */
-     unsigned int DFSChannelChangeEventCounter;      /* Number of DFS channel change events */
-     swl_timeReal_t DFSChannelChangeEventTimestamp;  /* Last DFS channel change event realTime value */
+@@ -1586,6 +1586,7 @@ struct WLD_RADIO {
+     uint32_t dtimPeriod;                                                    /* Delivery Traffic Information Map period, in nrBeacons*/
+     wld_preamble_type_e preambleType;                                       /* Longer preamble are needed by 802.11g to coexist with legacy systems 802.11 and 802.11b */
+     wld_ppevp_type_e ppevpType;                                             /* PPEVPType: 1 = Passive, 2 = Active, 3 = DS */
++    bool multicastTounicast;                                                /* Enable multicast to unicast support */
+     bool packetAggregationEnable;                                           /* Enable packet Aggregation (commonly called "frame aggregation") */
+     unsigned int DFSChannelChangeEventCounter;                              /* Number of DFS channel change events */
+     swl_timeReal_t DFSChannelChangeEventTimestamp;                          /* Last DFS channel change event realTime value */
 --- a/src/wld_radio.c
 +++ b/src/wld_radio.c
 @@ -1121,6 +1121,27 @@ static void s_setPPEVPType_pwf(void* pri
@@ -86,7 +86,7 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
  static void s_setPacketAggregationEnable_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
      SAH_TRACEZ_IN(ME);
  
-@@ -2487,6 +2508,7 @@ T_DEBUG_OBJ_STR VerifyRadio[] = {
+@@ -2525,6 +2546,7 @@ T_DEBUG_OBJ_STR VerifyRadio[] = {
      {TPH_UINT32, "BeaconPeriod", TPH_UINT32, offsetof(T_Radio, beaconPeriod)},
      {TPH_UINT32, "DTIMPeriod", TPH_UINT32, offsetof(T_Radio, dtimPeriod)},
      {TPH_UINT32, "PPEVPType", TPH_UINT32, offsetof(T_Radio, ppevpType)},
@@ -94,7 +94,7 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
      {TPH_BOOL, "TargetWakeTimeEnable", TPH_BOOL, offsetof(T_Radio, twtEnable)},
      {TPH_BOOL, "OfdmaEnable", TPH_BOOL, offsetof(T_Radio, ofdmaEnable)},
      {TPH_STR, "HeCapsSupported", TPH_INT32, offsetof(T_Radio, heCapsSupported)},
-@@ -4698,6 +4720,7 @@ SWLA_DM_HDLRS(sRadioDmHdlrs,
+@@ -4777,6 +4799,7 @@ SWLA_DM_HDLRS(sRadioDmHdlrs,
                    SWLA_DM_PARAM_HDLR("DTIMPeriod", s_setDtimPeriod_pwf),
                    SWLA_DM_PARAM_HDLR("PreambleType", s_setPreambleType_pwf),
                    SWLA_DM_PARAM_HDLR("PPEVPType", s_setPPEVPType_pwf),

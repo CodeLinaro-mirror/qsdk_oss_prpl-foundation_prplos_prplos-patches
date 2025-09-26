@@ -26,17 +26,17 @@ Signed-off-by: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
  #define M_AP_TD_WPA3_P (1 << AP_TD_WPA3_P)
  #define M_AP_TD_SAE_PK (1 << AP_TD_SAE_PK)
  #define M_AP_TD_WPA3_E (1 << AP_TD_WPA3_E)
-@@ -1569,6 +1575,7 @@ struct WLD_RADIO {
-     uint32_t beaconPeriod;                          /* Beaconing period in ms */
-     uint32_t dtimPeriod;                            /* Delivery Traffic Information Map period, in nrBeacons*/
-     wld_preamble_type_e preambleType;               /* Longer preamble are needed by 802.11g to coexist with legacy systems 802.11 and 802.11b */
-+    wld_ppevp_type_e ppevpType;                     /* PPEVPType: 1 = Passive, 2 = Active, 3 = DS */
-     bool packetAggregationEnable;                   /* Enable packet Aggregation (commonly called "frame aggregation") */
-     unsigned int DFSChannelChangeEventCounter;      /* Number of DFS channel change events */
-     swl_timeReal_t DFSChannelChangeEventTimestamp;  /* Last DFS channel change event realTime value */
+@@ -1579,6 +1585,7 @@ struct WLD_RADIO {
+     uint32_t beaconPeriod;                                                  /* Beaconing period in ms */
+     uint32_t dtimPeriod;                                                    /* Delivery Traffic Information Map period, in nrBeacons*/
+     wld_preamble_type_e preambleType;                                       /* Longer preamble are needed by 802.11g to coexist with legacy systems 802.11 and 802.11b */
++    wld_ppevp_type_e ppevpType;                                             /* PPEVPType: 1 = Passive, 2 = Active, 3 = DS */
+     bool packetAggregationEnable;                                           /* Enable packet Aggregation (commonly called "frame aggregation") */
+     unsigned int DFSChannelChangeEventCounter;                              /* Number of DFS channel change events */
+     swl_timeReal_t DFSChannelChangeEventTimestamp;                          /* Last DFS channel change event realTime value */
 --- a/odl/wld_radio.odl
 +++ b/odl/wld_radio.odl
-@@ -995,6 +995,19 @@ define probelist_t{
+@@ -1034,6 +1034,19 @@ define probelist_t{
  		}
  
  		/**
@@ -58,7 +58,7 @@ Signed-off-by: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
  		* Enumeration of:
 --- a/src/nl80211/wld_hostapd_cfgFile.c
 +++ b/src/nl80211/wld_hostapd_cfgFile.c
-@@ -772,7 +772,9 @@ static bool s_setVapCommonConfig(T_Acces
+@@ -781,7 +781,9 @@ static bool s_setVapCommonConfig(T_Acces
      if(pRad->dtimPeriod > 0) {
          swl_mapCharFmt_addValInt32(vapConfigMap, "dtim_period", pRad->dtimPeriod);
      }
@@ -127,7 +127,7 @@ Signed-off-by: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
  static void s_setPacketAggregationEnable_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
      SAH_TRACEZ_IN(ME);
  
-@@ -2437,6 +2486,7 @@ T_DEBUG_OBJ_STR VerifyRadio[] = {
+@@ -2475,6 +2524,7 @@ T_DEBUG_OBJ_STR VerifyRadio[] = {
      {TPH_UINT32, "LongRetryLimit", TPH_UINT8, offsetof(T_Radio, longRetryLimit)},
      {TPH_UINT32, "BeaconPeriod", TPH_UINT32, offsetof(T_Radio, beaconPeriod)},
      {TPH_UINT32, "DTIMPeriod", TPH_UINT32, offsetof(T_Radio, dtimPeriod)},
@@ -135,7 +135,7 @@ Signed-off-by: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
      {TPH_BOOL, "TargetWakeTimeEnable", TPH_BOOL, offsetof(T_Radio, twtEnable)},
      {TPH_BOOL, "OfdmaEnable", TPH_BOOL, offsetof(T_Radio, ofdmaEnable)},
      {TPH_STR, "HeCapsSupported", TPH_INT32, offsetof(T_Radio, heCapsSupported)},
-@@ -4647,6 +4697,7 @@ SWLA_DM_HDLRS(sRadioDmHdlrs,
+@@ -4726,6 +4776,7 @@ SWLA_DM_HDLRS(sRadioDmHdlrs,
                    SWLA_DM_PARAM_HDLR("BeaconPeriod", s_setBeaconPeriod_pwf),
                    SWLA_DM_PARAM_HDLR("DTIMPeriod", s_setDtimPeriod_pwf),
                    SWLA_DM_PARAM_HDLR("PreambleType", s_setPreambleType_pwf),
