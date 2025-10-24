@@ -1,0 +1,27 @@
+From 3fecf6ad8a8421fae8fd48b9476a8456bad974a7 Mon Sep 17 00:00:00 2001
+From: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
+Date: Mon, 29 Sep 2025 17:38:49 +0530
+Subject: [PATCH 1/1] ethernet-manager: Fix Duplicate MAC Address on Access
+ Point Ethernet Interfaces
+
+Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
+---
+ ethernet-manager_default_mac_addresses.odl.uc | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/odl/ethernet-manager_default_mac_addresses.odl.uc b/odl/ethernet-manager_default_mac_addresses.odl.uc
+index 53f9731..7a62863 100644
+--- a/odl/ethernet-manager_default_mac_addresses.odl.uc
++++ b/odl/ethernet-manager_default_mac_addresses.odl.uc
+@@ -2,7 +2,7 @@
+ {% let i=1 %}
+ {% for (let Itf in BD.Interfaces) : if (Itf.Upstream == "true" || Itf.DefaultUpstream == "true") : %}{% i++ %}
+     object "Ethernet.Link.{{i}}" {
+-        parameter MACAddress = "$(BASEMACADDRESS)";
++        parameter MACAddress = "$(BASEMACADDRESS_PLUS_7)";
+     }
+ {% endif; endfor; %}
+ {% let i = 0 %}
+-- 
+2.34.1
+
