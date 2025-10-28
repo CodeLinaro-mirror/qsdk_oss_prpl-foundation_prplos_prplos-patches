@@ -1,4 +1,8 @@
 From ad3e3da7ab6ea33b329a9f325286bad9fc7ea56a Mon Sep 17 00:00:00 2001
+From: avatarAhmed Amine HAOUES <ahmed-amine.haoues_ext@softathome.com>
+Date: Sun, 26 Oct 2025 19:18:35 +0530
+Subject: [PATCH 1/1] pwhm: Fix hostapd crash due to invalid MLD context
+
 PROVISORY: fix hostapd crash due to invalid MLD context
 
 
@@ -28,6 +32,7 @@ References: PPW-308, PCF-2145
 
 Signed-off-by: default avatarAhmed Amine HAOUES <ahmed-amine.haoues_ext@softathome.com>
 Signed-off-by: default avatarHoussem Dafdouf <houssem.dafdouf_ext@softathome.com>
+Signed-off-by: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
 
 ---
  src/nl80211/wld_hostapd_ap_api.c  | 22 +++++++++++++++++++---
