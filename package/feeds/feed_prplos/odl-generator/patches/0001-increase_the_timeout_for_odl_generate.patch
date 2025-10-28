@@ -1,20 +1,30 @@
-From 935b6d076abcf977d75c634aed14ffef72ad72d1 Mon Sep 17 00:00:00 2001
-From: Mohan Raj <mrajraje@qti.qualcomm.com>
-Date: Mon, 23 Jun 2025 20:13:29 +0530
-Subject: [PATCH] qca: Fix_ODL_generator_producing_invalid_wld.odl
+From d7a822c4d186e024695843476bc678293fee3a35 Mon Sep 17 00:00:00 2001
+From: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
+Date: Fri, 24 Oct 2025 19:57:53 +0530
+Subject: [PATCH 1/1] commit
 
-Change-Id: Ibf065268899b0c9a8c072da7ad42583103cc651b
-Signed-off-by: Mohan Raj <mrajraje@qti.qualcomm.com>
+Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
+---
+files/common.netlayout_from_uci.sh | 6 ++++++
+ 1 file changed, 6 insertions(+)
 
 diff --git a/files/common.netlayout_from_uci.sh b/files/common.netlayout_from_uci.sh
-index 1b7e73d..bebc82b 100755
+index 1b7e73d..2691578 100755
 --- a/files/common.netlayout_from_uci.sh
 +++ b/files/common.netlayout_from_uci.sh
-@@ -385,6 +385,11 @@ wait_for_uci_wireless() {
+@@ -378,6 +378,7 @@ wait_for_uci_wireless() {
+ 	local min_phy=0
+ 	local timeout_uci=$(uci -q get wireless.vendor.phy_detect_timeout)
+ 	local min_phy_uci=$(uci -q get wireless.vendor.min_phy)
++	local pci_count=$(ls /sys/kernel/debug/ath12k/ |wc -l)
+ 
+ 	[ -n "$timeout_uci" ] && timeout=$timeout_uci
+ 	[ -n "$min_phy_uci" ] && min_phy=$min_phy_uci
+@@ -385,6 +386,11 @@ wait_for_uci_wireless() {
  	phy_count=$(iw phy | grep -c Wiphy)
  	uci_count=$(count_matching_lines 'wifi-device.*radio' /etc/config/wireless)
  
-+	while [ $uci_count -lt 3 ]; do
++	while [ $uci_count -lt $pci_count ]; do
 +		uci_count=$(count_matching_lines 'wifi-device.*radio' /etc/config/wireless)
 +		sleep 1
 +	done
@@ -22,3 +32,6 @@ index 1b7e73d..bebc82b 100755
  	while ([ "$phy_count" -lt "$min_phy" ] || [ "$phy_count" -ne "$uci_count" ]) && [ $elapsed -lt $timeout ]; do
  		phy_count=$(iw phy | grep -c Wiphy)
  		uci_count=$(count_matching_lines 'wifi-device.*radio' /etc/config/wireless)
+-- 
+2.34.1
+
