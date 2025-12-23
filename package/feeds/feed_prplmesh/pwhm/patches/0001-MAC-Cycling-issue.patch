@@ -1,0 +1,27 @@
+From e10c9618d7b7119b71032e3ab15294314659ea69 Mon Sep 17 00:00:00 2001
+From: Jassim Shanavaskhan <jshanava@qti.qualcomm.com>
+Date: Tue, 23 Dec 2025 15:43:38 +0530
+Subject: [PATCH] MAC Cycling issue
+
+---
+ src/RadMgt/wld_rad_macCfg.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/RadMgt/wld_rad_macCfg.c b/src/RadMgt/wld_rad_macCfg.c
+index e718129..2137720 100644
+--- a/src/RadMgt/wld_rad_macCfg.c
++++ b/src/RadMgt/wld_rad_macCfg.c
+@@ -323,8 +323,9 @@ swl_rc_ne wld_rad_macCfg_generateBssid(T_Radio* pRad, const char* ifname, uint32
+         //mac bitmask not allowed to overflow with 11ax MultiBSSID rule
+         nrMaskBit = 18; //3 bytes LSB of Mac (the deviceId part)
+     } else if(bitMask + bssIdx >= nrSuppBss) {
+-        SAH_TRACEZ_WARNING(ME, "rad %s has not enough MACs in mask, for iface %s : %u + %u >= %u. Cycling BSS",
++        SAH_TRACEZ_WARNING(ME, "rad %s has not enough MACs in mask, for iface %s : %u + %u >= %u. Expanding mask bits",
+                            pRad->Name, ifname, bssIdx, bitMask, nrSuppBss);
++        nrMaskBit = 18; //3 bytes LSB of Mac (the deviceId part) to allow proper overflow
+     }
+ 
+     swl_mac_binAddVal(macBin, bssIdx, nrMaskBit);
+-- 
+2.34.1
+
