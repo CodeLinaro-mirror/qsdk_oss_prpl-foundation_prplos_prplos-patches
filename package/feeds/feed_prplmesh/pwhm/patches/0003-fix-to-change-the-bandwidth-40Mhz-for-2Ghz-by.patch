@@ -9,21 +9,16 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
  src/nl80211/wld_hostapd_cfgFile.c | 4 ++++
  1 file changed, 4 insertions(+)
 
-diff --git a/src/nl80211/wld_hostapd_cfgFile.c b/src/nl80211/wld_hostapd_cfgFile.c
-index 3668067..a3e2a09 100644
 --- a/src/nl80211/wld_hostapd_cfgFile.c
 +++ b/src/nl80211/wld_hostapd_cfgFile.c
-@@ -242,6 +242,10 @@ void wld_hostapd_cfgFile_setRadioConfig(T_Radio* pRad, swl_mapChar_t* radConfigM
-     if(SWL_BIT_IS_SET(pRad->supportedStandards, SWL_RADSTD_N)) {
-         swl_mapCharFmt_addValInt32(radConfigMap, "ieee80211n", wld_rad_checkEnabledRadStd(pRad, SWL_RADSTD_N));
+@@ -265,6 +265,10 @@ void wld_hostapd_cfgFile_setRadioConfig(
+             }
+         }
      }
 +    if (wld_rad_is_24ghz(pRad) && pRad->obssCoexistenceActive == 0) {
-+        swl_mapChar_add(radConfigMap, "ht_coex", "0");
-+        swl_mapChar_add(radConfigMap, "noscan", "1");
++	    swl_mapChar_add(radConfigMap, "ht_coex", "0");
++	    swl_mapChar_add(radConfigMap, "noscan", "1");
 +    }
-     if(wld_rad_checkEnabledRadStd(pRad, SWL_RADSTD_N)) {
-         char htCaps[256] = {0};
+     if(enableRad11n) {
          if(wld_channel_hasChannelWidthCovered(tgtChspec, SWL_BW_40MHZ)) {
--- 
-2.25.1
-
+             if(s_checkSGI(pRad, SWL_SGI_400)) {
