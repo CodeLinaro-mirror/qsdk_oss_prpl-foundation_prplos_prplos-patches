@@ -1,0 +1,23 @@
+From: Vijay Balaji <vijbal@qti.qualcomm.com>
+Subject: [PATCH] prpl-patches : update autodev configuration for LCM
+
+This change updates LCM configuration to use autodev
+for creating device nodes in order to run the container
+in nand flashtypes.
+
+Change-Id: I752dff23c6f2c8e68843afedf3d3f3dcefa384ec
+Signed-off-by: Vijay Balaji <vijbal@qti.qualcomm.com>
+---
+Index: cthulhu-lxc-v1.0.5/config/default.conf
+===================================================================
+--- cthulhu-lxc-v1.0.5.orig/config/default.conf
++++ cthulhu-lxc-v1.0.5/config/default.conf
+@@ -13,7 +13,7 @@ lxc.tty.max = 4
+ lxc.mount.auto = proc:mixed
+ 
+ # create default devices
+-lxc.autodev = 0
++lxc.autodev = 1
+ 
+ # Blacklist some syscalls which are not safe in privileged
+ # containers
