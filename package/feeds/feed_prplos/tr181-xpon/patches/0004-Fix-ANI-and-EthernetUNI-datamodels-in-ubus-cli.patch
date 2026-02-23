@@ -1,0 +1,154 @@
+From da944e7fc1066198f662591c2b470038355e0ceb Mon Sep 17 00:00:00 2001
+From: Harini Pavithra Elangovan <helangov@qti.qualcomm.com>
+Date: Thu, 19 Feb 2026 09:59:01 +0530
+Subject: [PATCH 1/1] Fix ANI and EthernetUNI datamodels in ubus-cli
+
+Signed-off-by: Harini Pavithra Elangovan <helangov@qti.qualcomm.com>
+---
+ odl/tr181-xpon_ANI.odl.m4         |  2 +-
+ odl/tr181-xpon_EthernetUNI.odl.m4 |  2 +-
+ src/dm_actions.c                  | 94 ++++++++++++++++++++++++++++++-
+ 3 files changed, 94 insertions(+), 4 deletions(-)
+
+diff --git a/odl/tr181-xpon_ANI.odl.m4 b/odl/tr181-xpon_ANI.odl.m4
+index 2ac0731..7cc8f89 100644
+--- a/odl/tr181-xpon_ANI.odl.m4
++++ b/odl/tr181-xpon_ANI.odl.m4
+@@ -159,7 +159,7 @@
+             current operational state.
+         */
+         %read-only uint32 LastChange {
+-            on action read call lastchange_on_read;
++            on action read call ani_lastchange_on_read;
+         }
+ 
+         /**
+diff --git a/odl/tr181-xpon_EthernetUNI.odl.m4 b/odl/tr181-xpon_EthernetUNI.odl.m4
+index d9c90cf..b2f8711 100644
+--- a/odl/tr181-xpon_EthernetUNI.odl.m4
++++ b/odl/tr181-xpon_EthernetUNI.odl.m4
+@@ -159,7 +159,7 @@
+             current operational state.
+         */
+         %read-only uint32 LastChange {
+-            on action read call lastchange_on_read;
++            on action read call ethernetuni_lastchange_on_read;
+         }
+ 
+         /**
+diff --git a/src/dm_actions.c b/src/dm_actions.c
+index 80ec36e..fd926b4 100644
+--- a/src/dm_actions.c
++++ b/src/dm_actions.c
+@@ -65,9 +65,7 @@
+ 
+ /* System headers */
+ #include <stdbool.h>
+-#ifdef _DEBUG_
+ #include <stdio.h>
+-#endif
+ #include <stdlib.h> /* free() */
+ #include <string.h> /* strlen() */
+ 
+@@ -295,6 +293,98 @@ exit:
+     return rv;
+ }
+ 
++/**
++ * Called if a LastChange parameter is read for EthernetUNI objects.
++ *
++ * For now, this simply returns 0 since the HAL doesn't properly support
++ * last_change for EthernetUNI objects.
++ *
++ * @return amxd_status_ok (=0) upon success
++ */
++amxd_status_t _ethernetuni_lastchange_on_read(UNUSED amxd_object_t* const object,
++                                              UNUSED amxd_param_t* const param,
++                                              amxd_action_t reason,
++                                              UNUSED const amxc_var_t* const args,
++                                              amxc_var_t* const retval,
++                                              UNUSED void* priv_unused) {
++    amxd_status_t rv = amxd_status_unknown_error;
++
++    if(reason != action_param_read) {
++        SAH_TRACEZ_WARNING(ME, "wrong reason, expected action_param_read(%d) got %d",
++                           action_param_read, reason);
++        rv = amxd_status_invalid_action;
++        goto exit;
++    }
++
++    /* For EthernetUNI, always return 0 */
++    rv = amxd_status_ok;
++    when_failed_trace(amxc_var_set_uint32_t(retval, 0),
++                      exit, ERROR, "Failed to set parameter LastChange");
++exit:
++    return rv;
++}
++
++ /**
++  * Called if a LastChange parameter is read for ANI objects.
++  *
++  * This mimics the HAL logic: reads the state timestamp from /proc/trex/gpon/onu
++  *
++  * @return amxd_status_ok (=0) upon success
++  */
++ amxd_status_t ani_lastchange_on_read(UNUSED amxd_object_t* const object,
++                                       UNUSED amxd_param_t* const param,
++                                       amxd_action_t reason,
++                                       UNUSED const amxc_var_t* const args,
++                                       amxc_var_t* const retval,
++                                       UNUSED void* priv_unused) {
++     amxd_status_t rv = amxd_status_unknown_error;
++     uint32_t last_change_value = 0;
++     FILE* fp = NULL;
++     char line[512] = {0};
++
++     if(reason != action_param_read) {
++         SAH_TRACEZ_WARNING(ME, "wrong reason, expected action_param_read(%d) got %d",
++                            action_param_read, reason);
++         rv = amxd_status_invalid_action;
++     }
++
++    fp = fopen("/proc/trex/gpon/onu", "r");
++    if(fp != NULL) {
++        while(fgets(line, sizeof(line), fp) != NULL) {
++            const char* key = "state:";
++            char* pos = strstr(line, key);
++            if(pos != NULL) {
++                pos += strlen(key);
++                while(*pos == ' ' || *pos == '\t') {
++                    pos++;
++                }
++                char token[64] = {0};
++                size_t i = 0;
++                while(*pos != '\0' && *pos != ' ' && *pos != '\t' && *pos != '\n' && i + 1 < sizeof(token)) {
++                    token[i++] = *pos++;
++                }
++                token[i] = '\0';
++                char* dot = strchr(token, '.');
++                if(dot != NULL) {
++                    *dot = '\0';
++                }
++                last_change_value = (uint32_t) atoi(token);
++                SAH_TRACEZ_DEBUG(ME, "ANI last_change from /proc = %u", last_change_value);
++                break;
++             }
++        }
++        fclose(fp);
++    } else {
++        SAH_TRACEZ_WARNING(ME, "Failed to open /proc/trex/gpon/onu");
++    }
++
++     rv = amxd_status_ok;
++     when_failed_trace(amxc_var_set_uint32_t(retval, last_change_value),
++                       exit, ERROR, "Failed to set parameter LastChange");
++ exit:
++     return rv;
++ }
++
+ typedef enum _private_data_type {
+     private_data_for_onu = 0,
+     private_data_for_object_interface
+-- 
+2.34.1
+
