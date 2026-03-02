@@ -1,0 +1,277 @@
+From bd1ddd965a34b84b077ba07bcb48f66a85462579 Mon Sep 17 00:00:00 2001
+From: Thiagarajan Rajagopalan <thiaraja@qti.qualcomm.com>
+Date: Sat, 21 Feb 2026 13:00:17 +0530
+Subject: [PATCH] pwhm: Add DataModels for DynamicVlan and BeaconRates This
+ commit addressess the below FRs, 1. [MPSK/Dynamic VLAN for UD] 2.
+  [UD--GAP: MLME MGMT Beacon Control]
+
+Added relevant data models for the the above FRs in this commit.
+
+Change-Id: I7d5c235b6d82cc0850a20098bfa0e26c4f74f22a
+Signed-off-by: Thiagarajan Rajagopalan <thiaraja@qti.qualcomm.com>
+---
+ ...10-Add-DM-DynamicVlan-And-BeaconRate.patch | 262 ++++++++++++++++++
+ 1 file changed, 262 insertions(+)
+ create mode 100644 package/feeds/feed_prplmesh/pwhm/patches/0010-Add-DM-DynamicVlan-And-BeaconRate.patch
+
+Index: pwhm-v7.14.11/include/wld/wld.h
+===================================================================
+--- pwhm-v7.14.11.orig/include/wld/wld.h
++++ pwhm-v7.14.11/include/wld/wld.h
+@@ -1985,6 +1985,18 @@ struct S_ACCESSPOINT {
+     wld_extMod_dataList_t extDataList;        /* list of extention data for non-chipset vendor modules */
+     amxc_llist_t llIntfWds;                   /* list of wds interface related to this VAP (wld_wds_intf_t) */
+     wld_mldCfg_t mldCfg;                      /* MLD config options */
++
++    uint8_t dynamicVlan;
++    char vlanTaggedInterface[IFNAMSIZ];
++    char vlanBridge[IFNAMSIZ];
++    uint8_t vlanNaming;
++    char wpaPskFile[128];
++    char saePasswordFile[128];
++
++    char beaconRate[128];
++    char supportedRates[128];
++    char basicRates[128];
++    char probeResponseRate[128];
+ };
+ 
+ typedef struct SWL_PACKED {
+Index: pwhm-v7.14.11/odl/wld_accesspoint.odl
+===================================================================
+--- pwhm-v7.14.11.orig/odl/wld_accesspoint.odl
++++ pwhm-v7.14.11/odl/wld_accesspoint.odl
+@@ -2561,6 +2561,40 @@ define rrm_t{
+ 
+ 		htable debug(%in string op);
+ 
++                /*
++                 * MPSK/Dynamic VLAN related configuration
++                */
++                /* DynamicVlan
++                 * # 0 = disabled (default); only VLAN IDs from accept_mac_file will be used
++                 * # 1 = optional; use default interface if RADIUS server does not include VLAN ID
++                 * # 2 = required; reject authentication if RADIUS server does not include VLAN ID
++                */
++
++                %persistent uint8 DynamicVlan {
++			on action validate call check_range { min = 0, max = 2 };
++                       default 0;
++                }
++                %persistent string VlanTaggedInterface;
++                %persistent string VlanBridge;
++                /* VlanNaming
++                 * # 0 = vlan<XXX>, e.g., vlan1
++                 * # 1 = <vlan_tagged_interface>.<XXX>, e.g. eth0.1
++                */
++                %persistent uint8 VlanNaming {
++			on action validate call check_range { min = 0, max = 1 };
++                       default 0;
++                }
++                %persistent string WpaPskFile;
++                %persistent string SaePasswordFile;
++
++                /*
++                 * MLME MGMT Beacon Control
++                */
++                %persistent string BeaconRate;
++                %persistent string SupportedRates;
++                %persistent string BasicRates;
++                %persistent string ProbeResponseRate;
++
+ 	} /* object AccessPoint */
+     }
+ }
+Index: pwhm-v7.14.11/src/nl80211/wld_hostapd_cfgFile.c
+===================================================================
+--- pwhm-v7.14.11.orig/src/nl80211/wld_hostapd_cfgFile.c
++++ pwhm-v7.14.11/src/nl80211/wld_hostapd_cfgFile.c
+@@ -1161,6 +1161,29 @@ static bool s_setVapCommonConfig(T_Acces
+         swl_mapCharFmt_addValInt32(vapConfigMap, "wpa_group_update_count", 8);
+         swl_mapCharFmt_addValInt32(vapConfigMap, "wpa_pairwise_update_count", 8);
+     }
++
++    if(pAP->dynamicVlan) {
++        swl_mapCharFmt_addValInt32(vapConfigMap, "dynamic_vlan", pAP->dynamicVlan);
++        swl_mapCharFmt_addValInt32(vapConfigMap, "vlan_naming", pAP->vlanNaming);
++        if(!swl_str_isEmpty(pAP->vlanTaggedInterface))
++             swl_mapCharFmt_addValStr(vapConfigMap, "vlan_tagged_interface", pAP->vlanTaggedInterface);
++         if(!swl_str_isEmpty(pAP->vlanBridge))
++             swl_mapCharFmt_addValStr(vapConfigMap, "vlan_bridge", pAP->vlanBridge);
++         if(!swl_str_isEmpty(pAP->wpaPskFile))
++             swl_mapCharFmt_addValStr(vapConfigMap, "wpa_psk_file", pAP->wpaPskFile);
++         if(!swl_str_isEmpty(pAP->saePasswordFile))
++             swl_mapCharFmt_addValStr(vapConfigMap, "sae_password_file", pAP->saePasswordFile);
++    }
++
++    if(!swl_str_isEmpty(pAP->beaconRate))
++         swl_mapCharFmt_addValStr(vapConfigMap, "beacon_rate", pAP->beaconRate);
++    if(!swl_str_isEmpty(pAP->supportedRates))
++         swl_mapCharFmt_addValStr(vapConfigMap, "supported_rates", pAP->supportedRates);
++    if(!swl_str_isEmpty(pAP->basicRates))
++         swl_mapCharFmt_addValStr(vapConfigMap, "basic_rates", pAP->basicRates);
++    if(!swl_str_isEmpty(pAP->probeResponseRate))
++         swl_mapCharFmt_addValStr(vapConfigMap, "probe_resp_rate", pAP->probeResponseRate);
++
+     return true;
+ }
+ 
+Index: pwhm-v7.14.11/src/wld_accesspoint.c
+===================================================================
+--- pwhm-v7.14.11.orig/src/wld_accesspoint.c
++++ pwhm-v7.14.11/src/wld_accesspoint.c
+@@ -2923,6 +2923,137 @@ amxd_status_t _AccessPoint_debug(amxd_ob
+     return amxd_status_ok;
+ }
+ 
++static void s_setDynamicVlan_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_AccessPoint* pAP = wld_ap_fromObj(object);
++    ASSERT_NOT_NULL(pAP, , ME, "INVALID");
++
++    uint8_t dynamicVlan = amxc_var_dyncast(uint8_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set dynamicVlan %d", pAP->alias, dynamicVlan);
++    pAP->dynamicVlan = dynamicVlan;
++    wld_ap_doSync(pAP);
++    SAH_TRACEZ_OUT(ME);
++}
++
++static void s_setVlanNaming_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_AccessPoint* pAP = wld_ap_fromObj(object);
++    ASSERT_NOT_NULL(pAP, , ME, "INVALID");
++
++    uint8_t vlanNaming = amxc_var_dyncast(uint8_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set VlanNaming %d", pAP->alias, vlanNaming);
++    pAP->vlanNaming = vlanNaming;
++    wld_ap_doSync(pAP);
++    SAH_TRACEZ_OUT(ME);
++}
++
++static void s_setVlanTaggedInterface_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_AccessPoint* pAP = wld_ap_fromObj(object);
++    ASSERT_NOT_NULL(pAP, , ME, "INVALID");
++
++    const char* vlanTaggedInterface = amxc_var_constcast(cstring_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set VlanTaggedInterface %s", pAP->alias, vlanTaggedInterface);
++    swl_str_copy(pAP->vlanTaggedInterface, sizeof(pAP->vlanTaggedInterface), vlanTaggedInterface);
++    wld_ap_doSync(pAP);
++    SAH_TRACEZ_OUT(ME);
++}
++
++static void s_setVlanBridge_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_AccessPoint* pAP = wld_ap_fromObj(object);
++    ASSERT_NOT_NULL(pAP, , ME, "INVALID");
++
++    const char* vlanBridge = amxc_var_constcast(cstring_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set VlanBridge %s", pAP->alias, vlanBridge);
++    swl_str_copy(pAP->vlanBridge, sizeof(pAP->vlanBridge), vlanBridge);
++    wld_ap_doSync(pAP);
++    SAH_TRACEZ_OUT(ME);
++}
++
++static void s_setWpaPskFile_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_AccessPoint* pAP = wld_ap_fromObj(object);
++    ASSERT_NOT_NULL(pAP, , ME, "INVALID");
++
++    const char* wpaPskFile = amxc_var_constcast(cstring_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set WpaPskFile %s", pAP->alias, wpaPskFile);
++    swl_str_copy(pAP->wpaPskFile, sizeof(pAP->wpaPskFile), wpaPskFile);
++    wld_ap_doSync(pAP);
++    SAH_TRACEZ_OUT(ME);
++}
++
++static void s_setSaePasswordFile_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_AccessPoint* pAP = wld_ap_fromObj(object);
++    ASSERT_NOT_NULL(pAP, , ME, "INVALID");
++
++    const char* saePasswordFile = amxc_var_constcast(cstring_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set SaePasswordFile %s", pAP->alias, saePasswordFile);
++    swl_str_copy(pAP->saePasswordFile, sizeof(pAP->saePasswordFile), saePasswordFile);
++    wld_ap_doSync(pAP);
++    SAH_TRACEZ_OUT(ME);
++}
++
++static void s_setBeaconRate_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_AccessPoint* pAP = wld_ap_fromObj(object);
++    ASSERT_NOT_NULL(pAP, , ME, "INVALID");
++
++    const char* beaconRate = amxc_var_constcast(cstring_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set BeaconRate %s", pAP->alias, beaconRate);
++    swl_str_copy(pAP->beaconRate, sizeof(pAP->beaconRate), beaconRate);
++    wld_ap_doSync(pAP);
++    SAH_TRACEZ_OUT(ME);
++}
++
++static void s_setSupportedRates_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_AccessPoint* pAP = wld_ap_fromObj(object);
++    ASSERT_NOT_NULL(pAP, , ME, "INVALID");
++
++    const char* supportedRates = amxc_var_constcast(cstring_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set SupportedRates %s", pAP->alias, supportedRates);
++    swl_str_copy(pAP->supportedRates, sizeof(pAP->supportedRates), supportedRates);
++    wld_ap_doSync(pAP);
++    SAH_TRACEZ_OUT(ME);
++}
++
++static void s_setBasicRates_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_AccessPoint* pAP = wld_ap_fromObj(object);
++    ASSERT_NOT_NULL(pAP, , ME, "INVALID");
++
++    const char* basicRates = amxc_var_constcast(cstring_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set BasicRates %s", pAP->alias, basicRates);
++    swl_str_copy(pAP->basicRates, sizeof(pAP->basicRates), basicRates);
++    wld_ap_doSync(pAP);
++    SAH_TRACEZ_OUT(ME);
++}
++
++static void s_setProbeResponseRate_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_AccessPoint* pAP = wld_ap_fromObj(object);
++    ASSERT_NOT_NULL(pAP, , ME, "INVALID");
++
++    const char* probeResponseRate = amxc_var_constcast(cstring_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set ProbeResponseRate %s", pAP->alias, probeResponseRate);
++    swl_str_copy(pAP->probeResponseRate, sizeof(pAP->probeResponseRate), probeResponseRate);
++    wld_ap_doSync(pAP);
++    SAH_TRACEZ_OUT(ME);
++}
++
++
+ SWLA_DM_HDLRS(sApDmHdlrs,
+               ARR(SWLA_DM_PARAM_HDLR("SSIDReference", s_setSSIDRef_pwf),
+                   SWLA_DM_PARAM_HDLR("SSIDAdvertisementEnabled", s_setSsidAdvEnabled_pwf),
+@@ -2952,6 +3083,16 @@ SWLA_DM_HDLRS(sApDmHdlrs,
+                   SWLA_DM_PARAM_HDLR("Enable", s_setApEnable_pwf),
+                   SWLA_DM_PARAM_HDLR("MACAddressControlEnabled", s_setMACAddressControlEnabled_pwf),
+                   SWLA_DM_PARAM_HDLR("StaInactivityTimeout", s_setStaInactivityTimeout_pwf),
++                  SWLA_DM_PARAM_HDLR("DynamicVlan", s_setDynamicVlan_pwf),
++                  SWLA_DM_PARAM_HDLR("VlanNaming", s_setVlanNaming_pwf),
++                  SWLA_DM_PARAM_HDLR("VlanTaggedInterface", s_setVlanTaggedInterface_pwf),
++                  SWLA_DM_PARAM_HDLR("VlanBridge", s_setVlanBridge_pwf),
++                  SWLA_DM_PARAM_HDLR("WpaPskFile", s_setWpaPskFile_pwf),
++                  SWLA_DM_PARAM_HDLR("SaePasswordFile", s_setSaePasswordFile_pwf),
++                  SWLA_DM_PARAM_HDLR("BeaconRate", s_setBeaconRate_pwf),
++                  SWLA_DM_PARAM_HDLR("SupportedRates", s_setSupportedRates_pwf),
++                  SWLA_DM_PARAM_HDLR("BasicRates", s_setBasicRates_pwf),
++                  SWLA_DM_PARAM_HDLR("ProbeResponseRate", s_setProbeResponseRate_pwf),
+                   ),
+               .instAddedCb = s_addApInst_oaf, );
+ 
