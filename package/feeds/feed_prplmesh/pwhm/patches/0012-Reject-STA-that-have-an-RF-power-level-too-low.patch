@@ -1,0 +1,129 @@
+From e63f52575d1b941d92d80c1946703225b0e43261 Mon Sep 17 00:00:00 2001
+From: Harini Pavithra Elangovan <helangov@qti.qualcomm.com>
+Date: Mon, 9 Mar 2026 14:38:05 +0530
+Subject: [PATCH 1/1] Reject STA that have an RF power level too low
+
+Signed-off-by: Harini Pavithra Elangovan <helangov@qti.qualcomm.com>
+---
+ include/wld/wld.h                 |  3 +++
+ odl/wld_accesspoint.odl           | 10 +++++++-
+ src/nl80211/wld_hostapd_cfgFile.c | 10 ++++++++++
+ src/wld_accesspoint.c             | 42 ++++++++++++++++++++++++++++++++
+ 4 files changed, 64 insertions(+), 1 deletion(-)
+
+diff --git a/include/wld/wld.h b/include/wld/wld.h
+index f03c8d8..10d05df 100644
+--- a/include/wld/wld.h
++++ b/include/wld/wld.h
+@@ -1999,6 +1999,9 @@ struct S_ACCESSPOINT {
+     char probeResponseRate[128];
+     uint32_t htMcsNssSet;                     /* HT MCS NSS bitmask: 0=hw default, 1-0xffffffff=disable specific HT MCS rates */
+     uint16_t vhtMcsNssSet;                    /* VHT MCS NSS bitmask: 0=hw default, 1-0xffff=disable specific VHT MCS rates */
++    int rssiRejectAssocRssi;
++    uint32_t rssiRejectAssocTimeout;
++    uint32_t rssiDeauthGraceSamples;
+ };
+ 
+ typedef struct SWL_PACKED {
+diff --git a/odl/wld_accesspoint.odl b/odl/wld_accesspoint.odl
+index a07463d..735abfa 100644
+--- a/odl/wld_accesspoint.odl
++++ b/odl/wld_accesspoint.odl
+@@ -2623,7 +2623,13 @@ define rrm_t{
+                 %persistent string SupportedRates;
+                 %persistent string BasicRates;
+                 %persistent string ProbeResponseRate;
+-
++                
++                /*
++                 * RSSI based Assoc rejection configurations
++                */
++                %persistent int32 RssiRejectAssocRssi;
++                %persistent uint32 RssiRejectAssocTimeout;
++                %persistent uint32 RssiDeauthGraceSamples;
+ 	} /* object AccessPoint */
+     }
+ }
+diff --git a/src/nl80211/wld_hostapd_cfgFile.c b/src/nl80211/wld_hostapd_cfgFile.c
+index 4fffae6..21255de 100644
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -1209,6 +1209,16 @@ static bool s_setVapCommonConfig(T_AccessPoint* pAP, swl_mapChar_t* vapConfigMap
+     if(!swl_str_isEmpty(pAP->probeResponseRate))
+          swl_mapCharFmt_addValStr(vapConfigMap, "probe_resp_rate", pAP->probeResponseRate);
+ 
++    if (pAP->rssiRejectAssocRssi != 0) {
++        swl_mapCharFmt_addValInt32(vapConfigMap, "rssi_reject_assoc_rssi", pAP->rssiRejectAssocRssi);
++    }
++    if (pAP->rssiRejectAssocTimeout != 0) {
++        swl_mapCharFmt_addValInt32(vapConfigMap, "rssi_reject_assoc_timeout", pAP->rssiRejectAssocTimeout);
++    }
++    if (pAP->rssiDeauthGraceSamples != 0) {
++        swl_mapCharFmt_addValInt32(vapConfigMap, "rssi_deauth_grace_samples", pAP->rssiDeauthGraceSamples);
++    }
++
+     return true;
+ }
+ 
+diff --git a/src/wld_accesspoint.c b/src/wld_accesspoint.c
+index 9c5464a..4340c23 100644
+--- a/src/wld_accesspoint.c
++++ b/src/wld_accesspoint.c
+@@ -3020,6 +3020,45 @@ static void s_setProbeResponseRate_pwf(void* priv _UNUSED, amxd_object_t* object
+     SAH_TRACEZ_OUT(ME);
+ }
+ 
++static void s_setRssiRejectAssocRssi_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_AccessPoint* pAP = wld_ap_fromObj(object);
++    ASSERT_NOT_NULL(pAP, , ME, "INVALID");
++
++    int8_t rssiRejectAssocRssi = amxc_var_dyncast(int8_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set RssiRejectAssocRssi %d", pAP->alias, rssiRejectAssocRssi);
++    pAP->rssiRejectAssocRssi = rssiRejectAssocRssi;
++    wld_ap_doSync(pAP);
++    SAH_TRACEZ_OUT(ME);
++}
++
++static void s_setRssiRejectAssocTimeout_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_AccessPoint* pAP = wld_ap_fromObj(object);
++    ASSERT_NOT_NULL(pAP, , ME, "INVALID");
++
++    uint8_t  rssiRejectAssocTimeout = amxc_var_dyncast(uint8_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set RssiRejectAssocTimeout %d", pAP->alias, rssiRejectAssocTimeout);
++    pAP->rssiRejectAssocTimeout = rssiRejectAssocTimeout;
++    wld_ap_doSync(pAP);
++    SAH_TRACEZ_OUT(ME);
++}
++
++static void s_setRssiDeauthGraceSamples_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_AccessPoint* pAP = wld_ap_fromObj(object);
++    ASSERT_NOT_NULL(pAP, , ME, "INVALID");
++
++    uint8_t  rssiDeauthGraceSamples = amxc_var_dyncast(uint8_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set RssiDeauthGraceSamples %d", pAP->alias, rssiDeauthGraceSamples);
++    pAP->rssiDeauthGraceSamples = rssiDeauthGraceSamples;
++    wld_ap_doSync(pAP);
++    SAH_TRACEZ_OUT(ME);
++}
++
+ 
+ SWLA_DM_HDLRS(sApDmHdlrs,
+               ARR(SWLA_DM_PARAM_HDLR("SSIDReference", s_setSSIDRef_pwf),
+@@ -3024,6 +3063,9 @@ SWLA_DM_HDLRS(sApDmHdlrs,
+                   SWLA_DM_PARAM_HDLR("SupportedRates", s_setSupportedRates_pwf),
+                   SWLA_DM_PARAM_HDLR("BasicRates", s_setBasicRates_pwf),
+                   SWLA_DM_PARAM_HDLR("ProbeResponseRate", s_setProbeResponseRate_pwf),
++		  SWLA_DM_PARAM_HDLR("RssiRejectAssocRssi", s_setRssiRejectAssocRssi_pwf),
++                  SWLA_DM_PARAM_HDLR("RssiRejectAssocTimeout", s_setRssiRejectAssocTimeout_pwf),
++                  SWLA_DM_PARAM_HDLR("RssiDeauthGraceSamples", s_setRssiDeauthGraceSamples_pwf),
+                   ),
+               .instAddedCb = s_addApInst_oaf, );
+ 
+-- 
+2.34.1

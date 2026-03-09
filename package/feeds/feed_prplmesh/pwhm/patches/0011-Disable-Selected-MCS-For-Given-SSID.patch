@@ -1,0 +1,210 @@
+From 7eaebf1ae204bf9f1da03bcea62ecc643a37552f Mon Sep 17 00:00:00 2001
+From: Harini Pavithra Elangovan <helangov@qti.qualcomm.com>
+Date: Mon, 2 Mar 2026 14:47:00 +0530
+Subject: [PATCH 1/1] Disable Selected MCS For Given SSID
+
+Signed-off-by: Harini Pavithra Elangovan <helangov@qti.qualcomm.com>
+---
+ include/wld/wld.h                 |   2 +
+ odl/wld_accesspoint.odl           |  29 +++++++++
+ src/nl80211/wld_hostapd_cfgFile.c |  26 ++++++++++++++++++++++++++-
+ src/wld_accesspoint.c             |  93 +++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 135 insertions(+), 1 deletion(-)
+
+diff --git a/include/wld/wld.h b/include/wld/wld.h
+index 70ae124..eb60953 100644
+--- a/include/wld/wld.h
++++ b/include/wld/wld.h
+@@ -1997,6 +1997,8 @@ struct S_ACCESSPOINT {
+     char supportedRates[128];
+     char basicRates[128];
+     char probeResponseRate[128];
++    uint32_t htMcsNssSet;                     /* HT MCS NSS bitmask: 0=hw default, 1-0xffffffff=disable specific HT MCS rates */
++    uint16_t vhtMcsNssSet;                    /* VHT MCS NSS bitmask: 0=hw default, 1-0xffff=disable specific VHT MCS rates */
+ };
+ 
+ typedef struct SWL_PACKED {
+diff --git a/odl/wld_accesspoint.odl b/odl/wld_accesspoint.odl
+index de2d2f0..20d543f 100644
+--- a/odl/wld_accesspoint.odl
++++ b/odl/wld_accesspoint.odl
+@@ -534,6 +534,35 @@ define rrm_t{
+		%persistent bool IsolationEnable{
+			default false;
+		}
++
++		/**
++		 * HT MCS NSS bitmask for this Access Point VAP.
++		 * Each bit represents an HT MCS index (MCS 0 to MCS 31).
++		 * Bit set to 1 means that MCS rate is disabled for Tx and Rx on this VAP.
++		 * A value of 0 means no restriction (use hardware defaults).
++		 * Allowed values: 0 to 0xffffffff
++		 * @version 1.0
++		 */
++		%persistent uint32 HtMcsNssSet {
++			on action validate call check_range { min = 0, max = 4294967295 };
++			default 0;
++		}
++
++		/**
++		 * VHT MCS NSS bitmask for this Access Point VAP.
++		 * 2 bits per NSS (spatial stream), following IEEE 802.11 VHT MCS encoding:
++		 * * 00 - VHT-MCS 0-7 supported
++		 * * 01 - VHT-MCS 0-8 supported
++		 * * 10 - VHT-MCS 0-9 supported
++		 * * 11 - NSS not supported
++		 * A value of 0 means no restriction (use hardware defaults).
++		 * Allowed values: 0 to 65535 (0xffff)
++		 * @version 1.0
++		 */
++		%persistent uint32 VhtMcsNssSet {
++			on action validate call check_range { min = 0, max = 65535 };
++			default 0;
++		}
+ 
+		/** This object contains security related parameters that apply
+		 * to a CPE acting as an Access Point */
+diff --git a/src/nl80211/wld_hostapd_cfgFile.c b/src/nl80211/wld_hostapd_cfgFile.c
+index 72c308a..800a96b 100644
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -794,7 +794,7 @@ static bool s_setVapCommonConfig(T_AccessPoint* pAP, swl_mapChar_t* vapConfigMap
+     T_Radio* pRad = pAP->pRadio;
+     ASSERTS_NOT_NULL(pRad, false, ME, "NULL");
+     ASSERTS_NOT_NULL(vapConfigMap, false, ME, "NULL");
+-    int tval = 0;
++    int tval, rc = 0;
+     const char* linkIfName = "";
+     if(pAP == wld_rad_hostapd_getCfgMainVap(pRad)) {
+         linkIfName = wld_hostapd_ap_selectApLinkIface(pAP);
+@@ -842,6 +842,31 @@ static bool s_setVapCommonConfig(T_AccessPoint* pAP, swl_mapChar_t* vapConfigMap
+     swl_mapCharFmt_addValStr(vapConfigMap, "vendor_elements", "%s", "dd050026861401");
+ 
+     swl_mapCharFmt_addValInt32(vapConfigMap, "ap_isolate", pAP->clientIsolationEnable);
++
++    if(pAP->vhtMcsNssSet != 0) {
++        //swl_mapCharFmt_addValInt32(vapConfigMap, "vht_mcs_nss_set", pAP->vhtMcsNssSet);
++        swl_mapCharFmt_addValStr(vapConfigMap, "vht_mcs_nss_set", "0x%x", pAP->vhtMcsNssSet);
++        SAH_TRACEZ_INFO(ME, "%s: Set vht_mcs_nss_set = 0x%x", pAP->alias, pAP->vhtMcsNssSet);
++
++        rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pAP->wpaCtrlInterface, "OK", "SET vht_mcs_nss_set 0x%x", pAP->vhtMcsNssSet);
++        //the call may timeout while being applied, but that only happens on success
++        if(rc == SWL_RC_NOT_AVAILABLE) {
++         rc = SWL_RC_CONTINUE;
++         }
++    }
++
++    if(pAP->htMcsNssSet != 0) {
++        //swl_mapCharFmt_addValInt32(vapConfigMap, "ht_mcs_nss_set", pAP->htMcsNssSet);
++        swl_mapCharFmt_addValStr(vapConfigMap, "ht_mcs_nss_set", "0x%x", pAP->htMcsNssSet);
++        SAH_TRACEZ_INFO(ME, "%s: Set ht_mcs_nss_set = 0x%x", pAP->alias, pAP->htMcsNssSet);
++
++        rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pAP->wpaCtrlInterface, "OK", "SET ht_mcs_nss_set 0x%x", pAP->htMcsNssSet);
++        //the call may timeout while being applied, but that only happens on success
++        if(rc == SWL_RC_NOT_AVAILABLE) {
++         rc = SWL_RC_CONTINUE;
++         }
++    }
++
+     swl_mapChar_add(vapConfigMap, "ignore_broadcast_ssid", pAP->SSIDAdvertisementEnabled ? "0" : "2");
+     if(!wld_ap_hasStackEnabled(pAP)) {
+         swl_mapChar_add(vapConfigMap, "start_disabled", "1");
+diff --git a/src/wld_accesspoint.c b/src/wld_accesspoint.c
+index f8776ff..57afd49 100644
+--- a/src/wld_accesspoint.c
++++ b/src/wld_accesspoint.c
+@@ -883,6 +883,9 @@ void SyncData_AP2OBJ(amxd_object_t* object, T_AccessPoint* pAP, int set) {
+ 
+         amxd_trans_set_bool(&trans, "IEEE80211kEnabled", pAP->IEEE80211kEnable);
+ 
++        amxd_trans_set_uint32_t(&trans, "HtMcsNssSet",  pAP->htMcsNssSet);
++        amxd_trans_set_uint32_t(&trans, "VhtMcsNssSet", (uint32_t)pAP->vhtMcsNssSet);
++
+         amxd_trans_set_bool(&trans, "WDSEnable", pAP->wdsEnable);
+ 
+         swl_conv_transParamSetMask(&trans, "MultiAPType", pAP->multiAPType, cstr_MultiAPType, MULTIAP_MAX);
+@@ -1028,6 +1031,18 @@ void SyncData_AP2OBJ(amxd_object_t* object, T_AccessPoint* pAP, int set) {
+             pAP->pFA->mfn_wvap_sync(pAP, SET);
+         }
+ 
++        uint32_t tmp_u32 = amxd_object_get_uint32_t(object, "HtMcsNssSet", NULL);
++        if(pAP->htMcsNssSet != tmp_u32) {
++            pAP->htMcsNssSet = tmp_u32;
++            wld_ap_doSync(pAP);
++        }
++
++        tmp_u32 = amxd_object_get_uint32_t(object, "VhtMcsNssSet", NULL);
++        if(pAP->vhtMcsNssSet != (uint16_t)tmp_u32) {
++            pAP->vhtMcsNssSet = (uint16_t)tmp_u32;
++            wld_ap_doSync(pAP);
++        }
++
+         tmp_bool = amxd_object_get_bool(object, "IEEE80211kEnabled", NULL);
+         if(pAP->IEEE80211kEnable != tmp_bool) {
+             pAP->IEEE80211kEnable = tmp_bool;
+@@ -1265,6 +1280,54 @@ static void s_setWDSEnable_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_p
+     SAH_TRACEZ_OUT(ME);
+ }
+ 
++static void s_setHtMcsNssSet_pwf(void* priv _UNUSED,
++                                 amxd_object_t* object,
++                                 amxd_param_t* param _UNUSED,
++                                 const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_AccessPoint* pAP = wld_ap_fromObj(object);
++    if(pAP == NULL) {
++        SAH_TRACEZ_INFO(ME, "AccessPoint is NULL");
++        SAH_TRACEZ_OUT(ME);
++        return;
++    }
++
++    uint32_t val = amxc_var_dyncast(uint32_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: Set HtMcsNssSet = 0x%x", pAP->alias, val);
++
++    if(pAP->htMcsNssSet != val) {
++        pAP->htMcsNssSet = val;
++        wld_ap_doSync(pAP);
++    }
++
++    SAH_TRACEZ_OUT(ME);
++}
++
++static void s_setVhtMcsNssSet_pwf(void* priv _UNUSED,
++                                  amxd_object_t* object,
++                                  amxd_param_t* param _UNUSED,
++                                  const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_AccessPoint* pAP = wld_ap_fromObj(object);
++    if(pAP == NULL) {
++        SAH_TRACEZ_INFO(ME, "AccessPoint is NULL");
++        SAH_TRACEZ_OUT(ME);
++        return;
++    }
++
++    uint16_t val = (uint16_t)amxc_var_dyncast(uint32_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: Set VhtMcsNssSet = 0x%x", pAP->alias, val);
++
++    if(pAP->vhtMcsNssSet != val) {
++        pAP->vhtMcsNssSet = val;
++        wld_ap_doSync(pAP);
++    }
++
++    SAH_TRACEZ_OUT(ME);
++}
++
+ static void s_setMBOEnable_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
+     SAH_TRACEZ_IN(ME);
+ 
+@@ -3064,6 +3127,8 @@ SWLA_DM_HDLRS(sApDmHdlrs,
+                   SWLA_DM_PARAM_HDLR("IEEE80211kEnabled", s_set80211kEnabled_pwf),
+                   SWLA_DM_PARAM_HDLR("WDSEnable", s_setWDSEnable_pwf),
+                   SWLA_DM_PARAM_HDLR("MBOEnable", s_setMBOEnable_pwf),
++                  SWLA_DM_PARAM_HDLR("HtMcsNssSet",  s_setHtMcsNssSet_pwf),
++                  SWLA_DM_PARAM_HDLR("VhtMcsNssSet", s_setVhtMcsNssSet_pwf),
+                   SWLA_DM_PARAM_HDLR("MBOAssocDisallowReason", s_setMBOAssocDisallowReason_pwf),
+                   SWLA_DM_PARAM_HDLR("MultiAPType", s_setMultiAPType_pwf),
+                   SWLA_DM_PARAM_HDLR("MultiAPProfile", s_setMultiAPProfile_pwf),
+-- 
+2.34.1
