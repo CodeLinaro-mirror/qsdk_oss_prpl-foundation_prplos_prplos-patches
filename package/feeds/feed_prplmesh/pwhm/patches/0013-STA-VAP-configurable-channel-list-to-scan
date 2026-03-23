@@ -1,0 +1,101 @@
+From 07a33f08ddb006fa2faec329fcc48bd466286cff Mon Sep 17 00:00:00 2001
+From: Thiagarajan Rajagopalan <thiaraja@qti.qualcomm.com>
+Date: Thu, 19 Mar 2026 12:58:13 +0530
+Subject: [PATCH] pwhm: Add data models support in ubus-cli
+
+Added data model to support configuring STA VAP scan channel list
+and background scan frequency list
+
+Change-Id: I5a37b2ff65bfdc0e5d18bea2b1c0d34438faf53b
+Signed-off-by: Thiagarajan Rajagopalan <thiaraja@qti.qualcomm.com>
+---
+ ...-STA-VAP-configurable-channel-list-to-scan | 85 +++++++++++++++++++
+ 1 file changed, 85 insertions(+)
+ create mode 100644 package/feeds/feed_prplmesh/pwhm/patches/0013-STA-VAP-configurable-channel-list-to-scan
+
+
+Index: pwhm-v7.14.11/include/wld/wld.h
+===================================================================
+--- pwhm-v7.14.11.orig/include/wld/wld.h
++++ pwhm-v7.14.11/include/wld/wld.h
+@@ -2212,6 +2212,9 @@ struct _EndPointProfile {
+     amxc_llist_it_t it;
+     amxd_object_t* pBus;
+     T_EndPoint* endpoint;
++    char scanFrequency[128];
++    char backgroundScan[32];
++    char backgroundScanFrequency[128];
+ };
+ 
+ 
+Index: pwhm-v7.14.11/odl/wld_endpoint.odl
+===================================================================
+--- pwhm-v7.14.11.orig/odl/wld_endpoint.odl
++++ pwhm-v7.14.11/odl/wld_endpoint.odl
+@@ -591,6 +591,13 @@
+ 				userflags %upc;
+ 			}
+ 
++			/**
++			 * Configure the scan frequency, background scan frequency
++			 */
++			%persistent string ScanFrequency;
++			%persistent string BackgroundScan;
++			%persistent string BackgroundScanFrequency;
++
+ 			/** This object contains security related parameters that apply
+ 			 *  to a WiFi End Point profile.*/
+ 			%persistent object Security{
+Index: pwhm-v7.14.11/src/nl80211/wld_wpaSupp_cfgFile.c
+===================================================================
+--- pwhm-v7.14.11.orig/src/nl80211/wld_wpaSupp_cfgFile.c
++++ pwhm-v7.14.11/src/nl80211/wld_wpaSupp_cfgFile.c
+@@ -224,6 +224,16 @@ static swl_rc_ne s_setWpaSuppNetworkConf
+         swl_mapChar_add(network, "pin", pEP->WPS_ClientPIN);
+     }
+ 
++    if(!swl_str_isEmpty(epProfile->scanFrequency)) {
++        swl_mapChar_add(network, "scan_freq", epProfile->scanFrequency);
++    }
++    if(!swl_str_isEmpty(epProfile->backgroundScan)) {
++        swl_mapChar_add(network, "bgscan", epProfile->backgroundScan);
++    }
++    if(!swl_str_isEmpty(epProfile->backgroundScanFrequency)) {
++        swl_mapChar_add(network, "bgscan_freq", epProfile->backgroundScanFrequency);
++    }
++
+     swl_security_mfpMode_e mfp = swl_security_getTargetMfpMode(epProfile->secModeEnabled, epProfile->mfpConfig);
+ 
+     switch(epProfile->secModeEnabled) {
+Index: pwhm-v7.14.11/src/wld_endpoint.c
+===================================================================
+--- pwhm-v7.14.11.orig/src/wld_endpoint.c
++++ pwhm-v7.14.11/src/wld_endpoint.c
+@@ -781,6 +781,27 @@ bool syncData_Object2EndPointProfile(amx
+     }
+     free(ssid);
+ 
++    char* scanFrequency = amxd_object_get_cstring_t(object, "ScanFrequency", NULL);
++    if(!swl_str_matches(scanFrequency, pProfile->scanFrequency)) {
++        changed |= 1;
++        swl_str_copy(pProfile->scanFrequency, sizeof(pProfile->scanFrequency), scanFrequency);
++    }
++    free(scanFrequency);
++
++    char* backgroundScan = amxd_object_get_cstring_t(object, "BackgroundScan", NULL);
++    if(!swl_str_matches(backgroundScan, pProfile->backgroundScan)) {
++        changed |= 1;
++        swl_str_copy(pProfile->backgroundScan, sizeof(pProfile->backgroundScan), backgroundScan);
++    }
++    free(backgroundScan);
++
++    char* backgroundScanFrequency = amxd_object_get_cstring_t(object, "BackgroundScanFrequency", NULL);
++    if(!swl_str_matches(backgroundScanFrequency, pProfile->backgroundScanFrequency)) {
++        changed |= 1;
++        swl_str_copy(pProfile->backgroundScanFrequency, sizeof(pProfile->backgroundScanFrequency), backgroundScanFrequency);
++    }
++    free(backgroundScanFrequency);
++
+     char* bssid = amxd_object_get_cstring_t(object, "ForceBSSID", NULL);
+     if((bssid == 0) || (bssid[0] == 0)
+        || !wldu_convStr2Mac((unsigned char*) BSSID, sizeof(BSSID), bssid, strlen(bssid))) {
