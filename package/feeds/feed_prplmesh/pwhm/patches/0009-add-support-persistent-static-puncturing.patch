@@ -1,0 +1,34 @@
+From ee9966c645b5093f4299dcc3169c53bdc6f3262a Mon Sep 17 00:00:00 2001
+From: Atchaya R <ratchaya@qti.qualcomm.com>
+Date: Mon, 9 Mar 2026 18:36:24 +0530
+Subject: [PATCH] prpl-patches: add support to enable static puncturing channel
+ persistent post reboot
+
+Change-Id: I8d407de38fc251b299eec1c80630c537d09961ce
+Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
+---
+ ...support-persistent-static-puncturing.patch | 20 +++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+ create mode 100644 package/feeds/feed_prplmesh/pwhm/patches/0009-add-support-persistent-static-puncturing.patch
+
+
+--- a/odl/wld_radio.odl
++++ b/odl/wld_radio.odl
+@@ -3288,15 +3288,14 @@ define probelist_t{
+ 		/**
+ 		 * Static puncturing feature
+ 		 */
+-		object StaticPuncturing{
++		%persistent object StaticPuncturing{
+ 			on event "*" call wld_rad_setStaticPuncturing_ocf;
+ 
+ 			/**
+ 			 * Comma-separated list of channels to disable
+ 			 */
+-			csv_string DisabledSubChannels{
++			%persistent csv_string DisabledSubChannels{
+ 				on action validate call wld_rad_validateDisabledSubChannels_pvf;
+-				default "";
+ 			}
+ 		}
+  
