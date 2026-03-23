@@ -1,0 +1,198 @@
+From f9253c4a5f90475a593bab690544086a81c24a3b Mon Sep 17 00:00:00 2001
+From: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+Date: Tue, 24 Mar 2026 12:13:30 +0530
+Subject: [PATCH 1/1] Add generation of vendor_elements and assocresp_elements
+
+Signed-off-by: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+---
+ include_priv/Plugin/wifiGen_vap.h |  3 ++
+ src/Plugin/wifiGen.c              |  3 ++
+ src/Plugin/wifiGen_vap.c          | 24 ++++++++++++
+ src/nl80211/wld_hostapd_ap_api.c  |  3 ++
+ src/nl80211/wld_hostapd_cfgFile.c | 61 +++++++++++++++++++++++++++++++
+ src/wld_accesspoint.c             |  4 +-
+ 6 files changed, 96 insertions(+), 2 deletions(-)
+
+diff --git a/include_priv/Plugin/wifiGen_vap.h b/include_priv/Plugin/wifiGen_vap.h
+index 9e7fd84..696b634 100644
+--- a/include_priv/Plugin/wifiGen_vap.h
++++ b/include_priv/Plugin/wifiGen_vap.h
+@@ -100,4 +100,7 @@ swl_rc_ne wifiGen_vap_setMldUnit(T_AccessPoint* pAP);
+ swl_rc_ne wifiGen_vap_postUpActions(T_AccessPoint* pAP);
+ swl_rc_ne wifiGen_vap_postDownActions(T_AccessPoint* pAP);
+ swl_rc_ne wifiGen_vap_getMloStats(T_AccessPoint* pAP, wld_mloStats_t* pStats);
++swl_rc_ne wifiGen_vap_addVendorIe(T_AccessPoint* pAP, wld_vendorIe_t* vendorIe);
++swl_rc_ne wifiGen_vap_delVendorIe(T_AccessPoint* pAP, wld_vendorIe_t* vendorIe);
++swl_rc_ne wifiGen_vap_enabVendorIe(T_AccessPoint* pAP, int enable);
+ #endif /* INCLUDE_PRIV_PLUGIN_WIFIGEN_VAP_H_ */
+diff --git a/src/Plugin/wifiGen.c b/src/Plugin/wifiGen.c
+index e995264..191fde0 100644
+--- a/src/Plugin/wifiGen.c
++++ b/src/Plugin/wifiGen.c
+@@ -184,6 +184,9 @@ bool wifiGen_init() {
+     fta.mfn_wvap_set_discovery_method = wifiGen_vap_setDiscoveryMethod;
+     fta.mfn_wvap_setMldUnit = wifiGen_vap_setMldUnit;
+     fta.mfn_wvap_getMloStats = wifiGen_vap_getMloStats;
++    fta.mfn_wvap_add_vendor_ie = wifiGen_vap_addVendorIe;
++    fta.mfn_wvap_del_vendor_ie = wifiGen_vap_delVendorIe;
++    fta.mfn_wvap_enab_vendor_ie = wifiGen_vap_enabVendorIe;
+ 
+     //endpoint functions
+     fta.mfn_wendpoint_create_hook = wifiGen_ep_createHook;
+diff --git a/src/Plugin/wifiGen_vap.c b/src/Plugin/wifiGen_vap.c
+index 4ee89f3..52e0731 100644
+--- a/src/Plugin/wifiGen_vap.c
++++ b/src/Plugin/wifiGen_vap.c
+@@ -835,3 +835,27 @@ swl_rc_ne wifiGen_vap_postDownActions(T_AccessPoint* pAP) {
+     }
+     return SWL_RC_OK;
+ }
++
++swl_rc_ne wifiGen_vap_addVendorIe(T_AccessPoint* pAP, wld_vendorIe_t* vendorIe) {
++    ASSERTS_NOT_NULL(pAP, SWL_RC_INVALID_PARAM, ME, "NULL");
++    _UNUSED_(vendorIe);
++
++    wld_ap_doSync(pAP);
++    return SWL_RC_OK;
++}
++
++swl_rc_ne wifiGen_vap_delVendorIe(T_AccessPoint* pAP, wld_vendorIe_t* vendorIe) {
++    ASSERTS_NOT_NULL(pAP, SWL_RC_INVALID_PARAM, ME, "NULL");
++    _UNUSED_(vendorIe);
++
++    wld_ap_doSync(pAP);
++    return SWL_RC_OK;
++}
++
++swl_rc_ne wifiGen_vap_enabVendorIe(T_AccessPoint* pAP, int enable) {
++    ASSERTS_NOT_NULL(pAP, SWL_RC_INVALID_PARAM, ME, "NULL");
++    _UNUSED_(enable);
++
++    wld_ap_doSync(pAP);
++    return SWL_RC_OK;
++}
+diff --git a/src/nl80211/wld_hostapd_ap_api.c b/src/nl80211/wld_hostapd_ap_api.c
+index 2e3e6e6..32b3646 100644
+--- a/src/nl80211/wld_hostapd_ap_api.c
++++ b/src/nl80211/wld_hostapd_ap_api.c
+@@ -357,6 +357,8 @@ SWL_TABLE(sHapdCfgParamsActionMap,
+               {"rnr", SECDMN_ACTION_OK_NEED_UPDATE_BEACON},
+               {"multi_ap_profile", SECDMN_ACTION_OK_NEED_UPDATE_BEACON},
+               {"multi_ap_vlanid", SECDMN_ACTION_OK_NEED_UPDATE_BEACON},
++              {"vendor_elements", SECDMN_ACTION_OK_NEED_UPDATE_BEACON},
++              {"assocresp_elements", SECDMN_ACTION_OK_NEED_UPDATE_BEACON},
+               //params set and applied without any action
+               ));
+ 
+@@ -754,6 +756,7 @@ wld_secDmn_action_rc_ne wld_ap_hostapd_setNoSecParams(T_AccessPoint* pAP) {
+         "rrm_neighbor_report", "rrm_beacon_report", "ieee80211w", "mbo",
+         "wmm_enabled", "uapsd_advertisement_enabled", "rnr", "ap_max_inactivity",
+         "multi_ap_profile", "multi_ap_vlanid",
++        "vendor_elements", "assocresp_elements",
+     };
+     s_setChangedMultiParams(pAP, pCurrVapParams, pNewVapParams,
+                             params, SWL_ARRAY_SIZE(params), &action);
+diff --git a/src/nl80211/wld_hostapd_cfgFile.c b/src/nl80211/wld_hostapd_cfgFile.c
+index 083eea5..1b2cd36 100644
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -780,6 +780,64 @@ static void s_setVapMultiApConf(T_AccessPoint* pAP, swl_mapChar_t* vapConfigMap,
+     }
+ }
+ 
++#define CFG_BEACON_PROBERESP_MASK (M_VENDOR_IE_BEACON | M_VENDOR_IE_PROBE_RESP)
++#define CFG_ASSOCRESP_MASK (M_VENDOR_IE_ASSOC_RESP)
++
++/**
++ * @brief Generate vendor-specific IE strings
++ *
++ * @param pAP Pointer to a vap
++ * @param vapConfigMap Char map with configuration
++ * @param mask Vendor IE frame mask
++ * @param string Configuration string that corresponds to a specific frame mask
++ */
++static void s_generateVendorIE(T_AccessPoint* pAP, swl_mapChar_t* vapConfigMap, wld_vendorIeFrame_m mask, char* string) {
++    if(!pAP->enableVendorIEs) {
++        return;
++    }
++
++    char* ieBuf = NULL;
++    int ieBufStrLen = 0;
++
++    amxc_llist_for_each(it, &pAP->vendorIEs) {
++        wld_vendorIe_t* vIE = amxc_llist_it_get_data(it, wld_vendorIe_t, it);
++        SAH_TRACEZ_INFO(ME, "%s: %s : %s : %u", pAP->alias, vIE->oui, vIE->data, vIE->frame_type);
++
++        if((vIE->frame_type & mask) == mask) {
++            swl_oui_t oui = {{0}};
++            swl_typeOui_fromChar(&oui, vIE->oui);
++            size_t payloadByteLen = SWL_OUI_BYTE_LEN + swl_str_len(vIE->data) / 2;
++            if(payloadByteLen > 255) {
++                SAH_TRACEZ_ERROR(ME, "%s: payload is too long = %zu", pAP->alias, payloadByteLen);
++                continue;
++            }
++
++            // tag (2 symbols) + length (2 symbols) + payload + terminating zero
++            size_t ieNewBufSize = 2 + 2 + payloadByteLen * 2 + 1;
++            char* newBuf = realloc(ieBuf, ieBufStrLen + ieNewBufSize);
++            if(newBuf == NULL) {
++                SAH_TRACEZ_ERROR(ME, "%s: realloc failed", pAP->alias);
++                continue;
++            }
++            ieBuf = newBuf;
++
++            int written = snprintf(ieBuf + ieBufStrLen, ieNewBufSize, "dd%02zx%06x%s", payloadByteLen, SWL_OUI_GET(oui.ouiBytes), vIE->data);
++            if(written < 0) {
++                SAH_TRACEZ_ERROR(ME, "%s: snprintf failed", pAP->alias);
++                continue;
++            }
++            ieBufStrLen += written;
++        }
++    }
++
++    if(swl_str_len(ieBuf) > 0) {
++        swl_mapChar_add(vapConfigMap, string, ieBuf);
++    }
++
++    free(ieBuf);
++}
++
++
+ /**
+  * @brief set the common parameters of a vap (ssid, secMode, keyPassphrase, bssid, ...)
+  *
+@@ -876,6 +934,9 @@ static bool s_setVapCommonConfig(T_AccessPoint* pAP, swl_mapChar_t* vapConfigMap
+ 
+     s_writeMfConfig(pAP, vapConfigMap);
+ 
++    s_generateVendorIE(pAP, vapConfigMap, CFG_BEACON_PROBERESP_MASK, "vendor_elements");
++    s_generateVendorIE(pAP, vapConfigMap, CFG_ASSOCRESP_MASK, "assocresp_elements");
++
+     if(pAP->cfg11u.qosMapSet[0] && pAP->WMMCapability) {
+         swl_mapChar_add(vapConfigMap, "qos_map_set", pAP->cfg11u.qosMapSet);
+     }
+diff --git a/src/wld_accesspoint.c b/src/wld_accesspoint.c
+index f5705c0..80d2e77 100644
+--- a/src/wld_accesspoint.c
++++ b/src/wld_accesspoint.c
+@@ -1473,7 +1473,7 @@ static bool s_isVendorIEValid(const char* oui, const char* data) {
+     swl_oui_t ouiBin;
+     ASSERT_TRUE(swl_typeOui_fromChar(&ouiBin, oui), false, ME, "Invalid OUI(%s)", oui);
+     size_t dataLen = swl_str_len(data);
+-    ASSERT_FALSE(((dataLen <= 2) || (dataLen > WLD_VENDORIE_T_DATA_SIZE) || (dataLen % 2 != 0)), false,
++    ASSERT_FALSE(((dataLen < 2) || (dataLen > WLD_VENDORIE_T_DATA_SIZE) || (dataLen % 2 != 0)), false,
+                  ME, "Invalid data len(%zu) (%s)", dataLen, data);
+     ASSERT_TRUE(swl_hex_isHexChar(data, dataLen), false, ME, "Invalid hex data (%s)", data);
+     return true;
+@@ -1541,7 +1541,7 @@ amxd_status_t _wld_ap_validateVendorIE_ovf(amxd_object_t* object,
+     swl_oui_t ouiBin;
+     if(!swl_str_isEmpty(ouiStr) && !swl_typeOui_fromChar(&ouiBin, (char*) ouiStr)) {
+         SAH_TRACEZ_ERROR(ME, "Invalid OUI(%s)", ouiStr);
+-    } else if(!swl_str_isEmpty(dataStr) && ((dataLen <= 2) || (dataLen > WLD_VENDORIE_T_DATA_SIZE) || (dataLen % 2 != 0) || (!swl_hex_isHexChar((char*) dataStr, dataLen)))) {
++    } else if(!swl_str_isEmpty(dataStr) && ((dataLen < 2) || (dataLen > WLD_VENDORIE_T_DATA_SIZE) || (dataLen % 2 != 0) || (!swl_hex_isHexChar((char*) dataStr, dataLen)))) {
+         SAH_TRACEZ_ERROR(ME, "Invalid Data (len:%zu / (%s))", dataLen, dataStr);
+     } else if(!swl_str_isEmpty(frameTypeMaskStr) && !swl_conv_charToMask(frameTypeMaskStr, wld_vendorIe_frameType_str, VENDOR_IE_MAX)) {
+         SAH_TRACEZ_ERROR(ME, "Invalid FrameType Mask (%s))", frameTypeMaskStr);
+-- 
+2.34.1
+
