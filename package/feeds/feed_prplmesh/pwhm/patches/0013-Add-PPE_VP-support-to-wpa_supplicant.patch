@@ -1,0 +1,36 @@
+From: Nikhil <nikhil@qualcomm.com>
+Date: Sun, 16 Mar 2026 16:30:00 +0530
+Subject: [PATCH] Add PPE_VP support to wpa_supplicant
+
+Add PPE_VP (PPE Virtual Port) configuration support to wpa_supplicant
+
+The ppe_vp parameter is added to the global configuration section of
+wpa_supplicant and uses the ppevpType field from the Radio structure.
+
+PPE_VP Type Values:
+- 1 = Passive
+- 2 = Active
+- 3 = DS (Direct Sequence)
+
+Signed-off-by: Nikhil <nikhil@qualcomm.com>
+---
+ src/nl80211/wld_wpaSupp_cfgFile.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/nl80211/wld_wpaSupp_cfgFile.c b/src/nl80211/wld_wpaSupp_cfgFile.c
+index 1234567..abcdefg 100644
+--- a/src/nl80211/wld_wpaSupp_cfgFile.c
++++ b/src/nl80211/wld_wpaSupp_cfgFile.c
+@@ -145,6 +145,10 @@ static swl_rc_ne s_setWpaSuppGlobalConfig(T_EndPoint* pEP, wld_wpaSupp_config_t
+     }
+     swl_mapChar_add(global, "ignore_old_scan_res", "1");
+ 
++    /* Add PPE_VP support */
++    swl_mapCharFmt_addValInt32(global, "ppe_vp", pRad->ppevpType);
++    SAH_TRACEZ_INFO(ME, "%s: PPEVP set ppe_vp = %u", pRad->Name, pRad->ppevpType);
++
+     return SWL_RC_OK;
+ }
+ 
+-- 
+2.34.1
