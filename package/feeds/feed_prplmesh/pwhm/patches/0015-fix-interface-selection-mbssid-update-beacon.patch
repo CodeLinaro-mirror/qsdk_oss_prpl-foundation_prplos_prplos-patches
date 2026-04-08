@@ -1,0 +1,28 @@
+From af0e43027c512f99503d2e8d3a4853cc07e4b6b1 Mon Sep 17 00:00:00 2001
+From: Ram Chandra Jangir <rjangir@qti.qualcomm.com>
+Date: Wed, 8 Apr 2026 18:09:37 +0530
+Subject: [PATCH] wld_hostapd_ap_api : Fix interface selection for MBSSID
+ UPDATE_BEACON
+
+Change-Id: I5f9525f738bb7129734168c5ea98f386748c419b
+Signed-off-by: Ram Chandra Jangir <rjangir@qti.qualcomm.com>
+---
+
+--- a/src/nl80211/wld_hostapd_ap_api.c
++++ b/src/nl80211/wld_hostapd_ap_api.c
+@@ -100,13 +100,13 @@ static bool s_sendHostapdCommand(T_Acces
+  */
+ bool wld_ap_hostapd_updateBeacon(T_AccessPoint* pAP, const char* reason) {
+     ASSERTS_NOT_NULL(pAP, false, ME, "NULL");
+-    T_Radio* pRad = pAP->pRadio;
++    /*T_Radio* pRad = pAP->pRadio;
+     if(wld_rad_hasMbssidAds(pRad)) {
+         T_AccessPoint* pAPmain = wld_rad_hostapd_getCfgMainVap(pRad);
+         if(pAPmain && !wld_vap_isDummyVap(pAPmain)) {
+             pAP = pAPmain;
+         }
+-    }
++    }*/
+     return s_sendHostapdCommand(pAP, "UPDATE_BEACON", reason);
+ }
+ 
