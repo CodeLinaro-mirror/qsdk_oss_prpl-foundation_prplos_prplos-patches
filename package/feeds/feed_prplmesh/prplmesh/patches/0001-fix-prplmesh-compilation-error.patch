@@ -1,0 +1,24 @@
+From f1e82780789c05a7f086a37d6b8f31ff69b7fbcf Mon Sep 17 00:00:00 2001
+From: Atchaya R <ratchaya@qti.qualcomm.com>
+Date: Wed, 8 Apr 2026 20:22:08 +0530
+Subject: [PATCH] prpl-patches: add patch to fix the prplmesh package
+ compilation error during fast forward.
+
+Change-Id: If729dc54c959d22cc6c161199b1d0f38d3522f59
+Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
+---
+ .../patches/0001-fix-prplmesh-compilation-error.patch | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+ create mode 100644 package/feeds/feed_prplmesh/prplmesh/patches/0001-fix-prplmesh-compilation-error.patch
+
+--- a/agent/src/beerocks/slave/beerocks_agent_main.cpp
++++ b/agent/src/beerocks/slave/beerocks_agent_main.cpp
+@@ -420,7 +420,7 @@ static int run_beerocks_slave(beerocks::
+         // Load and set traffic separation profile-disallow override (see beerocks_agent.conf).
+         const auto &policy_cfg =
+             beerocks_slave_conf.profile_x_disallow_override_unsupported_configuration;
+-        beerocks::eUnsupportedProfileDisallowPolicy policy;
++        beerocks::eUnsupportedProfileDisallowPolicy policy = beerocks::eUnsupportedProfileDisallowPolicy::NO_OVERRIDE;
+         if (!parse_unsupported_profile_disallow_policy(policy_cfg, policy)) {
+             LOG(ERROR) << "Invalid profile_x_disallow_override_unsupported_configuration value '"
+                        << policy_cfg << "'. Accepted values: 0 (NO_OVERRIDE), 1 "
