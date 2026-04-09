@@ -1,7 +1,14 @@
+This patch file is from Qualcomm Technologies, Inc. and is provided under the following license:
+
+Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. 
+SPDX-License-Identifier: BSD-3-Clause-Clear
+
 From e10c9618d7b7119b71032e3ab15294314659ea69 Mon Sep 17 00:00:00 2001
 From: Jassim Shanavaskhan <jshanava@qti.qualcomm.com>
 Date: Tue, 23 Dec 2025 15:43:38 +0530
 Subject: [PATCH] MAC Cycling issue
+
+Signed-off-by: Jassim Shanavaskhan <jshanava@qti.qualcomm.com>
 
 ---
  src/RadMgt/wld_rad_macCfg.c | 3 ++-
