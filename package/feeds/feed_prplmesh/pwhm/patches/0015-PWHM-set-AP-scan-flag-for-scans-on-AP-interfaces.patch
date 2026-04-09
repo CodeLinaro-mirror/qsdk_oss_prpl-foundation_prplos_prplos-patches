@@ -1,0 +1,58 @@
+From ca55f3fbca0a62b6485a89a64caa2e165867a328 Mon Sep 17 00:00:00 2001
+From: Dmytro Puz <d.puz@inango-systems.com>
+Date: Wed, 1 Apr 2026 13:25:59 +0200
+Subject: [PATCH] nl80211: set AP scan flag for scans on AP interfaces
+
+Inspect the selected scan interface in s_getScanFlags() and
+enable the nl80211 AP scan flag when the scan will be triggered
+on an AP-type interface.
+
+This aligns the scan request with upstream mac80211 expectations, where
+AP interface scans require NL80211_SCAN_FLAG_AP and may otherwise be
+rejected with -EOPNOTSUPP.
+
+Fixes: PPM-3974, PCF-2468
+Signed-off-by: Dmytro Puz <d.puz@inango-systems.com>
+---
+ src/nl80211/wld_nl80211_api.c | 13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/src/nl80211/wld_nl80211_api.c b/src/nl80211/wld_nl80211_api.c
+index 4924f1f51..a793bfbbf 100644
+--- a/src/nl80211/wld_nl80211_api.c
++++ b/src/nl80211/wld_nl80211_api.c
+@@ -884,13 +884,20 @@ swl_rc_ne wld_nl80211_getMaxTxPowerdBm(wld_nl80211_state_t* state, uint32_t ifIn
+     return SWL_RC_OK;
+ }
+ 
+-static uint32_t s_getScanFlags(wld_nl80211_scanFlags_t* pFlags) {
++static uint32_t s_getScanFlags(wld_nl80211_state_t* state, uint32_t ifIndex, wld_nl80211_scanFlags_t* pFlags) {
+     uint32_t flags = 0;
+     ASSERTS_NOT_NULL(pFlags, flags, ME, "NULL");
+     if(pFlags->flush) {
+         flags |= NL80211_SCAN_FLAG_FLUSH;
+     }
+-    if(pFlags->force) {
++
++    wld_nl80211_ifaceInfo_t ifaceInfo = {0};
++    bool isApScan = pFlags->force;
++    if((ifIndex > 0) && (wld_nl80211_getInterfaceInfo(state, ifIndex, &ifaceInfo) >= SWL_RC_OK)) {
++        isApScan = ifaceInfo.isAp;
++    }
++
++    if(isApScan) {
+         flags |= NL80211_SCAN_FLAG_AP;
+     }
+     return flags;
+@@ -901,7 +908,7 @@ swl_rc_ne wld_nl80211_startScan(wld_nl80211_state_t* state, uint32_t ifIndex, wl
+     swl_rc_ne rc = SWL_RC_INVALID_PARAM;
+     NL_ATTRS_EMPTY(attribs);
+     if(params) {
+-        uint32_t flags = s_getScanFlags(&params->flags);
++        uint32_t flags = s_getScanFlags(state, ifIndex, &params->flags);
+         if(flags) {
+             NL_ATTRS_ADD(&attribs, NL_ATTR_VAL(NL80211_ATTR_SCAN_FLAGS, flags));
+             SAH_TRACEZ_INFO(ME, "iface:%d, added scan flags attribute(%d)", ifIndex, swl_unLiList_size(&attribs));
+-- 
+GitLab
+
