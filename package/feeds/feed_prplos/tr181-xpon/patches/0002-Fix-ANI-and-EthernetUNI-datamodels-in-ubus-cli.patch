@@ -1,17 +1,43 @@
-From da944e7fc1066198f662591c2b470038355e0ceb Mon Sep 17 00:00:00 2001
+From 1abd52a656bd91fedf0eeb85412cace75fb4b4db Mon Sep 17 00:00:00 2001
 From: Harini Pavithra Elangovan <helangov@qti.qualcomm.com>
-Date: Thu, 19 Feb 2026 09:59:01 +0530
-Subject: [PATCH 1/1] Fix ANI and EthernetUNI datamodels in ubus-cli
+Date: Thu, 9 Apr 2026 11:00:31 +0530
+Subject: [PATCH 1/1] Fix ANI and EthernetUNI datamodels in ubus cli
 
 Signed-off-by: Harini Pavithra Elangovan <helangov@qti.qualcomm.com>
 ---
+ include_priv/dm_actions.h         | 14 +++++
  odl/tr181-xpon_ANI.odl.m4         |  2 +-
  odl/tr181-xpon_EthernetUNI.odl.m4 |  2 +-
  src/dm_actions.c                  | 94 ++++++++++++++++++++++++++++++-
- 3 files changed, 94 insertions(+), 4 deletions(-)
+ 4 files changed, 108 insertions(+), 4 deletions(-)
 
+diff --git a/include_priv/dm_actions.h b/include_priv/dm_actions.h
+index c4518ca..370a3a6 100644
+--- a/include_priv/dm_actions.h
++++ b/include_priv/dm_actions.h
+@@ -89,6 +89,20 @@ amxd_status_t _lastchange_on_read(amxd_object_t* const object,
+                                   amxc_var_t* const retval,
+                                   void* priv_unused);
+ 
++amxd_status_t _ethernetuni_lastchange_on_read(amxd_object_t* const object,
++                                              amxd_param_t* const param,
++                                              amxd_action_t reason,
++                                              const amxc_var_t* const args,
++                                              amxc_var_t* const retval,
++                                              void* priv_unused);
++
++amxd_status_t _ani_lastchange_on_read(amxd_object_t* const object,
++                                     amxd_param_t* const param,
++                                     amxd_action_t reason,
++                                     const amxc_var_t* const args,
++                                     amxc_var_t* const retval,
++                                     void* priv_unused);
++
+ amxd_status_t _onu_destroyed(amxd_object_t* object,
+                              amxd_param_t* param,
+                              amxd_action_t reason,
 diff --git a/odl/tr181-xpon_ANI.odl.m4 b/odl/tr181-xpon_ANI.odl.m4
-index 2ac0731..7cc8f89 100644
+index 9f96ff6..489fe77 100644
 --- a/odl/tr181-xpon_ANI.odl.m4
 +++ b/odl/tr181-xpon_ANI.odl.m4
 @@ -159,7 +159,7 @@
@@ -24,7 +50,7 @@ index 2ac0731..7cc8f89 100644
  
          /**
 diff --git a/odl/tr181-xpon_EthernetUNI.odl.m4 b/odl/tr181-xpon_EthernetUNI.odl.m4
-index d9c90cf..b2f8711 100644
+index 1635376..5a093ca 100644
 --- a/odl/tr181-xpon_EthernetUNI.odl.m4
 +++ b/odl/tr181-xpon_EthernetUNI.odl.m4
 @@ -159,7 +159,7 @@
@@ -37,20 +63,20 @@ index d9c90cf..b2f8711 100644
  
          /**
 diff --git a/src/dm_actions.c b/src/dm_actions.c
-index 80ec36e..fd926b4 100644
+index 0bd0455..e39fde2 100644
 --- a/src/dm_actions.c
 +++ b/src/dm_actions.c
-@@ -65,9 +65,7 @@
+@@ -64,9 +64,7 @@
+ #include "dm_actions.h"
  
  /* System headers */
- #include <stdbool.h>
 -#ifdef _DEBUG_
  #include <stdio.h>
 -#endif
  #include <stdlib.h> /* free() */
  #include <string.h> /* strlen() */
  
-@@ -295,6 +293,98 @@ exit:
+@@ -292,6 +290,98 @@ exit:
      return rv;
  }
  
@@ -71,7 +97,7 @@ index 80ec36e..fd926b4 100644
 +    amxd_status_t rv = amxd_status_unknown_error;
 +
 +    if(reason != action_param_read) {
-+        SAH_TRACEZ_WARNING(ME, "wrong reason, expected action_param_read(%d) got %d",
++       SAH_TRACEZ_WARNING(ME, "wrong reason, expected action_param_read(%d) got %d",
 +                           action_param_read, reason);
 +        rv = amxd_status_invalid_action;
 +        goto exit;
@@ -85,14 +111,14 @@ index 80ec36e..fd926b4 100644
 +    return rv;
 +}
 +
-+ /**
++/**
 +  * Called if a LastChange parameter is read for ANI objects.
 +  *
 +  * This mimics the HAL logic: reads the state timestamp from /proc/trex/gpon/onu
 +  *
 +  * @return amxd_status_ok (=0) upon success
-+  */
-+ amxd_status_t ani_lastchange_on_read(UNUSED amxd_object_t* const object,
++*/
++amxd_status_t _ani_lastchange_on_read(UNUSED amxd_object_t* const object,
 +                                       UNUSED amxd_param_t* const param,
 +                                       amxd_action_t reason,
 +                                       UNUSED const amxc_var_t* const args,
@@ -142,13 +168,13 @@ index 80ec36e..fd926b4 100644
 +     rv = amxd_status_ok;
 +     when_failed_trace(amxc_var_set_uint32_t(retval, last_change_value),
 +                       exit, ERROR, "Failed to set parameter LastChange");
-+ exit:
-+     return rv;
-+ }
++exit:
++    return rv;
++}
 +
- typedef enum _private_data_type {
-     private_data_for_onu = 0,
-     private_data_for_object_interface
+ /**
+  * Helper function called when certain instances are deleted.
+  *
 -- 
 2.34.1
 
