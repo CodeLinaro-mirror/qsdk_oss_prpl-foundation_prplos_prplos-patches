@@ -1,0 +1,23 @@
+From 6feba62b91de9d851103a10da99956f4598a65dd Mon Sep 17 00:00:00 2001
+From: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+Date: Wed, 15 Apr 2026 19:01:00 +0530
+Subject: [PATCH] Set mbssid_group_size value in hapd config file
+
+Change-Id: I94e83f49e806f6afd9e493844008f5b4f4183ae0
+Signed-off-by: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+---
+Index: pwhm-v7.21.5/src/nl80211/wld_hostapd_cfgFile.c
+===================================================================
+--- pwhm-v7.21.5.orig/src/nl80211/wld_hostapd_cfgFile.c
++++ pwhm-v7.21.5/src/nl80211/wld_hostapd_cfgFile.c
+@@ -595,8 +595,9 @@ void wld_hostapd_cfgFile_setRadioConfig(
+     bool configMbssid = (mbssidAdsMode != MBSSID_ADVERTISEMENT_MODE_OFF) && (wld_rad_countEnabledVaps(pRad) > 1);
+     if(configMbssid) {
+         SAH_TRACEZ_INFO(ME, "%s: Setting MBSSID Advertisement %d", pRad->Name, mbssidAdsMode);
+-        swl_mapCharFmt_addValInt32(radConfigMap, "mbssid", (mbssidAdsMode == MBSSID_ADVERTISEMENT_MODE_ENHANCED) ? 2 : 1);
++        swl_mapCharFmt_addValInt32(radConfigMap, "mbssid", (mbssidAdsMode == MBSSID_ADVERTISEMENT_MODE_ENHANCED) ? 3 : 1);
+         wld_secDmn_addToMapSuppCfgParamValueInt32(pRad->hostapd, radConfigMap, "mbssid_max", amxc_llist_size(&pRad->llAP));
++	swl_mapCharFmt_addValInt32(radConfigMap, "mbssid_group_size", 4);
+     }
+ 
+     pRad->pFA->mfn_wrad_updateConfigMap(pRad, radConfigMap);
