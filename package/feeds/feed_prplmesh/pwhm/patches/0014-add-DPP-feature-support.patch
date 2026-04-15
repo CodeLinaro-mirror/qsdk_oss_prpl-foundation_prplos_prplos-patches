@@ -1,0 +1,605 @@
+From 6d224720aebe50ed598910a9753f63f6134ec118 Mon Sep 17 00:00:00 2001
+From: Atchaya R <ratchaya@qti.qualcomm.com>
+Date: Wed, 15 Apr 2026 11:52:14 +0530
+Subject: [PATCH] pwhm: add changes to enable DPP feature in PRPL
+
+Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
+---
+ include/wld/wld.h                 |   8 ++
+ include/wld/wld_endpoint.h        |   6 +
+ odl/wld_accesspoint.odl           |  26 +++++
+ odl/wld_endpoint.odl              |  36 ++++++
+ src/nl80211/wld_hostapd_cfgFile.c |   6 +
+ src/nl80211/wld_wpaSupp_cfgFile.c |   8 ++
+ src/wld_accesspoint.c             | 160 +++++++++++++++++++++++++++
+ src/wld_endpoint.c                | 177 ++++++++++++++++++++++++++++++
+ 8 files changed, 427 insertions(+)
+
+diff --git a/include/wld/wld.h b/include/wld/wld.h
+index 15432b1..4dd6d84 100644
+--- a/include/wld/wld.h
++++ b/include/wld/wld.h
+@@ -1911,6 +1911,10 @@ struct S_ACCESSPOINT {
+     char radiusCalledStationId[88];
+     int radiusChargeableUserId;
+ 
++    bool DPP_Enable;                                /* DPP enabled? */
++    char DPP_Role[16];
++    char DPP_BootstrapType[16];
++
+     int WPS_CertMode;                               /* Correct default behavior for Certification Mode */
+     int WPS_Enable;                                 /* WPS enabled? */
+     wld_wps_status_e WPS_Status;                    /* WPS real status  */
+@@ -2148,6 +2152,10 @@ struct S_EndPoint {
+ 
+     swl_security_apMode_m secModesSupported;        /* Bit pattern for supported security modes */
+ 
++    bool DPP_Enable;                                /* DPP enabled? */
++    char DPP_Role[16];
++    char DPP_BootstrapType[16];
++
+     bool WPS_Enable;                                /* WPS enabled? */
+     int WPS_Configured;                             /* Not in ODL but required */
+     wld_wps_cfgMethod_m WPS_ConfigMethodsSupported; /* bit mask of supported wps config methods */
+diff --git a/include/wld/wld_endpoint.h b/include/wld/wld_endpoint.h
+index f7bfe5a..2d3c8cd 100644
+--- a/include/wld/wld_endpoint.h
++++ b/include/wld/wld_endpoint.h
+@@ -115,6 +115,12 @@ amxd_status_t _EndPoint_WPS_pushButton(amxd_object_t* obj,
+                                        amxd_function_t* func,
+                                        amxc_var_t* args,
+                                        amxc_var_t* ret);
++amxd_status_t _wld_endpoint_deleteGeneratedQR_odf(amxd_object_t* object,
++                                                  amxd_param_t* param,
++                                                  amxd_action_t reason,
++                                                  const amxc_var_t* const args,
++                                                  amxc_var_t* const retval,
++                                                  void* priv);
+ amxd_status_t _EndPoint_WPS_cancelPairing(amxd_object_t* obj,
+                                           amxd_function_t* func,
+                                           amxc_var_t* args,
+diff --git a/odl/wld_accesspoint.odl b/odl/wld_accesspoint.odl
+index b85aeb3..f8c9b33 100644
+--- a/odl/wld_accesspoint.odl
++++ b/odl/wld_accesspoint.odl
+@@ -959,6 +959,32 @@ define rrm_t{
+ 			void delTempEntry(%in %mandatory string mac);
+ 		}
+ 
++		/** This object contains parameters related to Device Provisioning Protocol
++		 *  [DPP] for this access point.*/
++		%persistent object DPP{
++			on event "*" call wld_ap_setDppConf_ocf;
++			/** Enables or disables DPP functionality for this access point. */
++			%persistent bool Enable{
++				default false;
++			}
++			/** Role of DPP.*/
++			%persistent string Role{
++				default "Configurator";
++			}
++			/** BootstrapType of DPP.*/
++			%persistent string BootstrapType{
++				default "QR";
++				on action validate call check_enum ["QR", "PKEX", "NFC"];
++			}
++
++			/**
++			 * configureDPP 
++			 * @param curve Optional curve
++			 * @param QR Mandatory QR code
++			 */
++			string configureDPP(%in string curve, %in %mandatory string QR);
++		}
++
+ 		/** This object contains parameters related to Wi-Fi Protected
+ 		 *  Setup [WPSv1.0] for this access point.*/
+ 		%persistent object WPS{
+diff --git a/odl/wld_endpoint.odl b/odl/wld_endpoint.odl
+index a1e0146..e7a4b9a 100644
+--- a/odl/wld_endpoint.odl
++++ b/odl/wld_endpoint.odl
+@@ -759,6 +759,42 @@
+ 			 */
+ 			%read-only bool PairingInProgress;
+ 		}
++
++		/** This object contains parameters related to Device
++		 *  Provisioning Protocol (DPP) for this end point. */
++		%persistent object DPP {
++			on event "*" call wld_ep_setDppConf_ocf;
++
++			/** Enables or disables DPP functionality for this endpoint. */
++			%persistent bool Enable;
++
++			/** Indicates the role of the endpoint in DPP. */
++			%persistent string Role {
++				on action validate call check_enum ["Enrollee", "Configurator"];
++				default "Enrollee";
++			}
++
++			/** Indicates the bootstrap type for DPP. */
++			%persistent string BootstrapType {
++				on action validate call check_enum ["QR", "PKEX", "NFC"];
++				default "QR";
++			}
++
++			/** A list of generated QRs */
++			%persistent object GeneratedQR[] {
++				on action destroy call wld_ep_deleteGeneratedQR_odf;
++				/** ID returned by the DPP command */
++				%persistent uint32 ID;
++				/** Extracted URI */
++				%persistent string URI;
++			}
++
++			/** Generates a bootstrap info and returns the URI */
++			string dpp_bootstrap_gen(%in string curve, %in uint32 chan, %in uint32 operatingclass);
++
++			/** Triggers a chirp message to start authentication */
++			bool chirp(%in uint32 id);
++		}
+ 		
+ 		/**
+ 		 * Assocation statistics.
+diff --git a/src/nl80211/wld_hostapd_cfgFile.c b/src/nl80211/wld_hostapd_cfgFile.c
+index 64d5855..789814f 100644
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -1413,6 +1413,12 @@ void wld_hostapd_cfgFile_setVapConfig(T_AccessPoint* pAP, swl_mapChar_t* vapConf
+     s_setVapWpsConfig(pAP, vapConfigMap);
+     s_setVapMultiApConf(pAP, vapConfigMap, multiAPConfig);
+ 
++    if(pAP->DPP_Enable) {
++        swl_mapChar_add(vapConfigMap, "dpp", "1");
++        swl_mapChar_add(vapConfigMap, "dpp_configurator_connectivity", "1");
++    }
++
++
+     // rnr standard config
+     bool isIEEE80211k = pAP->IEEE80211kEnable && pAP->pRadio->IEEE80211kSupported;
+     bool rnrCfgStd = isIEEE80211k && (wld_ap_getDiscoveryMethod(pAP) == M_AP_DM_RNR);
+diff --git a/src/nl80211/wld_wpaSupp_cfgFile.c b/src/nl80211/wld_wpaSupp_cfgFile.c
+index e7d7a56..3fe244e 100644
+--- a/src/nl80211/wld_wpaSupp_cfgFile.c
++++ b/src/nl80211/wld_wpaSupp_cfgFile.c
+@@ -134,6 +134,10 @@ static swl_rc_ne s_setWpaSuppGlobalConfig(T_EndPoint* pEP, wld_wpaSupp_config_t*
+         swl_mapChar_add(global, "config_methods", configMethodsStr);
+     }
+ 
++    if(pEP->DPP_Enable) {
++        swl_mapChar_add(global, "dpp_config_processing", "2");
++    }
++
+     /* By default for endpoint, wps_cred_processing should be set to 2
+      * to process received credentials internally and pass them over ctrl_iface
+      * to external program */
+@@ -345,6 +349,10 @@ static swl_rc_ne s_setWpaSuppNetworkConfig(T_EndPoint* pEP, wld_wpaSupp_config_t
+ 
+     swl_mapCharFmt_addValInt32(network, "ieee80211w", mfp);
+ 
++    if(pEP->DPP_Enable) {
++        swl_mapChar_add(network, "dpp", "1");
++    }
++
+     if(pEP->multiAPEnable) {
+         swl_mapChar_add(network, "multi_ap_backhaul_sta", "1");
+     }
+diff --git a/src/wld_accesspoint.c b/src/wld_accesspoint.c
+index 80d2e77..e3585b7 100644
+--- a/src/wld_accesspoint.c
++++ b/src/wld_accesspoint.c
+@@ -92,6 +92,7 @@
+ #include "wld_dm_trans.h"
+ #include "Features/wld_persist.h"
+ #include "wld_extMod.h"
++#include "wld_wpaCtrl_api.h"
+ 
+ #define ME "ap"
+ 
+@@ -182,6 +183,8 @@ static void s_setDefaults(T_AccessPoint* pAP, T_Radio* pRad, const char* vapName
+     pAP->status = APSTI_DISABLED;
+     pAP->secModesSupported = M_SWL_SECURITY_APMODE_NONE;
+     pAP->MaxStations = pRad->maxNrHwSta;
++    swl_str_copy(pAP->DPP_Role, sizeof(pAP->DPP_Role), "Configurator");
++    swl_str_copy(pAP->DPP_BootstrapType, sizeof(pAP->DPP_BootstrapType), "QR");
+ 
+     pAP->UAPSDCapability = pAP->pFA->mfn_misc_has_support(pAP->pRadio, pAP, "UAPSD", 0);
+     pAP->WMMCapability = pAP->pFA->mfn_misc_has_support(pAP->pRadio, pAP, "WME", 0);
+@@ -954,6 +957,11 @@ void SyncData_AP2OBJ(amxd_object_t* object, T_AccessPoint* pAP, int set) {
+         amxd_trans_set_cstring_t(&trans, "RadiusCalledStationId", pAP->radiusCalledStationId);
+         amxd_trans_set_int32_t(&trans, "RadiusChargeableUserId", pAP->radiusChargeableUserId);
+ 
++        amxd_trans_select_object(&trans, amxd_object_findf(object, "DPP"));
++        amxd_trans_set_bool(&trans, "Enable", pAP->DPP_Enable);
++        amxd_trans_set_cstring_t(&trans, "Role", pAP->DPP_Role);
++        amxd_trans_set_cstring_t(&trans, "BootstrapType", pAP->DPP_BootstrapType);
++
+         /** WPS Part */
+ 
+         if(wpsObj != NULL) {
+@@ -1188,6 +1196,25 @@ void SyncData_AP2OBJ(amxd_object_t* object, T_AccessPoint* pAP, int set) {
+             wld_ap_sec_doSync(pAP);
+         }
+ 
++        amxd_object_t* dppObj = amxd_object_findf(object, "DPP");
++        tmp_bool = amxd_object_get_bool(dppObj, "Enable", NULL);
++        if(pAP->DPP_Enable != tmp_bool) {
++            pAP->DPP_Enable = tmp_bool;
++            commit = true;
++        }
++        
++        char* dppRole = amxd_object_get_cstring_t(dppObj, "Role", NULL);
++        if(!swl_str_nmatches(pAP->DPP_Role, dppRole, swl_str_len(pAP->DPP_Role))) {
++            swl_str_copy(pAP->DPP_Role, sizeof(pAP->DPP_Role), dppRole);
++        }
++        free(dppRole);
++
++        char* dppBootstrapType = amxd_object_get_cstring_t(dppObj, "BootstrapType", NULL);
++        if(!swl_str_nmatches(pAP->DPP_BootstrapType, dppBootstrapType, swl_str_len(pAP->DPP_BootstrapType))) {
++            swl_str_copy(pAP->DPP_BootstrapType, sizeof(pAP->DPP_BootstrapType), dppBootstrapType);
++        }
++        free(dppBootstrapType);
++
+         tmp_bool = amxd_object_get_bool(wpsObj, "Enable", NULL);
+         if(pAP->WPS_Enable != tmp_bool) {
+             pAP->WPS_Enable = tmp_bool;
+@@ -1417,6 +1444,139 @@ static void s_setMultiAPVlanId_pwf(void* priv _UNUSED, amxd_object_t* object, am
+ }
+ 
+ 
++static void s_setDppEnable_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_AccessPoint* pAP = wld_ap_fromObj(amxd_object_get_parent(object));
++    ASSERT_NOT_NULL(pAP, , ME, "Invalid AP Ctx");
++
++    bool flag = amxc_var_dyncast(bool, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set DppEnable %d", pAP->alias, flag);
++    ASSERTI_NOT_EQUALS(pAP->DPP_Enable, flag, , ME, "EQUALS");
++    pAP->DPP_Enable = flag;
++    wld_ap_doSync(pAP);
++
++    SAH_TRACEZ_OUT(ME);
++}
++
++static void s_setDppRole_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_AccessPoint* pAP = wld_ap_fromObj(amxd_object_get_parent(object));
++    ASSERT_NOT_NULL(pAP, , ME, "Invalid AP Ctx");
++
++    const char* role = amxc_var_constcast(cstring_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set DppRole %s", pAP->alias, role);
++    swl_str_copy(pAP->DPP_Role, sizeof(pAP->DPP_Role), role);
++
++    SAH_TRACEZ_OUT(ME);
++}
++
++static void s_setDppBootstrapType_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_AccessPoint* pAP = wld_ap_fromObj(amxd_object_get_parent(object));
++    ASSERT_NOT_NULL(pAP, , ME, "Invalid AP Ctx");
++
++    const char* bootstrapType = amxc_var_constcast(cstring_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set DppBootstrapType %s", pAP->alias, bootstrapType);
++    swl_str_copy(pAP->DPP_BootstrapType, sizeof(pAP->DPP_BootstrapType), bootstrapType);
++
++    SAH_TRACEZ_OUT(ME);
++}
++
++SWLA_DM_HDLRS(sApDppDmHdlrs,
++              ARR(SWLA_DM_PARAM_HDLR("Enable", s_setDppEnable_pwf),
++                  SWLA_DM_PARAM_HDLR("Role", s_setDppRole_pwf),
++                  SWLA_DM_PARAM_HDLR("BootstrapType", s_setDppBootstrapType_pwf)
++                  )
++              );
++
++amxd_status_t _configureDPP(amxd_object_t* obj,
++                                 amxd_function_t* func _UNUSED,
++                                 amxc_var_t* args,
++                                 amxc_var_t* retMap) {
++    SAH_TRACEZ_IN(ME);
++    
++    T_AccessPoint* pAP = wld_ap_fromObj(amxd_object_get_parent(obj));
++    ASSERT_NOT_NULL(pAP, amxd_status_ok, ME, "No AP Ctx");
++
++    const char* curve = GET_CHAR(args, "curve");
++    const char* qr = GET_CHAR(args, "QR");
++
++    if (swl_str_isEmpty(curve)) {
++        curve = "P-256";
++    }
++
++    if (swl_str_isEmpty(qr)) {
++        SAH_TRACEZ_ERROR(ME, "QR parameter is mandatory");
++        return amxd_status_invalid_arg;
++    }
++
++    char cmd[1024] = {0};
++    
++    char reply[128] = {0};
++    
++    // 1. dpp_configurator_add
++    snprintf(cmd, sizeof(cmd), "DPP_CONFIGURATOR_ADD curve=%s", curve);
++    swl_rc_ne ret = wld_wpaCtrl_sendCmdFmtGetResponse(pAP->wpaCtrlInterface, reply, sizeof(reply), "%s", cmd);
++    if (ret != SWL_RC_OK || swl_str_isEmpty(reply) || swl_str_matches(reply, "FAIL")) {
++        SAH_TRACEZ_ERROR(ME, "DPP_CONFIGURATOR_ADD failed");
++        return amxd_status_unknown_error;
++    }
++    
++    // Parse the returned id
++    int configuratorId = atoi(reply);
++
++    // Helper to format string to hex
++    char ssidHex[128] = {0};
++    swl_hex_fromBytesSep(ssidHex, sizeof(ssidHex), (swl_bit8_t*)pAP->pSSID->SSID, swl_str_len(pAP->pSSID->SSID), false, 0, NULL);
++    
++    char passHex[256] = {0};
++    swl_hex_fromBytesSep(passHex, sizeof(passHex), (swl_bit8_t*)pAP->keyPassPhrase, swl_str_len(pAP->keyPassPhrase), false, 0, NULL);
++
++    const char* confStr = "";
++    if (pAP->secModeEnabled == SWL_SECURITY_APMODE_WPA3_P || pAP->secModeEnabled == SWL_SECURITY_APMODE_WPA2_WPA3_P) {
++         confStr = "sae";
++    } else if (pAP->secModeEnabled == SWL_SECURITY_APMODE_WPA2_P) {
++         confStr = "psk";
++    }
++
++    // 2. dpp_qr_code
++    snprintf(cmd, sizeof(cmd), "DPP_QR_CODE %s", qr);
++    memset(reply, 0, sizeof(reply));
++    ret = wld_wpaCtrl_sendCmdFmtGetResponse(pAP->wpaCtrlInterface, reply, sizeof(reply), "%s", cmd);
++    if (ret != SWL_RC_OK || swl_str_isEmpty(reply) || swl_str_matches(reply, "FAIL")) {
++        SAH_TRACEZ_ERROR(ME, "DPP_QR_CODE failed, ret: %d, reply: %s", ret, reply);
++        return amxd_status_unknown_error;
++    }
++
++    int peerId = atoi(reply);
++
++    // 3. dpp_auth_init
++    int len = snprintf(cmd, sizeof(cmd), "DPP_AUTH_INIT peer=%d conf=sta-%s configurator=%d ssid=%s", peerId, confStr, configuratorId, ssidHex);
++    if (!swl_str_isEmpty(passHex)) {
++        snprintf(cmd + len, sizeof(cmd) - len, " pass=%s", passHex);
++    }
++    
++    bool bRet = wld_wpaCtrl_sendCmdCheckResponse(pAP->wpaCtrlInterface, cmd, "OK");
++    if (!bRet) {
++        SAH_TRACEZ_ERROR(ME, "DPP_AUTH_INIT failed, cmd: %s", cmd);
++        return amxd_status_unknown_error;
++    }
++
++    amxc_var_set(cstring_t, retMap, "OK");
++
++    SAH_TRACEZ_OUT(ME);
++    return amxd_status_ok;
++}
++
++void _wld_ap_setDppConf_ocf(const char* const sig_name,
++                                const amxc_var_t* const data,
++                                void* const priv) {
++    swla_dm_procObjEvtOfLocalDm(&sApDppDmHdlrs, sig_name, data, priv);
++}
++
+ static void s_setApRole_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
+     SAH_TRACEZ_IN(ME);
+ 
+diff --git a/src/wld_endpoint.c b/src/wld_endpoint.c
+index fe431b4..8b815eb 100644
+--- a/src/wld_endpoint.c
++++ b/src/wld_endpoint.c
+@@ -86,6 +86,7 @@
+ #include "wld_epProfile.h"
+ #include "wld_dm_trans.h"
+ #include "wld_chanmgt.h"
++#include "wld_wpaCtrl_api.h"
+ 
+ /* Function prototypes for helpers. */
+ static void s_setEndpointStatus(T_EndPoint* pEP,
+@@ -652,6 +653,9 @@ static void s_setDefaults(T_EndPoint* pEP, const char* endpointname) {
+     pEP->multiAPProfile = MULTIAP_NOT_SUPPORTED;
+     pEP->peerMultiAPProfile = MULTIAP_NOT_SUPPORTED;
+     pEP->multiAPVlanId = 0;
++
++    swl_str_copy(pEP->DPP_Role, sizeof(pEP->DPP_Role), "Enrollee");
++    swl_str_copy(pEP->DPP_BootstrapType, sizeof(pEP->DPP_BootstrapType), "QR");
+ }
+ 
+ static void s_sendChangeEvent(T_EndPoint* pEP, wld_ep_changeEvent_e changeType, void* data) {
+@@ -1254,6 +1258,22 @@ bool syncData_OBJ2EndPoint(amxd_object_t* object) {
+     }
+     wpsobject->priv = &pEP->wpsSessionInfo;
+ 
++    /* DPP */
++    amxd_object_t* dppObj = amxd_object_findf(object, "DPP");
++    if(dppObj) {
++        pEP->DPP_Enable = amxd_object_get_bool(dppObj, "Enable", NULL);
++        char* role = amxd_object_get_cstring_t(dppObj, "Role", NULL);
++        if(role) {
++            swl_str_copy(pEP->DPP_Role, sizeof(pEP->DPP_Role), role);
++            free(role);
++        }
++        char* bootstrapType = amxd_object_get_cstring_t(dppObj, "BootstrapType", NULL);
++        if(bootstrapType) {
++            swl_str_copy(pEP->DPP_BootstrapType, sizeof(pEP->DPP_BootstrapType), bootstrapType);
++            free(bootstrapType);
++        }
++    }
++
+     pEP->WPS_Enable = amxd_object_get_bool(wpsobject, "Enable", NULL);
+     SAH_TRACEZ_INFO(ME, "Endpoint.WPS.enable = %d", pEP->WPS_Enable);
+ 
+@@ -1363,6 +1383,12 @@ void syncData_EndPoint2OBJ(T_EndPoint* pEP) {
+     swl_conv_transParamSetMask(&trans, "ConfigMethodsSupported", pEP->WPS_ConfigMethodsSupported, cstr_WPS_CM_Supported, WPS_CFG_MTHD_MAX);
+     swl_conv_transParamSetMask(&trans, "ConfigMethodsEnabled", pEP->WPS_ConfigMethodsEnabled, cstr_WPS_CM_Supported, WPS_CFG_MTHD_MAX);
+ 
++    amxd_object_t* dppObj = amxd_object_findf(object, "DPP");
++    amxd_trans_select_object(&trans, dppObj);
++    amxd_trans_set_bool(&trans, "Enable", pEP->DPP_Enable);
++    amxd_trans_set_cstring_t(&trans, "Role", pEP->DPP_Role);
++    amxd_trans_set_cstring_t(&trans, "BootstrapType", pEP->DPP_BootstrapType);
++
+     ASSERT_TRANSACTION_LOCAL_DM_END(&trans, , ME, "%s : trans apply failure", pEP->Name);
+ 
+ }
+@@ -2609,6 +2635,157 @@ amxd_status_t _EndPoint_debug(amxd_object_t* object,
+     return amxd_status_ok;
+ }
+ 
++static void s_setDppEnable_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_EndPoint* pEP = wld_ep_fromObj(amxd_object_get_parent(object));
++    ASSERT_NOT_NULL(pEP, , ME, "Invalid EP Ctx");
++
++    bool flag = amxc_var_dyncast(bool, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set DppEnable %d", pEP->alias, flag);
++    pEP->DPP_Enable = flag;
++    wld_endpoint_reconfigure(pEP);
++
++    SAH_TRACEZ_OUT(ME);
++}
++
++static void s_setDppRole_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_EndPoint* pEP = wld_ep_fromObj(amxd_object_get_parent(object));
++    ASSERT_NOT_NULL(pEP, , ME, "Invalid EP Ctx");
++
++    const char* role = amxc_var_constcast(cstring_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set DppRole %s", pEP->alias, role);
++    swl_str_copy(pEP->DPP_Role, sizeof(pEP->DPP_Role), role);
++
++    SAH_TRACEZ_OUT(ME);
++}
++
++static void s_setDppBootstrapType_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_EndPoint* pEP = wld_ep_fromObj(amxd_object_get_parent(object));
++    ASSERT_NOT_NULL(pEP, , ME, "Invalid EP Ctx");
++
++    const char* bootstrapType = amxc_var_constcast(cstring_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set DppBootstrapType %s", pEP->alias, bootstrapType);
++    swl_str_copy(pEP->DPP_BootstrapType, sizeof(pEP->DPP_BootstrapType), bootstrapType);
++
++    SAH_TRACEZ_OUT(ME);
++}
++
++SWLA_DM_HDLRS(sEpDppDmHdlrs,
++              ARR(SWLA_DM_PARAM_HDLR("Enable", s_setDppEnable_pwf),
++                  SWLA_DM_PARAM_HDLR("Role", s_setDppRole_pwf),
++                  SWLA_DM_PARAM_HDLR("BootstrapType", s_setDppBootstrapType_pwf)
++                  )
++              );
++
++amxd_status_t _wld_endpoint_deleteGeneratedQR_odf(amxd_object_t* object,
++                                                  amxd_param_t* param,
++                                                  amxd_action_t reason,
++                                                  const amxc_var_t* const args,
++                                                  amxc_var_t* const retval,
++                                                  void* priv) {
++    SAH_TRACEZ_IN(ME);
++    amxd_status_t status = amxd_action_object_destroy(object, param, reason, args, retval, priv);
++    SAH_TRACEZ_OUT(ME);
++    return status;
++}
++
++amxd_status_t _dpp_bootstrap_gen(amxd_object_t* obj,
++                                 amxd_function_t* func _UNUSED,
++                                 amxc_var_t* args,
++                                 amxc_var_t* retMap) {
++    SAH_TRACEZ_IN(ME);
++    
++    T_EndPoint* pEP = wld_ep_fromObj(amxd_object_get_parent(obj));
++    ASSERT_NOT_NULL(pEP, amxd_status_ok, ME, "No EP Ctx");
++
++    const char* curve = GET_CHAR(args, "curve");
++    uint32_t chan = GET_UINT32(args, "chan");
++    uint32_t operatingclass = GET_UINT32(args, "operatingclass");
++
++    if (swl_str_isEmpty(curve)) {
++        curve = "P-256";
++    }
++
++    char cmd[1024] = {0};
++    char reply[1024] = {0};
++    
++    int len = snprintf(cmd, sizeof(cmd), "DPP_BOOTSTRAP_GEN type=qrcode curve=%s", curve);
++    
++    if (chan != 0 && operatingclass != 0) {
++        snprintf(cmd + len, sizeof(cmd) - len, " chan=%u/%u", operatingclass, chan);
++    }
++    
++    swl_rc_ne ret = wld_wpaCtrl_sendCmdFmtGetResponse(pEP->wpaCtrlInterface, reply, sizeof(reply), "%s", cmd);
++    if (ret != SWL_RC_OK || swl_str_isEmpty(reply) || swl_str_matches(reply, "FAIL")) {
++        SAH_TRACEZ_ERROR(ME, "DPP_BOOTSTRAP_GEN failed");
++        return amxd_status_unknown_error;
++    }
++
++    uint32_t id = atoi(reply);
++
++    // get URI
++    snprintf(cmd, sizeof(cmd), "DPP_BOOTSTRAP_GET_URI %u", id);
++    memset(reply, 0, sizeof(reply));
++    ret = wld_wpaCtrl_sendCmdFmtGetResponse(pEP->wpaCtrlInterface, reply, sizeof(reply), "%s", cmd);
++    if (ret != SWL_RC_OK || swl_str_isEmpty(reply) || swl_str_matches(reply, "FAIL")) {
++        SAH_TRACEZ_ERROR(ME, "DPP_BOOTSTRAP_GET_URI failed");
++        return amxd_status_unknown_error;
++    }
++
++    // Add to generated QR list
++    amxd_object_t* qrListObj = amxd_object_findf(obj, "GeneratedQR");
++    if (qrListObj) {
++        amxd_trans_t trans;
++        ASSERT_TRANSACTION_INIT(qrListObj, &trans, amxd_status_unknown_error, ME, "trans init failure");
++        amxd_trans_add_inst(&trans, 0, NULL);
++        amxd_trans_set_uint32_t(&trans, "ID", id);
++        amxd_trans_set_cstring_t(&trans, "URI", reply);
++        ASSERT_TRANSACTION_LOCAL_DM_END(&trans, amxd_status_unknown_error, ME, "trans apply failure");
++    }
++
++    amxc_var_set(cstring_t, retMap, reply);
++
++    SAH_TRACEZ_OUT(ME);
++    return amxd_status_ok;
++}
++
++amxd_status_t _chirp(amxd_object_t* obj,
++                     amxd_function_t* func _UNUSED,
++                     amxc_var_t* args,
++                     amxc_var_t* retMap) {
++    SAH_TRACEZ_IN(ME);
++    
++    T_EndPoint* pEP = wld_ep_fromObj(amxd_object_get_parent(obj));
++    ASSERT_NOT_NULL(pEP, amxd_status_ok, ME, "No EP Ctx");
++
++    uint32_t id = GET_UINT32(args, "id");
++    char cmd[128] = {0};
++    
++    snprintf(cmd, sizeof(cmd), "DPP_CHIRP own=%u", id);
++    bool bRet = wld_wpaCtrl_sendCmdCheckResponse(pEP->wpaCtrlInterface, cmd, "OK");
++    if (!bRet) {
++        SAH_TRACEZ_ERROR(ME, "DPP_CHIRP failed");
++        amxc_var_set(bool, retMap, false);
++        return amxd_status_unknown_error;
++    }
++
++    amxc_var_set(bool, retMap, true);
++
++    SAH_TRACEZ_OUT(ME);
++    return amxd_status_ok;
++}
++
++void _wld_ep_setDppConf_ocf(const char* const sig_name,
++                                const amxc_var_t* const data,
++                                void* const priv) {
++    swla_dm_procObjEvtOfLocalDm(&sEpDppDmHdlrs, sig_name, data, priv);
++}
++
+ SWLA_DM_HDLRS(sEpDmHdlrs,
+               ARR(SWLA_DM_PARAM_HDLR("SSIDReference", s_setSSIDRef_pwf),
+                   SWLA_DM_PARAM_HDLR("ReconnectDelay", s_setReconnectDelay_pwf),
+-- 
+2.34.1
+
