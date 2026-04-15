@@ -1,0 +1,21 @@
+From 3bb143d371d4b01166a54649ef6bfa002bdba364 Mon Sep 17 00:00:00 2001
+From: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+Date: Sun, 12 Apr 2026 16:26:45 +0530
+Subject: [PATCH 1/1] Set Default MaxBSS value
+
+Change-Id: Ied724f84a7264d182be810aadcd67efb9d719d62
+Signed-off-by: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+
+Index: pwhm-v7.15.3/odl/wld_radio.odl
+===================================================================
+--- pwhm-v7.15.3.orig/odl/wld_radio.odl
++++ pwhm-v7.15.3/odl/wld_radio.odl
+@@ -2787,7 +2787,7 @@ define probelist_t{
+ 			 * Will also allow to move multi radio BSSIDs closer together when possible.
+ 			 */
+ 			%persistent uint32 NrBssRequired{
+-				default 0;
++				default 16;
+ 			}
+ 
+ 			/**
