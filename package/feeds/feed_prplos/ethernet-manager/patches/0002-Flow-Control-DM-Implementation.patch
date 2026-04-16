@@ -1,0 +1,318 @@
+From c30fc7ccc1fcb2463531fe1100293c875d0ad9ac Mon Sep 17 00:00:00 2001
+From: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+Date: Thu, 16 Apr 2026 09:58:28 +0530
+Subject: [PATCH] FlowControl DM Implementation
+
+Change-Id: Ida28230e2d5bc385c7044846b53f86657264371e
+Signed-off-by: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+-----
+diff --git a/include_priv/ethernet_actions.h b/include_priv/ethernet_actions.h
+index 38a23ec..2420798 100644
+--- a/include_priv/ethernet_actions.h
++++ b/include_priv/ethernet_actions.h
+@@ -138,6 +138,13 @@ amxd_status_t _return_false(amxd_object_t* const object,
+                             void* priv);
+ 
+ 
++amxd_status_t _flowcontrol_on_read(amxd_object_t* const object,
++                                   amxd_param_t* const param,
++                                   amxd_action_t reason,
++                                   const amxc_var_t* const args,
++                                   amxc_var_t* const retval,
++                                   void* priv);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/include_priv/ethernet_ethtool_utils.h b/include_priv/ethernet_ethtool_utils.h
+index efbcfb6..d586b29 100644
+--- a/include_priv/ethernet_ethtool_utils.h
++++ b/include_priv/ethernet_ethtool_utils.h
+@@ -76,6 +76,7 @@ extern "C"
+ int dm_ethernet_ethtool_update_speed(ethernet_info_t* ethernet);
+ int dm_ethernet_ethtool_update_eee(ethernet_info_t* ethernet);
+ int dm_ethernet_ethtool_update_edpd(ethernet_info_t* ethernet);
++int dm_ethernet_ethtool_update_flowcontrol(ethernet_info_t* ethernet);
+ int dm_ethernet_ethtool_set_speed(ethernet_info_t* ethernet);
+ int dm_ethernet_ethtool_set_eee(ethernet_info_t* ethernet);
+ int dm_ethernet_ethtool_set_edpd(ethernet_info_t* ethernet);
+diff --git a/mod-eth-lla/include_priv/mod_eth_ethtool.h b/mod-eth-lla/include_priv/mod_eth_ethtool.h
+index eace925..426626f 100644
+--- a/mod-eth-lla/include_priv/mod_eth_ethtool.h
++++ b/mod-eth-lla/include_priv/mod_eth_ethtool.h
+@@ -88,6 +88,10 @@ int link_edpd_get(const char* function_name,
+ int link_edpd_set(const char* function_name,
+                   amxc_var_t* args,
+                   amxc_var_t* ret);
++int link_flowcontrol_get(const char* function_name,
++                         amxc_var_t* args,
++                         amxc_var_t* ret);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/mod-eth-lla/src/mod_eth_ethtool.c b/mod-eth-lla/src/mod_eth_ethtool.c
+index 845835a..9a0a028 100644
+--- a/mod-eth-lla/src/mod_eth_ethtool.c
++++ b/mod-eth-lla/src/mod_eth_ethtool.c
+@@ -810,4 +810,86 @@ int link_edpd_set(UNUSED const char* function_name,
+ exit:
+     SAH_TRACEZ_OUT(ME);
+     return rv;
+-}
+\ No newline at end of file
++}
++
++#if defined ETHTOOL_GPAUSEPARAM
++static int ethernet_ethtool_pauseparam_get(const char* name, bool* rx_negotiated, bool* tx_negotiated) {
++    SAH_TRACEZ_IN(ME);
++    int rv = -1;
++    int fd = -1;
++    struct ifreq ifr;
++    struct ethtool_pauseparam pauseparam;
++
++    when_null_trace(rx_negotiated, exit, ERROR, "rx_negotiated pointer can not be NULL");
++    when_null_trace(tx_negotiated, exit, ERROR, "tx_negotiated pointer can not be NULL");
++    when_str_empty_trace(name, exit, ERROR, "Interface name is required");
++
++    memset(&ifr, 0, sizeof(ifr));
++    memset(&pauseparam, 0, sizeof(pauseparam));
++    strlcpy(ifr.ifr_name, name, IF_NAMESIZE);
++
++    fd = ioctl_fd_get();
++    when_false_trace(fd >= 0, exit, ERROR, "No valid file descriptor");
++
++    pauseparam.cmd = ETHTOOL_GPAUSEPARAM;
++    ifr.ifr_data = (char*) &pauseparam;
++
++    if(ioctl(fd, SIOCETHTOOL, &ifr) < 0) {
++        when_true_trace(errno != EOPNOTSUPP, exit, ERROR, "ioctl call ETHTOOL_GPAUSEPARAM failed, %s - for device name %s", strerror(errno), ifr.ifr_name);
++        *rx_negotiated = false;
++        *tx_negotiated = false;
++    } else {
++        // When autonegotiate is enabled, flow control is negotiated with link partner
++        // If autoneg is on, both RX and TX are negotiated (ethtool shows "RX negotiated: on, TX negotiated: on")
++        if(pauseparam.autoneg) {
++            // When autoneg is on, assume both RX and TX are negotiated
++            *rx_negotiated = true;
++            *tx_negotiated = true;
++        } else {
++            // When autonegotiate is off, use the configured values
++            *rx_negotiated = pauseparam.rx_pause;
++            *tx_negotiated = pauseparam.tx_pause;
++        }
++    }
++
++    rv = 0;
++exit:
++    SAH_TRACEZ_OUT(ME);
++    return rv;
++}
++#endif
++
++int link_flowcontrol_get(UNUSED const char* function_name,
++                         amxc_var_t* args,
++                         amxc_var_t* ret) {
++    SAH_TRACEZ_IN(ME);
++    int rv = -1;
++    const char* intf_name = GET_CHAR(args, "intf_name");
++    bool rx_negotiated = false;
++    bool tx_negotiated = false;
++    bool enabled = false;
++
++    when_str_empty_trace(intf_name, exit, ERROR, "Interface name is required to read flow control settings");
++    amxc_var_set_type(ret, AMXC_VAR_ID_HTABLE);
++
++#if defined ETHTOOL_GPAUSEPARAM
++    when_failed_trace(ethernet_ethtool_pauseparam_get(intf_name, &rx_negotiated, &tx_negotiated), exit, ERROR, "Failed to get flow control status for device name %s", intf_name);
++
++    // FlowControl is enabled if either RX or TX negotiated is on
++    enabled = rx_negotiated || tx_negotiated;
++
++    SAH_TRACEZ_INFO(ME, "Flow control for %s: RX negotiated=%d, TX negotiated=%d, enabled=%d",
++                    intf_name, rx_negotiated, tx_negotiated, enabled);
++#else
++    SAH_TRACEZ_ERROR(ME, "Getting flow control status via ethtool is not supported on this kernel version");
++#endif
++
++    amxc_var_add_key(bool, ret, "enabled", enabled);
++    amxc_var_add_key(bool, ret, "rx_negotiated", rx_negotiated);
++    amxc_var_add_key(bool, ret, "tx_negotiated", tx_negotiated);
++
++    rv = 0;
++exit:
++    SAH_TRACEZ_OUT(ME);
++    return rv;
++}
+diff --git a/mod-eth-lla/src/mod_eth_lla.c b/mod-eth-lla/src/mod_eth_lla.c
+index d3cfd72..9d4345f 100644
+--- a/mod-eth-lla/src/mod_eth_lla.c
++++ b/mod-eth-lla/src/mod_eth_lla.c
+@@ -164,6 +164,7 @@ static AMXM_CONSTRUCTOR module_start(void) {
+     amxm_module_add_function(mod, "link-eee-set", link_eee_set);
+     amxm_module_add_function(mod, "link-edpd-get", link_edpd_get);
+     amxm_module_add_function(mod, "link-edpd-set", link_edpd_set);
++    amxm_module_add_function(mod, "link-flowcontrol-get", link_flowcontrol_get);
+     amxm_module_add_function(mod, "system-uptime-get", system_uptime_get);
+     amxm_module_add_function(mod, "mtu-set", mtu_set);
+ 
+diff --git a/odl/ethernet-manager_link.odl b/odl/ethernet-manager_link.odl
+index e76738f..5b2a411 100644
+--- a/odl/ethernet-manager_link.odl
++++ b/odl/ethernet-manager_link.odl
+@@ -110,7 +110,7 @@
+             *
+             * @version 1.0
+             */
+-            %persistent bool FlowControl;
++            %read-only bool FlowControl = false;
+ 
+             /**
+             * Disables or enables sending of ARP messages on the Ethernet link. 
+@@ -132,4 +132,4 @@
+             }
+         }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/src/dm_ethernet_actions.c b/src/dm_ethernet_actions.c
+index 3005682..9432998 100644
+--- a/src/dm_ethernet_actions.c
++++ b/src/dm_ethernet_actions.c
+@@ -70,6 +70,7 @@
+ #include "ethernet_utils.h"
+ #include "ethernet_soc_utils.h"
+ #include "ethernet_actions.h"
++#include "ethernet_ethtool_utils.h"
+ 
+ #define ME "actions"
+ 
+@@ -481,4 +482,34 @@ amxd_status_t _return_false(UNUSED amxd_object_t* object,
+     return amxd_status_ok;
+ }
+ 
++amxd_status_t _flowcontrol_on_read(amxd_object_t* const object,
++                                   UNUSED amxd_param_t* const param,
++                                   amxd_action_t reason,
++                                   UNUSED const amxc_var_t* const args,
++                                   amxc_var_t* const retval,
++                                   UNUSED void* priv) {
++    SAH_TRACEZ_IN(ME);
++    amxd_status_t rv = amxd_status_unknown_error;
++    ethernet_info_t* ethernet = NULL;
++
++    if(reason != action_param_read) {
++        SAH_TRACEZ_NOTICE(ME, "wrong reason, expected action_param_read(%d) got %d", action_param_read, reason);
++        rv = amxd_status_invalid_action;
++        goto exit;
++    }
++
++    when_null_trace(object, exit, ERROR, "object can not be NULL");
++    when_null(object->priv, exit);
++
++    ethernet = (ethernet_info_t*) object->priv;
++
++    // Update FlowControl status from driver
++    dm_ethernet_ethtool_update_flowcontrol(ethernet);
+ 
++    // Read the updated value from the data model
++    rv = amxd_action_param_read(object, param, reason, args, retval, priv);
++
++exit:
++    SAH_TRACEZ_OUT(ME);
++    return rv;
++}
+diff --git a/src/ethernet_ethtool_utils.c b/src/ethernet_ethtool_utils.c
+index 84f3d81..a3e25bf 100644
+--- a/src/ethernet_ethtool_utils.c
++++ b/src/ethernet_ethtool_utils.c
+@@ -339,4 +339,59 @@ exit:
+     amxc_var_clean(&ret);
+     SAH_TRACEZ_OUT(ME);
+     return rv;
+-}
+\ No newline at end of file
++}
++
++int dm_ethernet_ethtool_update_flowcontrol(ethernet_info_t* ethernet) {
++    SAH_TRACEZ_IN(ME);
++    int rv = -1;
++    amxd_dm_t* dm = ethernet_get_dm();
++    amxd_trans_t trans;
++    const char* ctrl = NULL;
++    bool enabled = false;
++    bool rx_negotiated = false;
++    bool tx_negotiated = false;
++    amxc_var_t data;
++    amxc_var_t ret;
++
++    amxd_trans_init(&trans);
++    amxc_var_init(&data);
++    amxc_var_init(&ret);
++
++    when_null_trace(ethernet, exit, ERROR, "ethernet object is NULL");
++    when_null_trace(ethernet->object, exit, ERROR, "ethernet->object is NULL");
++    when_str_empty_trace(ethernet->netdev_intf, exit, ERROR, "netdev_intf is empty");
++
++    amxc_var_set_type(&data, AMXC_VAR_ID_HTABLE);
++    amxc_var_add_key(cstring_t, &data, "intf_name", ethernet->netdev_intf);
++
++    ctrl = mod_ctrl_get(ethernet->object, ETH_LLA_CTRL);
++    SAH_TRACEZ_INFO(ME, "Calling link-flowcontrol-get for interface '%s' (controller='%s')", ethernet->netdev_intf, ctrl);
++    rv = amxm_execute_function(ctrl, MOD_ETH_LLA_CTRL, "link-flowcontrol-get", &data, &ret);
++    when_failed_trace(rv, exit, ERROR, "Failed to call link-flowcontrol-get, return '%d'", rv);
++
++    // Prefer rx_negotiated and tx_negotiated over enabled field
++    // These fields accurately reflect the hardware negotiation state
++    if(GET_ARG(&ret, "rx_negotiated") != NULL && GET_ARG(&ret, "tx_negotiated") != NULL) {
++        rx_negotiated = GET_BOOL(&ret, "rx_negotiated");
++        tx_negotiated = GET_BOOL(&ret, "tx_negotiated");
++        enabled = rx_negotiated || tx_negotiated;
++    } else if(GET_ARG(&ret, "enabled") != NULL) {
++        enabled = GET_BOOL(&ret, "enabled");
++    } else {
++        SAH_TRACEZ_ERROR(ME, "No flow control fields found in return data");
++        goto exit;
++    }
++
++    amxd_trans_set_attr(&trans, amxd_tattr_change_ro, true);
++    amxd_trans_select_object(&trans, ethernet->object);
++    amxd_trans_set_value(bool, &trans, "FlowControl", enabled);
++    rv = amxd_trans_apply(&trans, dm);
++    when_failed_trace(rv, exit, ERROR, "Failed to update FlowControl parameter");
++
++exit:
++    amxd_trans_clean(&trans);
++    amxc_var_clean(&data);
++    amxc_var_clean(&ret);
++    SAH_TRACEZ_OUT(ME);
++    return rv;
++}
+diff --git a/src/ethernet_utils.c b/src/ethernet_utils.c
+index e84b848..efeb95e 100644
+--- a/src/ethernet_utils.c
++++ b/src/ethernet_utils.c
+@@ -307,9 +307,11 @@ amxd_status_t dm_ethernet_update_status(ethernet_info_t* ethernet, const char* s
+             dm_ethernet_ethtool_update_speed(ethernet);
+             dm_ethernet_ethtool_update_eee(ethernet);
+             dm_ethernet_ethtool_update_edpd(ethernet);
++	    dm_ethernet_ethtool_update_flowcontrol(ethernet);
+ 
+         } else if(ethernet->type == ETHERNET_LINK) {
+             set_link_arp(ethernet);
++	    dm_ethernet_ethtool_update_flowcontrol(ethernet);
+         }
+         enable = amxd_object_get_value(bool, ethernet->object, "Enable", NULL);
+         ethernet_info_set_enabled(ethernet, enable);
+@@ -320,7 +322,9 @@ amxd_status_t dm_ethernet_update_status(ethernet_info_t* ethernet, const char* s
+                 dm_ethernet_ethtool_update_speed(ethernet);
+                 dm_ethernet_ethtool_update_eee(ethernet);
+                 dm_ethernet_ethtool_update_edpd(ethernet);
+-            }
++		dm_ethernet_ethtool_update_flowcontrol(ethernet);
++            } else if(ethernet->type == ETHERNET_LINK) {
++		dm_ethernet_ethtool_update_flowcontrol(ethernet); }
+             handle_mac_address(ethernet);
+         } else {
+             reset_ethtool(ethernet);
