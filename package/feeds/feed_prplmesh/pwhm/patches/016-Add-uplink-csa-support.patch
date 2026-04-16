@@ -1,0 +1,134 @@
+From 56fee54ba63ca3964a5b250b6389dedb08497aec Mon Sep 17 00:00:00 2001
+From: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+Date: Thu, 16 Apr 2026 15:03:56 +0530
+Subject: [PATCH 1/1] pwhm : Add-uplink-csa-support
+
+Signed-off-by: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+---
+ include/wld/wld_wpaCtrl_events.h   |  2 ++
+ src/Plugin/wifiGen_eventHandlers.c | 29 +++++++++++++++++++++++++++++
+ src/nl80211/wld_hostapd_cfgFile.c  |  6 ++++++
+ src/nl80211/wld_wpaCtrl_events.c   |  9 +++++++++
+ 4 files changed, 46 insertions(+)
+
+diff --git a/include/wld/wld_wpaCtrl_events.h b/include/wld/wld_wpaCtrl_events.h
+index cc54166..41e68cf 100644
+--- a/include/wld/wld_wpaCtrl_events.h
++++ b/include/wld/wld_wpaCtrl_events.h
+@@ -225,6 +225,7 @@ typedef void (* wld_wpaCtrl_dfsCacExpiredCb_f)(void* userData, char* ifName, swl
+ typedef void (* wld_wpaCtrl_dfsRadarDetectedCb_f)(void* userData, char* ifName, swl_chanspec_t* chanSpec);
+ typedef void (* wld_wpaCtrl_dfsNopFinishedCb_f)(void* userData, char* ifName, swl_chanspec_t* chanSpec);
+ typedef void (* wld_wpaCtrl_dfsNewChannelCb_f)(void* userData, char* ifName, swl_chanspec_t* chanSpec);
++typedef void (* wld_wpaCtrl_uplinkCsaCb_f)(void* userData, char* ifName, char* params);
+ typedef void (* wld_wpaCtrl_mainApSetupCompletedCb_f)(void* userData, char* ifName);
+ typedef void (* wld_wpaCtrl_mainApDisabledCb_f)(void* userData, char* ifName);
+ typedef void (* wld_wpaCtrl_syncOnReadyCb_f)(void* userData, char* ifName, bool state);
+@@ -252,6 +253,7 @@ typedef struct {
+     wld_wpaCtrl_dfsRadarDetectedCb_f fDfsRadarDetectedCb;
+     wld_wpaCtrl_dfsNopFinishedCb_f fDfsNopFinishedCb;
+     wld_wpaCtrl_dfsNewChannelCb_f fDfsNewChannelCb; //fallback after dfs radar detection
++    wld_wpaCtrl_uplinkCsaCb_f fUplinkCsaCb;
+     wld_wpaCtrl_mainApSetupCompletedCb_f fMainApSetupCompletedCb;
+     wld_wpaCtrl_mainApDisabledCb_f fMainApDisabledCb;
+ 
+diff --git a/src/Plugin/wifiGen_eventHandlers.c b/src/Plugin/wifiGen_eventHandlers.c
+index b6a018e..079fddf 100644
+--- a/src/Plugin/wifiGen_eventHandlers.c
++++ b/src/Plugin/wifiGen_eventHandlers.c
+@@ -119,6 +119,8 @@ static const char* s_fwdRadioStdWpaCtrlEventsList[] = {
+     "DFS-CAC-START",
+     "DFS-CAC-COMPLETED",
+     "DFS-NOP-FINISHED"
++    "DFS-NOP-FINISHED",
++    "DFS-UPLINK-CSA"
+ };
+ 
+ static void s_notifyWpaCtrlEvent(amxd_object_t* object, char* ifName, char* eventName,
+@@ -514,6 +516,32 @@ static void s_fetchSockLinkIface(void* userData _UNUSED, wld_wpaCtrlMngr_t* pMgr
+     swl_str_copyMalloc(ppLinkIfName, pLinkIfName);
+ }
+ 
++static void s_uplinkCsaCb(void* userData, char* ifName _UNUSED, char* params) {
++    T_Radio* pRad = (T_Radio*) userData;
++    ASSERT_NOT_NULL(pRad, , ME, "NULL");
++
++    // Forward DFS-UPLINK-CSA event to wpa_supplicant endpoint if connected
++    T_EndPoint* pEP = NULL;
++    wld_rad_forEachEp(pEP, pRad) {
++        if((pEP == NULL) || (pEP->wpaCtrlInterface == NULL)) {
++            continue;
++        }
++
++        if(!wld_wpaCtrlInterface_isReady(pEP->wpaCtrlInterface)) {
++            SAH_TRACEZ_ERROR(ME, "%s: wpa_supplicant interface not ready, skip for    warding UPLINK-CSA", pEP->Name);
++            continue;
++        }
++
++        // Send UPLINK_CSA command to wpa_supplicant
++        char cmd[256];
++        snprintf(cmd, sizeof(cmd), "UPLINK_CSA %s", params);
++
++        SAH_TRACEZ_ERROR(ME, "%s: forwarding UPLINK-CSA to wpa_supplicant: %s", pEP->Name, cmd);
++        wld_wpaCtrl_sendCmd(pEP->wpaCtrlInterface, cmd);
++    }
++}
++
++
+ #define SET_HDLR(tgt, src) {tgt = (tgt ? : src); }
+ 
+ static swl_rc_ne s_setWpaCtrlRadEvtHandlers(wld_wpaCtrlMngr_t* wpaCtrlMngr, T_Radio* pRad) {
+@@ -538,6 +566,7 @@ static swl_rc_ne s_setWpaCtrlRadEvtHandlers(wld_wpaCtrlMngr_t* wpaCtrlMngr, T_Ra
+     SET_HDLR(wpaCtrlRadEvthandlers.fDfsNopFinishedCb, s_dfsNopFinishedCb);
+     SET_HDLR(wpaCtrlRadEvthandlers.fDfsNewChannelCb, s_dfsNewChannelCb);
+     SET_HDLR(wpaCtrlRadEvthandlers.fFetchSockLinkIface, s_fetchSockLinkIface);
++    SET_HDLR(wpaCtrlRadEvthandlers.fUplinkCsaCb, s_uplinkCsaCb);
+     wld_wpaCtrlMngr_setEvtHandlers(wpaCtrlMngr, pRad, &wpaCtrlRadEvthandlers);
+     return SWL_RC_OK;
+ }
+diff --git a/src/nl80211/wld_hostapd_cfgFile.c b/src/nl80211/wld_hostapd_cfgFile.c
+index c82e4db..04cc5cf 100644
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -436,6 +436,12 @@ void wld_hostapd_cfgFile_setRadioConfig(T_Radio* pRad, swl_mapChar_t* radConfigM
+     if(SWL_BIT_IS_SET(pRad->supportedStandards, SWL_RADSTD_AX)) {
+         swl_mapCharFmt_addValInt32(radConfigMap, "ieee80211ax", enableRad11ax);
+     }
++
++    if(wld_rad_is_5ghz(pRad) && pRad->isSTA) {
++        swl_mapCharFmt_addValInt32(radConfigMap,"uplink_csa", 1);
++	swl_mapCharFmt_addValInt32(radConfigMap, "skip_cac", 1);
++    }
++
+     if(enableRad11ax) {
+         if(pChWId) {
+             if(pEhtChWId && (*pChWId != *pEhtChWId)) {
+diff --git a/src/nl80211/wld_wpaCtrl_events.c b/src/nl80211/wld_wpaCtrl_events.c
+index 7043e8c..dee7295 100644
+--- a/src/nl80211/wld_wpaCtrl_events.c
++++ b/src/nl80211/wld_wpaCtrl_events.c
+@@ -523,6 +523,14 @@ static void s_apCsaFinishedEvtCb(wld_wpaCtrlInterface_t* pInterface, char* event
+     CALL_MGR_I(pInterface, fApCsaFinishedCb, &chanSpec);
+ }
+ 
++static void s_uplinkCsaEvtCb(wld_wpaCtrlInterface_t* pInterface, char* event _UNUSED    , char* params) {
++    // Example: DFS-UPLINK-CSA freq=2427 ht_enabled=0 ch_offset=0 ch_width=20MHz (no HT) cf1=2427 cf2=0 dfs=0
++
++    SAH_TRACEZ_ERROR(ME, "%s: uplink CSA %s ", pInterface->name, params);
++
++    CALL_MGR_I(pInterface, fUplinkCsaCb, params);
++}
++
+ static void s_apEnabledEvt(wld_wpaCtrlInterface_t* pInterface, char* event, char* params _UNUSED) {
+     // Example: AP-ENABLED
+     // This event notifies that hapd main interface has setup completed
+@@ -882,6 +890,7 @@ SWL_TABLE(sWpaCtrlEvents,
+               {"CTRL-EVENT-NETWORK-NOT-FOUND", &s_stationScanNetworkNotFound},
+               {"CTRL-EVENT-AUTH-REJECT", &s_stationAuthRejected},
+               {"BEACON-RESP-RX", &s_beaconResponseEvt},
++	      {"DFS-UPLINK-CSA", &s_uplinkCsaEvtCb},
+               ));
+ 
+ static evtParser_f s_getEventParser(char* eventName) {
+-- 
+2.34.1
+
