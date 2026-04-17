@@ -83,6 +83,8 @@ start() {
 	local age0=$(cat /proc/boot_info/bootconfig0/age)
 	local age1=$(cat /proc/boot_info/bootconfig1/age)
 
+	#stop prplmesh to prevent beerocks crash
+	/etc/init.d/prplmesh stop
 	#clearing milestone bit
 	echo 0 > /sys/devices/platform/firmware:scm/hlos_done
 	case "$board" in
