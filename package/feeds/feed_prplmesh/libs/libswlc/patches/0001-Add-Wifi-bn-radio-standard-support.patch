@@ -1,0 +1,139 @@
+From: Vijay Balaji <vijbal@qti.qualcomm.com>
+Subject: [PATCH] libswlc : Enable BN radio standard
+
+This change adds support to enable 'bn' operating standard
+as default along with other standards.
+
+Change-Id: Ib68d891a98d5e26451dedf2f8f108e44190ea589
+Signed-off-by: Vijay Balaji <vijbal@qti.qualcomm.com>
+---
+diff --git a/src/swl_radioStandards.c b/src/swl_radioStandards.c
+index 1234567..abcdef0 100644
+--- a/src/swl_radioStandards.c
++++ b/src/swl_radioStandards.c
+@@ -94,9 +94,9 @@
+ #include "swl/swl_assert.h"
+ #include "swl/swl_typeEnum.h"
+ 
+-const char* const swl_radStd_str[] = {"auto", "a", "b", "g", "n", "ac", "ax", "be"};
++const char* const swl_radStd_str[] = {"auto", "a", "b", "g", "n", "ac", "ax", "be", "bn"};
+ SWL_ASSERT_STATIC(SWL_ARRAY_SIZE(swl_radStd_str) == SWL_RADSTD_MAX, "swl_radStd_str not correctly defined");
+-const char* const swl_radStd_unknown_str[] = {"Unknown", "a", "b", "g", "n", "ac", "ax", "be"};
++const char* const swl_radStd_unknown_str[] = {"Unknown", "a", "b", "g", "n", "ac", "ax", "be", "bn"};
+ SWL_ASSERT_STATIC(SWL_ARRAY_SIZE(swl_radStd_unknown_str) == SWL_RADSTD_MAX, "swl_radStd_unknown_str not correctly defined");
+ 
+ SWL_TYPE_ENUM_C(gtSwl_type_radStd, swl_radStd_e, SWL_RADSTD_AUTO, SWL_RADSTD_MAX, swl_radStd_str);
+@@ -118,7 +118,8 @@ static const char* radStdIncludingLegacy
+     SWL_RADSTD_LEGACY_A_B_G_N,
+     SWL_RADSTD_LEGACY_AC_AND_LOWER,
+     SWL_RADSTD_LEGACY_AX_AND_LOWER,
+-    SWL_RADSTD_LEGACY_BE_AND_LOWER
++    SWL_RADSTD_LEGACY_BE_AND_LOWER,
++    SWL_RADSTD_LEGACY_BN_AND_LOWER
+ };
+ 
+ /**
+@@ -137,7 +138,8 @@ static const swl_radStd_m radStdMasksInc
+     M_SWL_RADSTD_A | M_SWL_RADSTD_B | M_SWL_RADSTD_G | M_SWL_RADSTD_N, // "abgn"
+     M_SWL_RADSTD_AC,                                                   // "ac"
+     M_SWL_RADSTD_AX,                                                   // "ax"
+-    M_SWL_RADSTD_BE                                                    // "be"
++    M_SWL_RADSTD_BE,                                                   // "be"
++    M_SWL_RADSTD_BN                                                    // "bn"
+ };
+ 
+ /** Conversion between string and enum representation of #swl_radStd_format_e. */
+@@ -167,12 +169,17 @@ static swl_radStd_m s_removeLowerStandar
+     swl_radStd_m expressBE = M_SWL_RADSTD_BE
+         | ((M_SWL_RADSTD_A | M_SWL_RADSTD_B | M_SWL_RADSTD_G | M_SWL_RADSTD_N | M_SWL_RADSTD_AC | M_SWL_RADSTD_AX)
+            & supportedStandards);
++    swl_radStd_m expressBN = M_SWL_RADSTD_BN
++        | ((M_SWL_RADSTD_A | M_SWL_RADSTD_B | M_SWL_RADSTD_G | M_SWL_RADSTD_N | M_SWL_RADSTD_AC | M_SWL_RADSTD_AX | M_SWL_RADSTD_BE)
++           & supportedStandards);
+     if(standards == expressAC) {
+         return M_SWL_RADSTD_AC;
+     } else if(standards == expressAX) {
+         return M_SWL_RADSTD_AX;
+     } else if(standards == expressBE) {
+         return M_SWL_RADSTD_BE;
++    } else if(standards == expressBN) {
++        return M_SWL_RADSTD_BN;
+     } else {
+         return standards;
+     }
+@@ -330,6 +337,8 @@ static swl_radStd_m s_addLowerStandardsI
+         tryToAdd = M_SWL_RADSTD_A | M_SWL_RADSTD_B | M_SWL_RADSTD_G | M_SWL_RADSTD_N | M_SWL_RADSTD_AC;
+     } else if(standards == M_SWL_RADSTD_BE) {
+         tryToAdd = M_SWL_RADSTD_A | M_SWL_RADSTD_B | M_SWL_RADSTD_G | M_SWL_RADSTD_N | M_SWL_RADSTD_AC | M_SWL_RADSTD_AX;
++    } else if(standards == M_SWL_RADSTD_BN) {
++        tryToAdd = M_SWL_RADSTD_A | M_SWL_RADSTD_B | M_SWL_RADSTD_G | M_SWL_RADSTD_N | M_SWL_RADSTD_AC | M_SWL_RADSTD_AX | M_SWL_RADSTD_BE;
+     } else {
+         tryToAdd = 0;
+     }
+diff --git a/include/swl/swl_common_radioStandards.h b/include/swl/swl_common_radioStandards.h
+index 1234567..abcdef0 100644
+--- a/include/swl/swl_common_radioStandards.h
++++ b/include/swl/swl_common_radioStandards.h
+@@ -80,6 +80,7 @@ typedef enum {
+     SWL_RADSTD_AC,
+     SWL_RADSTD_AX,
+     SWL_RADSTD_BE,
++    SWL_RADSTD_BN,
+     SWL_RADSTD_MAX
+ } swl_radStd_e;
+ 
+@@ -134,6 +135,7 @@ SWL_TYPE_ENUM_H(gtSwl_type_radStd, swl_r
+ #define M_SWL_RADSTD_AC    (1 << SWL_RADSTD_AC)
+ #define M_SWL_RADSTD_AX    (1 << SWL_RADSTD_AX)
+ #define M_SWL_RADSTD_BE    (1 << SWL_RADSTD_BE)
++#define M_SWL_RADSTD_BN    (1 << SWL_RADSTD_BN)
+ #define M_SWL_RADSTD_LAST  (1 << SWL_RADSTD_LAST)
+ #define M_SWL_RADSTD_ALL   ((1 << SWL_RADSTD_MAX) - 1)
+ 
+@@ -163,6 +165,7 @@ typedef uint32_t swl_radStd_m;
+ #define SWL_RADSTD_LEGACY_AC_AND_LOWER "ac"
+ #define SWL_RADSTD_LEGACY_AX_AND_LOWER "ax"
+ #define SWL_RADSTD_LEGACY_BE_AND_LOWER "be"
++#define SWL_RADSTD_LEGACY_BN_AND_LOWER "bn"
+ 
+ typedef enum {
+     // Interpret "ac" as '802.11ac plus 802.11a
+diff --git a/src/swl_chanspec.c b/src/swl_chanspec.c
+index 1234567..abcdef0 100644
+--- a/src/swl_chanspec.c
++++ b/src/swl_chanspec.c
+@@ -107,9 +107,9 @@ SWL_ASSERT_STATIC(SWL_ARRAY_SIZE(swl_ban
+ 
+ const swl_radStd_m swl_freqBand_radStd[] =
+ {
+-    M_SWL_RADSTD_B | M_SWL_RADSTD_G | M_SWL_RADSTD_N | M_SWL_RADSTD_AX | M_SWL_RADSTD_BE,  // #SWL_FREQ_BAND_2_4GHZ
+-    M_SWL_RADSTD_A | M_SWL_RADSTD_N | M_SWL_RADSTD_AC | M_SWL_RADSTD_AX | M_SWL_RADSTD_BE, // #SWL_FREQ_BAND_5GHZ
+-    M_SWL_RADSTD_AX | M_SWL_RADSTD_BE,                                                     // #SWL_FREQ_BAND_6GHZ
++    M_SWL_RADSTD_B | M_SWL_RADSTD_G | M_SWL_RADSTD_N | M_SWL_RADSTD_AX | M_SWL_RADSTD_BE | M_SWL_RADSTD_BN,  // #SWL_FREQ_BAND_2_4GHZ
++    M_SWL_RADSTD_A | M_SWL_RADSTD_N | M_SWL_RADSTD_AC | M_SWL_RADSTD_AX | M_SWL_RADSTD_BE | M_SWL_RADSTD_BN, // #SWL_FREQ_BAND_5GHZ
++    M_SWL_RADSTD_AX | M_SWL_RADSTD_BE | M_SWL_RADSTD_BN,                                                     // #SWL_FREQ_BAND_6GHZ
+ };
+ SWL_ASSERT_STATIC(SWL_ARRAY_SIZE(swl_freqBand_radStd) == SWL_FREQ_BAND_MAX,
+                   "update 'swl_radStd_supportedInFreqBand' when adding frequency bands");
+@@ -845,6 +845,7 @@ static swl_radBw_m sSwl_maxAppRadBwsFrom
+     /* AC   */ M_SWL_RAD_BW_AUTO | M_SWL_RAD_BW_20MHZ | M_SWL_RAD_BW_40MHZ | M_SWL_RAD_BW_80MHZ | M_SWL_RAD_BW_160MHZ | M_SWL_RAD_BW_8080MHZ,
+     /* AX   */ M_SWL_RAD_BW_AUTO | M_SWL_RAD_BW_20MHZ | M_SWL_RAD_BW_40MHZ | M_SWL_RAD_BW_80MHZ | M_SWL_RAD_BW_160MHZ | M_SWL_RAD_BW_8080MHZ,
+     /* BE   */ M_SWL_RAD_BW_AUTO | M_SWL_RAD_BW_20MHZ | M_SWL_RAD_BW_40MHZ | M_SWL_RAD_BW_80MHZ | M_SWL_RAD_BW_160MHZ | M_SWL_RAD_BW_8080MHZ | M_SWL_RAD_BW_320MHZ1 | M_SWL_RAD_BW_320MHZ2,
++    /* BN   */ M_SWL_RAD_BW_AUTO | M_SWL_RAD_BW_20MHZ | M_SWL_RAD_BW_40MHZ | M_SWL_RAD_BW_80MHZ | M_SWL_RAD_BW_160MHZ | M_SWL_RAD_BW_8080MHZ | M_SWL_RAD_BW_320MHZ1 | M_SWL_RAD_BW_320MHZ2,
+ };
+ SWL_ASSERT_STATIC(SWL_ARRAY_SIZE(sSwl_maxAppRadBwsFromRadStd) == SWL_RADSTD_MAX, "sSwl_maxAppRadBwsFromRadStd not correctly defined");
+ 
+diff --git a/src/swl_mcs.c b/src/swl_mcs.c
+index 1234567..abcdef0 100644
+--- a/src/swl_mcs.c
++++ b/src/swl_mcs.c
+@@ -135,7 +135,8 @@ const swl_mcsStandard_e swl_mcsStandard_
+     SWL_MCS_STANDARD_HT,      //      SWL_RADSTD_N,
+     SWL_MCS_STANDARD_VHT,     //      SWL_RADSTD_AC,
+     SWL_MCS_STANDARD_HE,      //      SWL_RADSTD_AX,
+-    SWL_MCS_STANDARD_EHT      //      SWL_RADSTD_BE
++    SWL_MCS_STANDARD_EHT,     //      SWL_RADSTD_BE,
++    SWL_MCS_STANDARD_EHT      //      SWL_RADSTD_BN
+ };
+ SWL_ASSERT_STATIC(SWL_ARRAY_SIZE(swl_mcsStandard_fromRadStandard_map) == (SWL_RADSTD_MAX), "swl_mcsStandard_radStandard_maps not correctly defined");
+ 
