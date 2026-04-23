@@ -1,0 +1,189 @@
+From 7eaebf1ae204bf9f1da03bcea62ecc643a37552f Mon Sep 17 00:00:00 2001
+From: Harini Pavithra Elangovan <helangov@qti.qualcomm.com>
+Date: Mon, 21 Apr 2026 10:30:00 +0530
+Subject: [PATCH 1/1] Add NaStaMonitor SignalStrength, TimeStamp and OffChannelSupported support
+
+Signed-off-by: Harini Pavithra Elangovan <helangov@qti.qualcomm.com>
+
+---
+--- a/include/wld/wld_nl80211_types.h
++++ b/include/wld/wld_nl80211_types.h
+@@ -209,4 +209,5 @@ typedef struct {
+     bool channelSwitch; // support Channel Switch Announcement
+     bool survey;        // support Survey API
+     bool WMMCapability; // support WME
++    bool remainOnChannel; // support Remain On Channel (off-channel monitoring)
+ } wld_nl80211_wiphySuppCmds;
+--- a/src/nl80211/wld_nl80211_parser.c
++++ b/src/nl80211/wld_nl80211_parser.c
+@@ -1089,7 +1089,9 @@
+         } else if(nl80211Cmd == NL80211_CMD_GET_SURVEY) {
+             pWiphy->suppCmds.survey = true;
+         } else if(nl80211Cmd == NL80211_CMD_SET_QOS_MAP) {
+             pWiphy->suppCmds.WMMCapability = true;
++        } else if(nl80211Cmd == NL80211_CMD_REMAIN_ON_CHANNEL) {
++            pWiphy->suppCmds.remainOnChannel = true;
+         }
+     }
+     return SWL_RC_OK;
+--- a/include_priv/Plugin/wifiGen_rad.h
++++ b/include_priv/Plugin/wifiGen_rad.h
+@@ -99,10 +99,14 @@ swl_rc_ne wifiGen_rad_getScanResults(T_Radio* rad, wld_scanResults_t* results);
+ swl_rc_ne wifiGen_rad_getAirStats(T_Radio* pRad, wld_airStats_t* pStats);
+ swl_rc_ne wifiGen_rad_getSpectrumInfo(T_Radio* rad, bool update _UNUSED, amxc_llist_t* llSpectrumChannelInfo);
+ swl_rc_ne wifiGen_rad_bgDfsStartExt(T_Radio* pRad, wld_startBgdfsArgs_t* args);
+ swl_rc_ne wifiGen_rad_bgDfsStop(T_Radio* pRad);
+ swl_rc_ne wifiGen_rad_fsmReset(T_Radio* pRad);
++swl_rc_ne wifiGen_rad_setupStaMon(T_Radio* pRad, bool enable);
++swl_rc_ne wifiGen_rad_addStaMon(T_Radio* pRad, T_NonAssociatedDevice* pMD);
++swl_rc_ne wifiGen_rad_delStaMon(T_Radio* pRad, T_NonAssociatedDevice* pMD);
++swl_rc_ne wifiGen_rad_updateMonStats(T_Radio* pRad);
+ 
+ /* Internal APIs */
+ void wifiGen_rad_initBands(T_Radio* pRad);
+ swl_rc_ne wifiGen_rad_addVap(T_Radio* pRad, T_AccessPoint* pAP);
+ 
+--- a/src/Plugin/wifiGen.c
++++ b/src/Plugin/wifiGen.c
+@@ -204,7 +204,13 @@ bool wifiGen_init() {
+     fta.mfn_wendpoint_set_mac_address = wifiGen_ep_setMacAddress;
+     fta.mfn_wendpoint_update = wifiGen_ep_update;
+     fta.mfn_wendpoint_setMldUnit = wifiGen_ep_setMldUnit;
+ 
++    /* NaStaMonitor functions */
++    fta.mfn_wrad_setup_stamon = wifiGen_rad_setupStaMon;
++    fta.mfn_wrad_add_stamon = wifiGen_rad_addStaMon;
++    fta.mfn_wrad_del_stamon = wifiGen_rad_delStaMon;
++    fta.mfn_wrad_update_mon_stats = wifiGen_rad_updateMonStats;
++
+     s_vendor = wld_nl80211_registerVendor(&fta);
+     ASSERT_NOT_NULL(s_vendor, false, ME, "NULL vendor");
+     wld_nl80211_getSharedState();
+--- a/src/Plugin/wifiGen_rad.c
++++ b/src/Plugin/wifiGen_rad.c
+@@ -660,4 +660,10 @@ swl_rc_ne wifiGen_rad_supports(T_Radio* pRad) {
+     /* Enable WPS 2.0 -- Do this only when you know that WPS 2.0 is supported & needed! */
+     pRad->wpsConst->wpsSupVer = 2;
+ 
++    /* Set OffChannelSupported based on NL80211_CMD_REMAIN_ON_CHANNEL capability */
++    pRad->stationMonitorOffChannelSupported = wiphyInfo.suppCmds.remainOnChannel;
++    SAH_TRACEZ_INFO(ME, "%s: stationMonitorOffChannelSupported=%d (remain_on_channel=%d)",
++                    pRad->Name, pRad->stationMonitorOffChannelSupported,
++                    wiphyInfo.suppCmds.remainOnChannel);
++
+     if(wiphyInfo.suppMlo && (pOperBand->radStdsMask & M_SWL_RADSTD_BE)) {
+@@ -1376,3 +1376,114 @@ swl_rc_ne wifiGen_rad_fsmReset(T_Radio* pRad) {
+     wld_rad_fsm_reset(pRad);
+     return SWL_RC_OK;
+ }
++
++#define ATH12K_DEBUGFS_BASE "/sys/kernel/debug/ieee80211"
++
++static const char* s_getAth12kHwDir(swl_freqBandExt_e band) {
++    switch(band) {
++    case SWL_FREQ_BAND_EXT_6GHZ:   return "ath12k_hw0";
++    case SWL_FREQ_BAND_EXT_5GHZ:   return "ath12k_hw1";
++    case SWL_FREQ_BAND_EXT_2_4GHZ: return "ath12k_hw2";
++    default:
++        SAH_TRACEZ_WARNING(ME, "Unknown band %d, defaulting to ath12k_hw1", band);
++        return "ath12k_hw1";
++    }
++}
++
++swl_rc_ne wifiGen_rad_setupStaMon(T_Radio* pRad, bool enable) {
++    ASSERT_NOT_NULL(pRad, SWL_RC_INVALID_PARAM, ME, "NULL");
++
++    wld_nl80211_wiphyInfo_t wiphyInfo;
++    swl_rc_ne rc = wld_rad_nl80211_getWiphyInfo(pRad, &wiphyInfo);
++    if(rc < SWL_RC_OK) {
++        SAH_TRACEZ_WARNING(ME, "%s: failed to get wiphy info for staMon setup", pRad->Name);
++        return SWL_RC_OK;
++    }
++
++    pRad->stationMonitorOffChannelSupported = wiphyInfo.suppCmds.remainOnChannel;
++    SAH_TRACEZ_INFO(ME, "%s: staMon %s, offChannelSupported=%d",
++                    pRad->Name, enable ? "enabled" : "disabled",
++                    pRad->stationMonitorOffChannelSupported);
++    return SWL_RC_OK;
++}
++
++static swl_rc_ne s_writeNeighborPeer(T_Radio* pRad, const char* cmd, const unsigned char* mac) {
++    char path[256];
++    snprintf(path, sizeof(path), "%s/%s/%s/neighbor_peer",
++             ATH12K_DEBUGFS_BASE, pRad->wiphyName,
++             s_getAth12kHwDir(pRad->operatingFrequencyBand));
++
++    FILE* f = fopen(path, "w");
++    if(!f) {
++        SAH_TRACEZ_ERROR(ME, "%s: failed to open %s", pRad->Name, path);
++        return SWL_RC_ERROR;
++    }
++    char entry[32];
++    snprintf(entry, sizeof(entry), "%s," MAC_PRINT_FMT "\n", cmd, MAC_PRINT_ARG(mac));
++    fputs(entry, f);
++    fclose(f);
++    SAH_TRACEZ_INFO(ME, "%s: wrote '%s' to neighbor_peer", pRad->Name, entry);
++    return SWL_RC_OK;
++}
++
++swl_rc_ne wifiGen_rad_addStaMon(T_Radio* pRad, T_NonAssociatedDevice* pMD) {
++    ASSERT_NOT_NULL(pRad, SWL_RC_INVALID_PARAM, ME, "NULL");
++    ASSERT_NOT_NULL(pMD, SWL_RC_INVALID_PARAM, ME, "NULL");
++    return s_writeNeighborPeer(pRad, "add", pMD->MACAddress);
++}
++
++swl_rc_ne wifiGen_rad_delStaMon(T_Radio* pRad, T_NonAssociatedDevice* pMD) {
++    ASSERT_NOT_NULL(pRad, SWL_RC_INVALID_PARAM, ME, "NULL");
++    ASSERT_NOT_NULL(pMD, SWL_RC_INVALID_PARAM, ME, "NULL");
++    return s_writeNeighborPeer(pRad, "del", pMD->MACAddress);
++}
++
++swl_rc_ne wifiGen_rad_updateMonStats(T_Radio* pRad) {
++    ASSERT_NOT_NULL(pRad, SWL_RC_INVALID_PARAM, ME, "NULL");
++
++    amxc_llist_for_each(it, &pRad->naStations) {
++        wld_nasta_t* pMD = amxc_llist_it_get_data(it, wld_nasta_t, it);
++        if(!pMD) {
++            continue;
++        }
++
++        char path[256];
++        snprintf(path, sizeof(path), "%s/%s/%s/nrp_rssi/" MAC_PRINT_FMT,
++                 ATH12K_DEBUGFS_BASE, pRad->wiphyName,
++                 s_getAth12kHwDir(pRad->operatingFrequencyBand),
++                 MAC_PRINT_ARG(pMD->MACAddress));
++
++        FILE* f = fopen(path, "r");
++        if(!f) {
++            SAH_TRACEZ_WARNING(ME, "%s: failed to open %s", pRad->Name, path);
++            continue;
++        }
++
++        /* Skip header line */
++        char line[256];
++        if(!fgets(line, sizeof(line), f)) {
++            fclose(f);
++            continue;
++        }
++
++        char mac[18];
++        int32_t rssi = 0, avgRssi = 0;
++        unsigned long timestamp = 0;
++        int parsed = fscanf(f, "%17s %d %d %lu", mac, &rssi, &avgRssi, &timestamp);
++        fclose(f);
++
++        if(parsed >= 2) {
++            pMD->SignalStrength = -rssi;
++            pMD->TimeStamp = swl_timespec_getMonoVal().tv_sec;
++            char macStr[18];
++            snprintf(macStr, sizeof(macStr), MAC_PRINT_FMT, MAC_PRINT_ARG(pMD->MACAddress));
++            SAH_TRACEZ_INFO(ME, "%s: %s rssi=%d SignalStrength=%d",
++                            pRad->Name, macStr, rssi, pMD->SignalStrength);
++        } else {
++            char macStr[18];
++            snprintf(macStr, sizeof(macStr), MAC_PRINT_FMT, MAC_PRINT_ARG(pMD->MACAddress));
++            SAH_TRACEZ_WARNING(ME, "%s: failed to parse nrp_rssi for %s", pRad->Name, macStr);
++        }
++    }
++    return SWL_RC_OK;
++}
