@@ -1,0 +1,23 @@
+From 7ddb83bfbd93f9eb80c63852486a84c07e79068f Mon Sep 17 00:00:00 2001
+From: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+Date: Tue, 28 Apr 2026 22:36:57 +0530
+Subject: [PATCH] Prevent unnecessary client disconnections during SSID
+ configuration
+
+Signed-off-by: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+---
+
+Index: pwhm-v7.23.0/src/Plugin/wifiGen_hapd.c
+===================================================================
+--- pwhm-v7.23.0.orig/src/Plugin/wifiGen_hapd.c
++++ pwhm-v7.23.0/src/Plugin/wifiGen_hapd.c
+@@ -472,7 +472,8 @@ swl_rc_ne wifiGen_hapd_reloadDaemon(T_Ra
+     ASSERTS_NOT_NULL(pRad, SWL_RC_INVALID_PARAM, ME, "NULL");
+     SAH_TRACEZ_INFO(ME, "%s : Reload Hostapd", pRad->Name);
+     swl_rc_ne rc = SWL_RC_OK;
+-    wifiGen_hapd_deauthKnownStations(pRad, true);
++    //Removed a function call that caused unnecessary client disconnections during SSID configuration
++    //wifiGen_hapd_deauthKnownStations(pRad, true);
+     if((wifiGen_hapd_countGrpMembers(pRad) < 2) ||
+        ((rc = wld_rad_hostapd_reconfigure(pRad)) < SWL_RC_OK)) {
+         rc = wld_secDmn_reload(pRad->hostapd);
