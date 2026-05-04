@@ -1,0 +1,158 @@
+From 6b687982396e2fba01a526c9ccbf7b833d6299c1 Mon Sep 17 00:00:00 2001
+From: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+Date: Mon, 4 May 2026 15:05:15 +0530
+Subject: [PATCH] pwhm : Add QBSS Load support via ubus-cli data model
+
+Signed-off-by: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+---
+ include/wld/wld.h                 |  3 ++
+ odl/wld_accesspoint.odl           | 36 ++++++++++++++++++++
+ src/nl80211/wld_hostapd_cfgFile.c |  4 +++
+ src/wld_accesspoint.c             | 55 +++++++++++++++++++++++++++++++
+ 4 files changed, 98 insertions(+)
+
+diff --git a/include/wld/wld.h b/include/wld/wld.h
+index 82de862..711a219 100644
+--- a/include/wld/wld.h
++++ b/include/wld/wld.h
+@@ -2006,6 +2006,9 @@ struct S_ACCESSPOINT {
+     int rssiRejectAssocRssi;
+     uint32_t rssiRejectAssocTimeout;
+     uint32_t rssiDeauthGraceSamples;
++    bool qbssEnable;                /* QBSS Load feature enable flag */
++    uint32_t bssLoadUpdatePeriod;   /* BSS Load Update Period in TUs (only used when qbssEnable=true) */
++    uint32_t chanUtilAvgPeriod;     /* Channel Utilization Averaging Period in TUs (only used when qbssEnable=true) */
+ };
+ 
+ typedef struct SWL_PACKED {
+diff --git a/odl/wld_accesspoint.odl b/odl/wld_accesspoint.odl
+index f703359..659c467 100644
+--- a/odl/wld_accesspoint.odl
++++ b/odl/wld_accesspoint.odl
+@@ -2666,6 +2666,42 @@ define rrm_t{
+                 %persistent int32 RssiRejectAssocRssi;
+                 %persistent uint32 RssiRejectAssocTimeout;
+                 %persistent uint32 RssiDeauthGraceSamples;
++
++                /**
++                 * QBSS (QoS Basic Service Set) Load configuration.
++                 * When Enable is set to 1, the BSS Load element will be included
++                 * in Beacon and Probe Response frames with the configured periods.
++                 */
++                %persistent object Qbss {
++                    on event "*" call wld_ap_setQbssConf_ocf;
++
++                    /**
++                     * Enable or disable QBSS Load element in Beacon/Probe Response frames.
++                     * When set to 1, BssLoadUpdatePeriod and ChanUtilAvgPeriod are applied.
++                     */
++                    %persistent bool Enable {
++                        default false;
++                    }
++
++                    /**
++                     * BSS Load Update Period in TUs (Time Units).
++                     * Defines how often the BSS Load element in Beacon and Probe Response
++                     * frames is updated. Only applied when Enable=1.
++                     */
++                    %persistent uint32 BssLoadUpdatePeriod {
++                        default 10;
++                    }
++
++                    /**
++                     * Channel Utilization Averaging Period in TUs.
++                     * Defines the averaging period for channel utilization measurements.
++                     * Only applied when Enable=1.
++                     */
++                    %persistent uint32 ChanUtilAvgPeriod {
++                        default 10;
++                    }
++                }
++
+ 	} /* object AccessPoint */
+     }
+ }
+diff --git a/src/nl80211/wld_hostapd_cfgFile.c b/src/nl80211/wld_hostapd_cfgFile.c
+index 631f0f1..558045d 100644
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -1234,6 +1234,10 @@ static bool s_setVapCommonConfig(T_AccessPoint* pAP, swl_mapChar_t* vapConfigMap
+     if (pAP->rssiDeauthGraceSamples != 0) {
+         swl_mapCharFmt_addValInt32(vapConfigMap, "rssi_deauth_grace_samples", pAP->rssiDeauthGraceSamples);
+     }
++    if (pAP->qbssEnable) {
++        swl_mapCharFmt_addValInt32(vapConfigMap, "bss_load_update_period", pAP->bssLoadUpdatePeriod);
++        swl_mapCharFmt_addValInt32(vapConfigMap, "chan_util_avg_period", pAP->chanUtilAvgPeriod);
++    }
+ 
+     return true;
+ }
+diff --git a/src/wld_accesspoint.c b/src/wld_accesspoint.c
+index 6ee6a61..ff04c98 100644
+--- a/src/wld_accesspoint.c
++++ b/src/wld_accesspoint.c
+@@ -3327,6 +3327,61 @@ static void s_setRssiDeauthGraceSamples_pwf(void* priv _UNUSED, amxd_object_t* o
+     SAH_TRACEZ_OUT(ME);
+ }
+ 
++static void s_setQbssEnable_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_AccessPoint* pAP = wld_ap_fromObj(amxd_object_get_parent(object));
++    ASSERT_NOT_NULL(pAP, , ME, "INVALID");
++
++    bool qbssEnable = amxc_var_dyncast(bool, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set Qbss.Enable %d", pAP->alias, qbssEnable);
++    pAP->qbssEnable = qbssEnable;
++    wld_ap_doSync(pAP);
++    SAH_TRACEZ_OUT(ME);
++}
++
++static void s_setQbssBssLoadUpdatePeriod_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_AccessPoint* pAP = wld_ap_fromObj(amxd_object_get_parent(object));
++    ASSERT_NOT_NULL(pAP, , ME, "INVALID");
++
++    uint32_t bssLoadUpdatePeriod = amxc_var_dyncast(uint32_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set Qbss.BssLoadUpdatePeriod %u", pAP->alias, bssLoadUpdatePeriod);
++    pAP->bssLoadUpdatePeriod = bssLoadUpdatePeriod;
++    if(pAP->qbssEnable) {
++        wld_ap_doSync(pAP);
++    }
++    SAH_TRACEZ_OUT(ME);
++}
++
++static void s_setQbssChanUtilAvgPeriod_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_AccessPoint* pAP = wld_ap_fromObj(amxd_object_get_parent(object));
++    ASSERT_NOT_NULL(pAP, , ME, "INVALID");
++
++    uint32_t chanUtilAvgPeriod = amxc_var_dyncast(uint32_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set Qbss.ChanUtilAvgPeriod %u", pAP->alias, chanUtilAvgPeriod);
++    pAP->chanUtilAvgPeriod = chanUtilAvgPeriod;
++    if(pAP->qbssEnable) {
++        wld_ap_doSync(pAP);
++    }
++    SAH_TRACEZ_OUT(ME);
++}
++
++SWLA_DM_HDLRS(sApQbssDmHdlrs,
++              ARR(SWLA_DM_PARAM_HDLR("Enable", s_setQbssEnable_pwf),
++                  SWLA_DM_PARAM_HDLR("BssLoadUpdatePeriod", s_setQbssBssLoadUpdatePeriod_pwf),
++                  SWLA_DM_PARAM_HDLR("ChanUtilAvgPeriod", s_setQbssChanUtilAvgPeriod_pwf),
++                  ));
++
++void _wld_ap_setQbssConf_ocf(const char* const sig_name,
++                             const amxc_var_t* const data,
++                             void* const priv) {
++    swla_dm_procObjEvtOfLocalDm(&sApQbssDmHdlrs, sig_name, data, priv);
++}
++
+ 
+ SWLA_DM_HDLRS(sApDmHdlrs,
+               ARR(SWLA_DM_PARAM_HDLR("SSIDReference", s_setSSIDRef_pwf),
+-- 
+2.34.1
+
