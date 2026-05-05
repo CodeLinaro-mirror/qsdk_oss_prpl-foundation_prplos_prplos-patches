@@ -1,0 +1,35 @@
+From 025f95a23fddce5ead4642af2eb88d839ea38175 Mon Sep 17 00:00:00 2001
+From: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+Date: Tue, 5 May 2026 16:17:14 +0530
+Subject: [PATCH] ML Reconfiguration Link Removal on Vaps
+
+Change-Id: I3321fbf46348a1cf63b1a7a5a47ea748e3ec046a
+Signed-off-by: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+---
+
+diff --git a/src/Plugin/wifiGen_fsm.c b/src/Plugin/wifiGen_fsm.c
+index 69665dd..ac86d90 100644
+--- a/src/Plugin/wifiGen_fsm.c
++++ b/src/Plugin/wifiGen_fsm.c
+@@ -466,7 +466,7 @@ static bool s_doEnableAp(T_AccessPoint* pAP, T_Radio* pRad) {
+             s_schedNextAction(SECDMN_ACTION_OK_NEED_RE_ADD, pAP, pRad);
+         } else if(s_hasMultiLinkApMld(pRad)) {
+             SAH_TRACEZ_INFO(ME, "%s: has multi-band APMLD: need to restart hostapd", pAP->alias);
+-            s_schedNextAction(SECDMN_ACTION_OK_NEED_RE_ADD_LINK, pAP, pRad);
++            s_schedNextAction(SECDMN_ACTION_OK_NEED_SIGHUP, pAP, pRad);
+         } else {
+             SAH_TRACEZ_WARNING(ME, "%s: sched reload all radio %s VAPs to update wpaCtrl ifaces", pAP->alias, pRad->Name);
+             s_schedNextAction(SECDMN_ACTION_OK_NEED_SIGHUP, pAP, pRad);
+diff --git a/src/nl80211/wld_hostapd_ap_api.c b/src/nl80211/wld_hostapd_ap_api.c
+index 8b5f0a5..e337cc6 100644
+--- a/src/nl80211/wld_hostapd_ap_api.c
++++ b/src/nl80211/wld_hostapd_ap_api.c
+@@ -864,7 +864,7 @@ wld_secDmn_action_rc_ne wld_ap_hostapd_setMldParams(T_AccessPoint* pAP) {
+         if(!swl_str_matches(curCfgIface, curRunIface) || ((curLinkId > -1) != cfgMldAp)) {
+             SAH_TRACEZ_INFO(ME, "%s: need restart to sync mld runIface(%s)/cfgIface(%s) curLinkId(%d)/cfgMldAp(%d)",
+                             pAP->alias, curRunIface, curCfgIface, curLinkId, cfgMldAp);
+-            action = SECDMN_ACTION_OK_NEED_RE_ADD_LINK;
++            action = SECDMN_ACTION_OK_NEED_SIGHUP;
+         }
+     }
+     wld_hostapd_deleteConfig(pNewCfg);
