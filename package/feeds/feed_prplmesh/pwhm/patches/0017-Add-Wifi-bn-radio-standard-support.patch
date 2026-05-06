@@ -1,0 +1,35 @@
+From: Vijay Balaji <vijbal@qti.qualcomm.com>
+Subject: [PATCH] pwhm : Update radio standards with BN
+
+This change adds 'bn' operating standard as default standard
+along with other standards for pwhm.
+
+Change-Id: Ib68d891a98d5e26451dedf2f8f108e44190ea589
+Signed-off-by: Vijay Balaji <vijbal@qti.qualcomm.com>
+---
+diff --git a/odl/wld_radio.odl b/src/odl/wld_radio.odl
+index 1234567..abcdef0 100644
+--- a/odl/wld_radio.odl
++++ b/odl/wld_radio.odl
+@@ -663,7 +663,8 @@ define probelist_t{
+ 		   the following combinations (were "ax" means "ax"-only and "ac" "ac-only"):
+ 		   "a", "b", "g", "n", "b,g", "g,n", "b,g,n", "a,n", "a,b,g,n", "a,n,ac",
+ 		   "a,b,g,n,ac,ax", "n,ac", "ac", "ax", "be", "a,n,ac,ax",
+-		   "b,g,n,ax","a,n,ac,ax,be", "b,g,n,ax,be".
++		   "b,g,n,ax","a,n,ac,ax,be", "b,g,n,ax,be", "a,n,ac,ax,be,bn",
++		   "b,g,n,ax,be,bn", "ax,be,bn".
+ 		   </p>
+ 		 */
+ 		%persistent string OperatingStandards = "auto" {
+diff --git a/src/nl80211/wld_nl80211_parser.c b/src/nl80211/wld_nl80211_parser.c
+index 1234567..abcdef0 100644
+--- a/src/nl80211/wld_nl80211_parser.c
++++ b/src/nl80211/wld_nl80211_parser.c
+@@ -699,6 +699,7 @@ static void s_parseEhtCapPhy(const struc
+     }
+ 
+     pBand->radStdsMask |= M_SWL_RADSTD_BE;
++    pBand->radStdsMask |= M_SWL_RADSTD_BN;
+ 
+     /* Support For 320MHz In 6 GHz */
+     if(phyCaps->support_320mhz &&
