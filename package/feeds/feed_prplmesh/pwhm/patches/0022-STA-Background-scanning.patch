@@ -1,0 +1,86 @@
+From 736092d940bc6129b08d3aaf5817e0d4a099e232 Mon Sep 17 00:00:00 2001
+From: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+Date: Mon, 11 May 2026 14:41:27 +0530
+Subject: [PATCH] STA background scanning fix
+
+Change-Id: I19fcaa5ae8c4a1a85fd85e98ef6241ef4893c0e7
+Signed-off-by: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+---
+diff --git a/src/nl80211/wld_wpaSupp_cfgFile.c b/src/nl80211/wld_wpaSupp_cfgFile.c
+index 9fa298c..227148a 100644
+--- a/src/nl80211/wld_wpaSupp_cfgFile.c
++++ b/src/nl80211/wld_wpaSupp_cfgFile.c
+@@ -238,15 +238,23 @@ static swl_rc_ne s_setWpaSuppNetworkConfig(T_EndPoint* pEP, wld_wpaSupp_config_t
+         swl_mapChar_add(network, "pin", pEP->WPS_ClientPIN);
+     }
+ 
++    bool bgscanEnabled = !swl_str_isEmpty(epProfile->backgroundScan);
++    bool bgscanFreqConfigured = !swl_str_isEmpty(epProfile->backgroundScanFrequency);
++    
+     if(pEP->connectionStatus != EPCS_CONNECTED) {
+         if(!swl_str_isEmpty(epProfile->scanFrequency)) {
+             swl_mapChar_add(network, "scan_freq", epProfile->scanFrequency);
++            SAH_TRACEZ_INFO(ME, "%s: Using scan_freq for initial connection: %s", pEP->Name, epProfile->scanFrequency);
+         }
+-        if(!swl_str_isEmpty(epProfile->backgroundScan)) {
+-            swl_mapChar_add(network, "bgscan", epProfile->backgroundScan);
+-        }
+-        if(!swl_str_isEmpty(epProfile->backgroundScanFrequency)) {
++    }
++    
++    if(bgscanEnabled) {
++        swl_mapChar_add(network, "bgscan", epProfile->backgroundScan);
++        
++        if(bgscanFreqConfigured) {
+             swl_mapChar_add(network, "bgscan_freq", epProfile->backgroundScanFrequency);
++            SAH_TRACEZ_INFO(ME, "%s: Background scan configured: %s on freq: %s", 
++                           pEP->Name, epProfile->backgroundScan, epProfile->backgroundScanFrequency);
+         }
+     }
+ 
+diff --git a/src/wld_endpoint.c b/src/wld_endpoint.c
+index e50e97f..eb06aa7 100644
+--- a/src/wld_endpoint.c
++++ b/src/wld_endpoint.c
+@@ -790,28 +790,28 @@ bool syncData_Object2EndPointProfile(amxd_object_t* object) {
+     }
+     free(ssid);
+ 
+-    if (pProfile->endpoint && pProfile->endpoint->connectionStatus != EPCS_CONNECTED){
++    if (pProfile->endpoint && pProfile->endpoint->connectionStatus != EPCS_CONNECTED) {
+         char* scanFrequency = amxd_object_get_cstring_t(object, "ScanFrequency", NULL);
+         if(!swl_str_matches(scanFrequency, pProfile->scanFrequency)) {
+             changed |= 1;
+             swl_str_copy(pProfile->scanFrequency, sizeof(pProfile->scanFrequency), scanFrequency);
+         }
+         free(scanFrequency);
++    }
+ 
+-        char* backgroundScan = amxd_object_get_cstring_t(object, "BackgroundScan", NULL);
+-        if(!swl_str_matches(backgroundScan, pProfile->backgroundScan)) {
+-            changed |= 1;
+-            swl_str_copy(pProfile->backgroundScan, sizeof(pProfile->backgroundScan), backgroundScan);
+-        }
+-        free(backgroundScan);
++    char* backgroundScan = amxd_object_get_cstring_t(object, "BackgroundScan", NULL);
++    if(!swl_str_matches(backgroundScan, pProfile->backgroundScan)) {
++        changed |= 1;
++        swl_str_copy(pProfile->backgroundScan, sizeof(pProfile->backgroundScan), backgroundScan);
++    }
++    free(backgroundScan);
+ 
+-        char* backgroundScanFrequency = amxd_object_get_cstring_t(object, "BackgroundScanFrequency", NULL);
+-        if(!swl_str_matches(backgroundScanFrequency, pProfile->backgroundScanFrequency)) {
+-            changed |= 1;
+-            swl_str_copy(pProfile->backgroundScanFrequency, sizeof(pProfile->backgroundScanFrequency), backgroundScanFrequency);
+-        }
+-        free(backgroundScanFrequency);
++    char* backgroundScanFrequency = amxd_object_get_cstring_t(object, "BackgroundScanFrequency", NULL);
++    if(!swl_str_matches(backgroundScanFrequency, pProfile->backgroundScanFrequency)) {
++        changed |= 1;
++        swl_str_copy(pProfile->backgroundScanFrequency, sizeof(pProfile->backgroundScanFrequency), backgroundScanFrequency);
+     }
++    free(backgroundScanFrequency);
+ 
+     char* bssid = amxd_object_get_cstring_t(object, "ForceBSSID", NULL);
+     if((bssid == 0) || (bssid[0] == 0)
