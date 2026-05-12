@@ -11,13 +11,17 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
 
 --- a/src/nl80211/wld_hostapd_cfgFile.c
 +++ b/src/nl80211/wld_hostapd_cfgFile.c
-@@ -265,6 +265,10 @@ void wld_hostapd_cfgFile_setRadioConfig(
+@@ -305,6 +305,14 @@ void wld_hostapd_cfgFile_setRadioConfig(
              }
          }
      }
-+    if (wld_rad_is_24ghz(pRad) && pRad->obssCoexistenceActive == 0) {
++    if (wld_rad_is_24ghz(pRad) && pRad->obssCoexistenceActive == 0  && pRad->obssCoexistenceEnabled == 0) {
 +	    swl_mapChar_add(radConfigMap, "ht_coex", "0");
 +	    swl_mapChar_add(radConfigMap, "noscan", "1");
++    }
++    else if (wld_rad_is_24ghz(pRad) && pRad->obssCoexistenceEnabled == 1) {
++	    swl_mapChar_add(radConfigMap, "ht_coex", "1");
++	    swl_mapChar_add(radConfigMap, "noscan", "0");
 +    }
      if(enableRad11n) {
          if(wld_channel_hasChannelWidthCovered(tgtChspec, SWL_BW_40MHZ)) {
