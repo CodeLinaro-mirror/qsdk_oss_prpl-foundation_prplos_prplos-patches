@@ -1,0 +1,144 @@
+From 27ac4e7c140c1e5c1e4bfaee15576895fe117350 Mon Sep 17 00:00:00 2001
+From: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+Date: Thu, 14 May 2026 16:46:26 +0530
+Subject: [PATCH] FlowControl DM fix
+
+Change-Id: Iefae3dbbdfdb1b221b09afac7ec83cea859f177c
+Signed-off-by: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+---
+
+diff --git a/mod-eth-lla/src/mod_eth_ethtool.c b/mod-eth-lla/src/mod_eth_ethtool.c
+index 9a0a028..eca5abc 100644
+--- a/mod-eth-lla/src/mod_eth_ethtool.c
++++ b/mod-eth-lla/src/mod_eth_ethtool.c
+@@ -414,9 +414,13 @@ static int ethernet_ethtool_linksettings_get(const char* name, uint32_t* speed,
+         when_failed_trace(rv, exit, ERROR, "Failed to get duplex mode and speed using SET commands for device name %s", name);
+     } else {
+         SAH_TRACEZ_INFO(ME, "ETHTOOL_GLINKSETTINGS supported");
+-        when_false_trace(elscmd.base.duplex <= 2, exit, ERROR, "Malformed value returned by ioctl for device name %s", name);
++        if(elscmd.base.duplex > 2 && elscmd.base.duplex != 255) {
++            SAH_TRACEZ_ERROR(ME, "Malformed value returned by ioctl for device name %s, duplex=%d", name, elscmd.base.duplex);
++            rv = -1;
++            goto exit;
++        }
+         *speed = elscmd.base.speed;
+-        *duplex_mode_index = elscmd.base.duplex;
++        *duplex_mode_index = (elscmd.base.duplex == 255) ? 2 : elscmd.base.duplex;  // Map 255 to Unknown (2)
+     }
+ 
+ exit:
+@@ -812,53 +816,6 @@ exit:
+     return rv;
+ }
+ 
+-#if defined ETHTOOL_GPAUSEPARAM
+-static int ethernet_ethtool_pauseparam_get(const char* name, bool* rx_negotiated, bool* tx_negotiated) {
+-    SAH_TRACEZ_IN(ME);
+-    int rv = -1;
+-    int fd = -1;
+-    struct ifreq ifr;
+-    struct ethtool_pauseparam pauseparam;
+-
+-    when_null_trace(rx_negotiated, exit, ERROR, "rx_negotiated pointer can not be NULL");
+-    when_null_trace(tx_negotiated, exit, ERROR, "tx_negotiated pointer can not be NULL");
+-    when_str_empty_trace(name, exit, ERROR, "Interface name is required");
+-
+-    memset(&ifr, 0, sizeof(ifr));
+-    memset(&pauseparam, 0, sizeof(pauseparam));
+-    strlcpy(ifr.ifr_name, name, IF_NAMESIZE);
+-
+-    fd = ioctl_fd_get();
+-    when_false_trace(fd >= 0, exit, ERROR, "No valid file descriptor");
+-
+-    pauseparam.cmd = ETHTOOL_GPAUSEPARAM;
+-    ifr.ifr_data = (char*) &pauseparam;
+-
+-    if(ioctl(fd, SIOCETHTOOL, &ifr) < 0) {
+-        when_true_trace(errno != EOPNOTSUPP, exit, ERROR, "ioctl call ETHTOOL_GPAUSEPARAM failed, %s - for device name %s", strerror(errno), ifr.ifr_name);
+-        *rx_negotiated = false;
+-        *tx_negotiated = false;
+-    } else {
+-        // When autonegotiate is enabled, flow control is negotiated with link partner
+-        // If autoneg is on, both RX and TX are negotiated (ethtool shows "RX negotiated: on, TX negotiated: on")
+-        if(pauseparam.autoneg) {
+-            // When autoneg is on, assume both RX and TX are negotiated
+-            *rx_negotiated = true;
+-            *tx_negotiated = true;
+-        } else {
+-            // When autonegotiate is off, use the configured values
+-            *rx_negotiated = pauseparam.rx_pause;
+-            *tx_negotiated = pauseparam.tx_pause;
+-        }
+-    }
+-
+-    rv = 0;
+-exit:
+-    SAH_TRACEZ_OUT(ME);
+-    return rv;
+-}
+-#endif
+-
+ int link_flowcontrol_get(UNUSED const char* function_name,
+                          amxc_var_t* args,
+                          amxc_var_t* ret) {
+@@ -868,18 +825,55 @@ int link_flowcontrol_get(UNUSED const char* function_name,
+     bool rx_negotiated = false;
+     bool tx_negotiated = false;
+     bool enabled = false;
++    bool link_detected = false;
++    int fd = -1;
++    struct ifreq ifr;
++    struct ethtool_value edata;
++    FILE* fp = NULL;
++    char cmd[256];
++    char line[256];
+ 
+     when_str_empty_trace(intf_name, exit, ERROR, "Interface name is required to read flow control settings");
+     amxc_var_set_type(ret, AMXC_VAR_ID_HTABLE);
+ 
+ #if defined ETHTOOL_GPAUSEPARAM
+-    when_failed_trace(ethernet_ethtool_pauseparam_get(intf_name, &rx_negotiated, &tx_negotiated), exit, ERROR, "Failed to get flow control status for device name %s", intf_name);
++    memset(&ifr, 0, sizeof(ifr));
++    memset(&edata, 0, sizeof(edata));
++    strlcpy(ifr.ifr_name, intf_name, IF_NAMESIZE);
++    
++    fd = ioctl_fd_get();
++    if(fd >= 0) {
++        edata.cmd = ETHTOOL_GLINK;
++        ifr.ifr_data = (char*) &edata;
++        if(ioctl(fd, SIOCETHTOOL, &ifr) == 0) {
++            link_detected = (edata.data != 0);
++        }
++    }
++
++    if(link_detected) {
++        snprintf(cmd, sizeof(cmd), "ethtool -a %s 2>/dev/null", intf_name);
++        fp = popen(cmd, "r");
++        if(fp != NULL) {
++            while(fgets(line, sizeof(line), fp) != NULL) {
++                if(strstr(line, "RX negotiated:") != NULL) {
++                    if(strstr(line, "on") != NULL) {
++                        rx_negotiated = true;
++                    }
++                }
++                if(strstr(line, "TX negotiated:") != NULL) {
++                    if(strstr(line, "on") != NULL) {
++                        tx_negotiated = true;
++                    }
++                }
++            }
++            pclose(fp);
++        }
++    }
+ 
+-    // FlowControl is enabled if either RX or TX negotiated is on
+-    enabled = rx_negotiated || tx_negotiated;
++    enabled = link_detected && (rx_negotiated || tx_negotiated);
+ 
+-    SAH_TRACEZ_INFO(ME, "Flow control for %s: RX negotiated=%d, TX negotiated=%d, enabled=%d",
+-                    intf_name, rx_negotiated, tx_negotiated, enabled);
++    SAH_TRACEZ_INFO(ME, "Flow control for %s: link_detected=%d, RX negotiated=%d, TX negotiated=%d, enabled=%d",
++                    intf_name, link_detected, rx_negotiated, tx_negotiated, enabled);
+ #else
+     SAH_TRACEZ_ERROR(ME, "Getting flow control status via ethtool is not supported on this kernel version");
+ #endif
