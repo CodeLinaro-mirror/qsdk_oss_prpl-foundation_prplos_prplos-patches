@@ -1,0 +1,88 @@
+From 9a279e2cbe5892e5b65db6fce42746f737445dc8 Mon Sep 17 00:00:00 2001
+From: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+Date: Thu, 14 May 2026 10:17:03 +0530
+Subject: [PATCH] Fix: Radio disable does not remove all VAPs in prpl
+
+Change-Id: I26c79f5fa5758bee82ca0e4ef541791bdf7bd02a
+Signed-off-by: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+---
+
+diff --git a/src/Plugin/wifiGen_fsm.c b/src/Plugin/wifiGen_fsm.c
+index ac86d90..fbc6f73 100644
+--- a/src/Plugin/wifiGen_fsm.c
++++ b/src/Plugin/wifiGen_fsm.c
+@@ -463,7 +463,7 @@ static bool s_doEnableAp(T_AccessPoint* pAP, T_Radio* pRad) {
+         wifiGen_hapd_enableVapWpaCtrlIface(pAP);
+         if(mainIfaceChanged) {
+             SAH_TRACEZ_WARNING(ME, "%s: Main iface changed: sched re-add radio %s", pAP->alias, pRad->Name);
+-            s_schedNextAction(SECDMN_ACTION_OK_NEED_RE_ADD, pAP, pRad);
++            s_schedNextAction(SECDMN_ACTION_OK_NEED_SIGHUP, pAP, pRad);
+         } else if(s_hasMultiLinkApMld(pRad)) {
+             SAH_TRACEZ_INFO(ME, "%s: has multi-band APMLD: need to restart hostapd", pAP->alias);
+             s_schedNextAction(SECDMN_ACTION_OK_NEED_SIGHUP, pAP, pRad);
+@@ -906,7 +906,7 @@ static bool s_doDisableHostapd(T_Radio* pRad) {
+      */
+     wifiGen_hapd_deauthKnownStations(pRad, true);
+     if(wld_rad_hostapd_disable(pRad) >= 0) {
+-        wld_rad_resetApMldLinks(pRad);
++        //wld_rad_resetApMldLinks(pRad);
+     }
+     pRad->fsmRad.timeout_msec = 500;
+     return true;
+@@ -1629,8 +1629,16 @@ static void s_checkPreRadDependency(T_Radio* pRad _UNUSED) {
+                        pRad->enable, wld_status_str[pRad->status]);
+ 
+     if(targetEnable != currentEnable) {
+-        setBitLongArray(pRad->fsmRad.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_ENABLE_RAD);
++        if(targetEnable) {
++	    SAH_TRACEZ_WARNING(ME,"Setting GEN_FSM_ENABLE_HOSTAPD to enable radio");
++            setBitLongArray(pRad->fsmRad.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_ENABLE_HOSTAPD);
++        } else {
++	    SAH_TRACEZ_WARNING(ME,"Setting GEN_FSM_DISABLE_HOSTAPD to disable radio");
++            setBitLongArray(pRad->fsmRad.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_DISABLE_HOSTAPD);
++	    return;
++        }
+     }
++
+     if(wifiGen_hapd_isStarted(pRad) != targetFthEnable) {
+         setBitLongArray(pRad->fsmRad.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_START_HOSTAPD);
+     }
+@@ -1644,6 +1652,14 @@ static void s_checkApDependency(T_AccessPoint* pAP, T_Radio* pRad) {
+      * Disabling/enabling radio will implicitly interact with hostapd,
+      * which will manage the related VAPs
+      */
++    //  If radio is being disabled, clear MLD and return
++    if(isBitSetLongArray(pRad->fsmRad.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_DISABLE_HOSTAPD)) {
++        if(isBitSetLongArray(pAP->fsm.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_MOD_MLD)) {
++            SAH_TRACEZ_WARNING(ME, "%s: clear MLD action - radio being disabled", pAP->alias);
++            clearBitLongArray(pAP->fsm.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_MOD_MLD);
++        }
++        return;
++    }
+     if(isBitSetLongArray(pAP->fsm.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_MOD_BSSID)) {
+         setBitLongArray(pRad->fsmRad.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_START_HOSTAPD);
+     }
+diff --git a/src/nl80211/wld_hostapd_ap_api.c b/src/nl80211/wld_hostapd_ap_api.c
+index e337cc6..ee78e12 100644
+--- a/src/nl80211/wld_hostapd_ap_api.c
++++ b/src/nl80211/wld_hostapd_ap_api.c
+@@ -867,6 +867,7 @@ wld_secDmn_action_rc_ne wld_ap_hostapd_setMldParams(T_AccessPoint* pAP) {
+             action = SECDMN_ACTION_OK_NEED_SIGHUP;
+         }
+     }
++    action = SECDMN_ACTION_OK_NEED_SIGHUP;
+     wld_hostapd_deleteConfig(pNewCfg);
+     wld_hostapd_deleteConfig(config);
+     return action;
+diff --git a/src/nl80211/wld_wpaCtrlInterface.c b/src/nl80211/wld_wpaCtrlInterface.c
+index c91a643..9c0f3d6 100644
+--- a/src/nl80211/wld_wpaCtrlInterface.c
++++ b/src/nl80211/wld_wpaCtrlInterface.c
+@@ -297,6 +297,7 @@ swl_rc_ne wld_wpaCtrl_sendCmdFmtGetResponse(wld_wpaCtrlInterface_t* pIface, char
+ static swl_rc_ne s_sendCmdFmtCheckResponseExt(wld_wpaCtrlInterface_t* pIface, uint32_t tmOutMSec, char* expectedResponse, char* cmdStr) {
+     const char* wpaCtrlIfName = wld_wpaCtrlInterface_getName(pIface);
+     size_t maxMsgLen = wld_wpaCtrl_getMaxMsgLen();
++    SAH_TRACEZ_WARNING(ME, "%s: Sending command to hostapd: [%s] wpaCtrlIfName=%s", wpaCtrlIfName, cmdStr,wpaCtrlIfName);
+     char reply[maxMsgLen];
+     memset(reply, 0, sizeof(reply));
+     swl_rc_ne rc = s_sendCmdFmtGetResponseExt(pIface, reply, sizeof(reply) - 1, tmOutMSec, cmdStr);
