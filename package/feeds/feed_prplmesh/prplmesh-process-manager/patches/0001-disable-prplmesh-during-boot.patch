@@ -1,0 +1,23 @@
+From ec01722e105bfa37e8fd42a6cdd67c0601aee322 Mon Sep 17 00:00:00 2001
+From: Atchaya R <ratchaya@qti.qualcomm.com>
+Date: Tue, 19 May 2026 23:02:08 +0530
+Subject: [PATCH] prplmesh: disable prplmesh during boot
+
+Change-Id: Ie6670618ba522c6eca75d057f27fe9312b4f42bd
+Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
+---
+ .../patches/0002-disable-prplmesh-during-boot.patch   | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+ create mode 100644 package/feeds/feed_prplmesh/prplmesh/patches/0002-disable-prplmesh-during-boot.patch
+
+--- a/odl/defaults.d/00_services_defaults.odl.in
++++ b/odl/defaults.d/00_services_defaults.odl.in
+@@ -9,7 +9,7 @@
+         }
+ 
+         object PrplMesh {
+-            parameter Enable = true;
++            parameter Enable = false;
+         }
+     }
+ }
