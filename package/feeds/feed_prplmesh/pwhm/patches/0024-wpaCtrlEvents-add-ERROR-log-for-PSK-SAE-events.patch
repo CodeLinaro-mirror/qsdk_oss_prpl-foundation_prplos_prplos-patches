@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Harini Pavithra Elangovan <helangov@qti.qualcomm.com>
+Date: Mon, 19 May 2026 15:00:00 +0530
+Subject: [PATCH] wpaCtrlEvents: add ERROR log in s_apStationAssocFailure
+
+Add SAH_TRACEZ_ERROR log in s_apStationAssocFailure() which is the
+first entry point in pwhm when it receives AP-STA-POSSIBLE-PSK-MISMATCH
+or CTRL-EVENT-SAE-UNKNOWN-PASSWORD-IDENTIFIER from hostapd via wpa_ctrl.
+
+This confirms pwhm received and processed the event. The log is at
+ERROR level to ensure visibility without requiring INFO-level logging.
+
+Note: These events are only triggered in prplmesh/beerocks setup.
+The ath12k driver handles the 4-way handshake in firmware and does
+not expose these events to hostapd in standalone pwhm setup.
+
+Signed-off-by: Harini Pavithra Elangovan <helangov@qti.qualcomm.com>
+---
+ src/nl80211/wld_wpaCtrl_events.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+--- a/src/nl80211/wld_wpaCtrl_events.c
++++ b/src/nl80211/wld_wpaCtrl_events.c
+@@ -337,10 +337,12 @@ static void s_apStationAssocFailure(wld_wpaCtrlInterface_t* pInterface, char* e
+-static void s_apStationAssocFailure(wld_wpaCtrlInterface_t* pInterface, char* event _UNUSED, char* params) {
++static void s_apStationAssocFailure(wld_wpaCtrlInterface_t* pInterface, char* event, char* params) {
+     //Example: AP-STA-POSSIBLE-PSK-MISMATCH xx:xx:xx:xx:xx:xx
+     //Example: AP-STA-POSSIBLE-PSK-MISMATCH xx:xx:xx:xx:xx:xx status=x reason=x
+     //Example: CTRL-EVENT-SAE-UNKNOWN-PASSWORD-IDENTIFIER xx:xx:xx:xx:xx:xx
+     char buf[SWL_MAC_CHAR_LEN] = {0};
+     swl_macBin_t bStationMac;
+ 
++    SAH_TRACEZ_ERROR(ME, "%s: pwhm received wpaCtrlEvent: %s %s", pInterface->name, event, params);
++
+     memcpy(buf, params, SWL_MAC_CHAR_LEN - 1);
+     bool ret = swl_mac_charToBin(&bStationMac, (swl_macChar_t*) buf);
+     ASSERT_TRUE(ret, , ME, "fail to convert mac address to binary");
