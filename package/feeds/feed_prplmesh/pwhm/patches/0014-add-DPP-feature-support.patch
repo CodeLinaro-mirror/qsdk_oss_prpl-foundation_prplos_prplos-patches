@@ -15,11 +15,9 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
  src/wld_endpoint.c                | 177 ++++++++++++++++++++++++++++++
  8 files changed, 427 insertions(+)
 
-diff --git a/include/wld/wld.h b/include/wld/wld.h
-index 15432b1..4dd6d84 100644
 --- a/include/wld/wld.h
 +++ b/include/wld/wld.h
-@@ -1911,6 +1911,10 @@ struct S_ACCESSPOINT {
+@@ -1923,6 +1923,10 @@ struct S_ACCESSPOINT {
      char radiusCalledStationId[88];
      int radiusChargeableUserId;
  
@@ -30,7 +28,7 @@ index 15432b1..4dd6d84 100644
      int WPS_CertMode;                               /* Correct default behavior for Certification Mode */
      int WPS_Enable;                                 /* WPS enabled? */
      wld_wps_status_e WPS_Status;                    /* WPS real status  */
-@@ -2148,6 +2152,10 @@ struct S_EndPoint {
+@@ -2160,6 +2164,10 @@ struct S_EndPoint {
  
      swl_security_apMode_m secModesSupported;        /* Bit pattern for supported security modes */
  
@@ -41,11 +39,9 @@ index 15432b1..4dd6d84 100644
      bool WPS_Enable;                                /* WPS enabled? */
      int WPS_Configured;                             /* Not in ODL but required */
      wld_wps_cfgMethod_m WPS_ConfigMethodsSupported; /* bit mask of supported wps config methods */
-diff --git a/include/wld/wld_endpoint.h b/include/wld/wld_endpoint.h
-index f7bfe5a..2d3c8cd 100644
 --- a/include/wld/wld_endpoint.h
 +++ b/include/wld/wld_endpoint.h
-@@ -115,6 +115,12 @@ amxd_status_t _EndPoint_WPS_pushButton(amxd_object_t* obj,
+@@ -143,6 +143,12 @@ amxd_status_t _EndPoint_WPS_pushButton(a
                                         amxd_function_t* func,
                                         amxc_var_t* args,
                                         amxc_var_t* ret);
@@ -58,11 +54,9 @@ index f7bfe5a..2d3c8cd 100644
  amxd_status_t _EndPoint_WPS_cancelPairing(amxd_object_t* obj,
                                            amxd_function_t* func,
                                            amxc_var_t* args,
-diff --git a/odl/wld_accesspoint.odl b/odl/wld_accesspoint.odl
-index b85aeb3..f8c9b33 100644
 --- a/odl/wld_accesspoint.odl
 +++ b/odl/wld_accesspoint.odl
-@@ -959,6 +959,32 @@ define rrm_t{
+@@ -976,6 +976,32 @@ define rrm_t{
  			void delTempEntry(%in %mandatory string mac);
  		}
  
@@ -95,11 +89,9 @@ index b85aeb3..f8c9b33 100644
  		/** This object contains parameters related to Wi-Fi Protected
  		 *  Setup [WPSv1.0] for this access point.*/
  		%persistent object WPS{
-diff --git a/odl/wld_endpoint.odl b/odl/wld_endpoint.odl
-index a1e0146..e7a4b9a 100644
 --- a/odl/wld_endpoint.odl
 +++ b/odl/wld_endpoint.odl
-@@ -759,6 +759,42 @@
+@@ -788,6 +788,42 @@
  			 */
  			%read-only bool PairingInProgress;
  		}
@@ -142,11 +134,9 @@ index a1e0146..e7a4b9a 100644
  		
  		/**
  		 * Assocation statistics.
-diff --git a/src/nl80211/wld_hostapd_cfgFile.c b/src/nl80211/wld_hostapd_cfgFile.c
-index 64d5855..789814f 100644
 --- a/src/nl80211/wld_hostapd_cfgFile.c
 +++ b/src/nl80211/wld_hostapd_cfgFile.c
-@@ -1413,6 +1413,12 @@ void wld_hostapd_cfgFile_setVapConfig(T_AccessPoint* pAP, swl_mapChar_t* vapConf
+@@ -1429,6 +1429,12 @@ void wld_hostapd_cfgFile_setVapConfig(T_
      s_setVapWpsConfig(pAP, vapConfigMap);
      s_setVapMultiApConf(pAP, vapConfigMap, multiAPConfig);
  
@@ -159,11 +149,9 @@ index 64d5855..789814f 100644
      // rnr standard config
      bool isIEEE80211k = pAP->IEEE80211kEnable && pAP->pRadio->IEEE80211kSupported;
      bool rnrCfgStd = isIEEE80211k && (wld_ap_getDiscoveryMethod(pAP) == M_AP_DM_RNR);
-diff --git a/src/nl80211/wld_wpaSupp_cfgFile.c b/src/nl80211/wld_wpaSupp_cfgFile.c
-index e7d7a56..3fe244e 100644
 --- a/src/nl80211/wld_wpaSupp_cfgFile.c
 +++ b/src/nl80211/wld_wpaSupp_cfgFile.c
-@@ -134,6 +134,10 @@ static swl_rc_ne s_setWpaSuppGlobalConfig(T_EndPoint* pEP, wld_wpaSupp_config_t*
+@@ -138,6 +138,10 @@ static swl_rc_ne s_setWpaSuppGlobalConfi
          swl_mapChar_add(global, "config_methods", configMethodsStr);
      }
  
@@ -174,7 +162,7 @@ index e7d7a56..3fe244e 100644
      /* By default for endpoint, wps_cred_processing should be set to 2
       * to process received credentials internally and pass them over ctrl_iface
       * to external program */
-@@ -345,6 +349,10 @@ static swl_rc_ne s_setWpaSuppNetworkConfig(T_EndPoint* pEP, wld_wpaSupp_config_t
+@@ -356,6 +360,10 @@ static swl_rc_ne s_setWpaSuppNetworkConf
  
      swl_mapCharFmt_addValInt32(network, "ieee80211w", mfp);
  
@@ -185,8 +173,6 @@ index e7d7a56..3fe244e 100644
      if(pEP->multiAPEnable) {
          swl_mapChar_add(network, "multi_ap_backhaul_sta", "1");
      }
-diff --git a/src/wld_accesspoint.c b/src/wld_accesspoint.c
-index 80d2e77..e3585b7 100644
 --- a/src/wld_accesspoint.c
 +++ b/src/wld_accesspoint.c
 @@ -92,6 +92,7 @@
@@ -197,7 +183,7 @@ index 80d2e77..e3585b7 100644
  
  #define ME "ap"
  
-@@ -182,6 +183,8 @@ static void s_setDefaults(T_AccessPoint* pAP, T_Radio* pRad, const char* vapName
+@@ -182,6 +183,8 @@ static void s_setDefaults(T_AccessPoint*
      pAP->status = APSTI_DISABLED;
      pAP->secModesSupported = M_SWL_SECURITY_APMODE_NONE;
      pAP->MaxStations = pRad->maxNrHwSta;
@@ -206,7 +192,7 @@ index 80d2e77..e3585b7 100644
  
      pAP->UAPSDCapability = pAP->pFA->mfn_misc_has_support(pAP->pRadio, pAP, "UAPSD", 0);
      pAP->WMMCapability = pAP->pFA->mfn_misc_has_support(pAP->pRadio, pAP, "WME", 0);
-@@ -954,6 +957,11 @@ void SyncData_AP2OBJ(amxd_object_t* object, T_AccessPoint* pAP, int set) {
+@@ -956,6 +959,11 @@ void SyncData_AP2OBJ(amxd_object_t* obje
          amxd_trans_set_cstring_t(&trans, "RadiusCalledStationId", pAP->radiusCalledStationId);
          amxd_trans_set_int32_t(&trans, "RadiusChargeableUserId", pAP->radiusChargeableUserId);
  
@@ -218,7 +204,7 @@ index 80d2e77..e3585b7 100644
          /** WPS Part */
  
          if(wpsObj != NULL) {
-@@ -1188,6 +1196,25 @@ void SyncData_AP2OBJ(amxd_object_t* object, T_AccessPoint* pAP, int set) {
+@@ -1190,6 +1198,25 @@ void SyncData_AP2OBJ(amxd_object_t* obje
              wld_ap_sec_doSync(pAP);
          }
  
@@ -244,7 +230,7 @@ index 80d2e77..e3585b7 100644
          tmp_bool = amxd_object_get_bool(wpsObj, "Enable", NULL);
          if(pAP->WPS_Enable != tmp_bool) {
              pAP->WPS_Enable = tmp_bool;
-@@ -1417,6 +1444,139 @@ static void s_setMultiAPVlanId_pwf(void* priv _UNUSED, amxd_object_t* object, am
+@@ -1419,6 +1446,139 @@ static void s_setMultiAPVlanId_pwf(void*
  }
  
  
@@ -384,8 +370,6 @@ index 80d2e77..e3585b7 100644
  static void s_setApRole_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
      SAH_TRACEZ_IN(ME);
  
-diff --git a/src/wld_endpoint.c b/src/wld_endpoint.c
-index fe431b4..8b815eb 100644
 --- a/src/wld_endpoint.c
 +++ b/src/wld_endpoint.c
 @@ -86,6 +86,7 @@
@@ -393,10 +377,10 @@ index fe431b4..8b815eb 100644
  #include "wld_dm_trans.h"
  #include "wld_chanmgt.h"
 +#include "wld_wpaCtrl_api.h"
+ #include "wld_epMld.h"
  
  /* Function prototypes for helpers. */
- static void s_setEndpointStatus(T_EndPoint* pEP,
-@@ -652,6 +653,9 @@ static void s_setDefaults(T_EndPoint* pEP, const char* endpointname) {
+@@ -664,6 +665,9 @@ static void s_setDefaults(T_EndPoint* pE
      pEP->multiAPProfile = MULTIAP_NOT_SUPPORTED;
      pEP->peerMultiAPProfile = MULTIAP_NOT_SUPPORTED;
      pEP->multiAPVlanId = 0;
@@ -406,7 +390,7 @@ index fe431b4..8b815eb 100644
  }
  
  static void s_sendChangeEvent(T_EndPoint* pEP, wld_ep_changeEvent_e changeType, void* data) {
-@@ -1254,6 +1258,22 @@ bool syncData_OBJ2EndPoint(amxd_object_t* object) {
+@@ -1266,6 +1270,22 @@ bool syncData_OBJ2EndPoint(amxd_object_t
      }
      wpsobject->priv = &pEP->wpsSessionInfo;
  
@@ -429,7 +413,7 @@ index fe431b4..8b815eb 100644
      pEP->WPS_Enable = amxd_object_get_bool(wpsobject, "Enable", NULL);
      SAH_TRACEZ_INFO(ME, "Endpoint.WPS.enable = %d", pEP->WPS_Enable);
  
-@@ -1363,6 +1383,12 @@ void syncData_EndPoint2OBJ(T_EndPoint* pEP) {
+@@ -1375,6 +1395,12 @@ void syncData_EndPoint2OBJ(T_EndPoint* p
      swl_conv_transParamSetMask(&trans, "ConfigMethodsSupported", pEP->WPS_ConfigMethodsSupported, cstr_WPS_CM_Supported, WPS_CFG_MTHD_MAX);
      swl_conv_transParamSetMask(&trans, "ConfigMethodsEnabled", pEP->WPS_ConfigMethodsEnabled, cstr_WPS_CM_Supported, WPS_CFG_MTHD_MAX);
  
@@ -442,7 +426,7 @@ index fe431b4..8b815eb 100644
      ASSERT_TRANSACTION_LOCAL_DM_END(&trans, , ME, "%s : trans apply failure", pEP->Name);
  
  }
-@@ -2609,6 +2635,157 @@ amxd_status_t _EndPoint_debug(amxd_object_t* object,
+@@ -2647,6 +2673,157 @@ amxd_status_t _EndPoint_debug(amxd_objec
      return amxd_status_ok;
  }
  
@@ -600,6 +584,3 @@ index fe431b4..8b815eb 100644
  SWLA_DM_HDLRS(sEpDmHdlrs,
                ARR(SWLA_DM_PARAM_HDLR("SSIDReference", s_setSSIDRef_pwf),
                    SWLA_DM_PARAM_HDLR("ReconnectDelay", s_setReconnectDelay_pwf),
--- 
-2.34.1
-
