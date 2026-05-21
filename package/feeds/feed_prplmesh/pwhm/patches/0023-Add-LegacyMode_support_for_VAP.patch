@@ -1,0 +1,122 @@
+From 66b2805c468ca36452c100e54f3644dee53f185c Mon Sep 17 00:00:00 2001
+From: Kartheek E <karte@qti.qualcomm.com>
+Date: Tue, 19 May 2026 23:26:54 +0530
+Subject: [PATCH] 0023-Add-LegacyMode_support_for_VAP
+
+Signed-off-by: Kartheek E <karte@qti.qualcomm.com>
+---
+ include/wld/wld.h       |  2 ++
+ odl/wld_accesspoint.odl | 10 ++++++++
+ src/wld_accesspoint.c   | 55 +++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 67 insertions(+)
+
+diff --git a/include/wld/wld.h b/include/wld/wld.h
+index 081f312..e5b11a4 100644
+--- a/include/wld/wld.h
++++ b/include/wld/wld.h
+@@ -2010,6 +2010,8 @@ struct S_ACCESSPOINT {
+     int rssiRejectAssocRssi;
+     uint32_t rssiRejectAssocTimeout;
+     uint32_t rssiDeauthGraceSamples;
++
++    int32_t savedMldUnit; /* Saved SSID.mldUnit before LegacyMode=true; -1 means no saved value */
+     bool qbssEnable;                /* QBSS Load feature enable flag */
+     uint32_t bssLoadUpdatePeriod;   /* BSS Load Update Period in TUs (only used when qbssEnable=true) */
+     uint32_t chanUtilAvgPeriod;     /* Channel Utilization Averaging Period in TUs (only used when qbssEnable=true) */
+diff --git a/odl/wld_accesspoint.odl b/odl/wld_accesspoint.odl
+index cec32b9..6831bf9 100644
+--- a/odl/wld_accesspoint.odl
++++ b/odl/wld_accesspoint.odl
+@@ -349,6 +349,16 @@ define rrm_t{
+ 			default true;
+ 		}
+ 
++		/**
++		 * Disable IEEE 802.11be (Wi-Fi 7 / EHT) for this VAP.
++		 * When set to true, removes this VAP from its MLD group by setting
++		 * SSID.MLDUnit=-1, converting it to standalone 11ax (Wi-Fi 6) mode.
++		 * Setting back to false restores the original MLDUnit value.
++		 */
++		%persistent bool LegacyMode {
++			default false;
++		}
++
+ 		/**
+ 		 * Add MBO Assoc Disallow Reason in the MBO IE
+ 		 * Possible options are : "Off", "Unspecified", "MaxAssocSTA",
+diff --git a/src/wld_accesspoint.c b/src/wld_accesspoint.c
+index 59ac475..199154b 100644
+--- a/src/wld_accesspoint.c
++++ b/src/wld_accesspoint.c
+@@ -1396,6 +1396,60 @@ static void s_setMBOAssocDisallowReason_pwf(void* priv _UNUSED, amxd_object_t* o
+ }
+ 
+ 
++static void s_setLegacyMode_pwf(void* priv _UNUSED, amxd_object_t* object,
++                                  amxd_param_t* param _UNUSED,
++                                  const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_AccessPoint* pAP = wld_ap_fromObj(object);
++    ASSERT_NOT_NULL(pAP, , ME, "INVALID");
++
++    bool disable = amxc_var_dyncast(bool, newValue);
++
++    if(!pAP->pSSID) {
++        SAH_TRACEZ_ERROR(ME, "%s: pSSID is NULL - cannot change MLDUnit", pAP->alias);
++        SAH_TRACEZ_OUT(ME);
++        return;
++    }
++
++    if(!pAP->pSSID->pBus) {
++        SAH_TRACEZ_ERROR(ME, "%s: pSSID->pBus is NULL - cannot update DM MLDUnit", pAP->alias);
++        SAH_TRACEZ_OUT(ME);
++        return;
++    }
++
++    int32_t newMldUnit;
++    if(disable) {
++        if(pAP->pSSID->mldUnit < 0) {
++            SAH_TRACEZ_INFO(ME, "%s: mldUnit=%d already not in MLD - no action", pAP->alias, pAP->pSSID->mldUnit);
++            SAH_TRACEZ_OUT(ME);
++            return;
++        }
++        pAP->savedMldUnit = pAP->pSSID->mldUnit;
++        SAH_TRACEZ_INFO(ME, "%s: LegacyMode=1 saving mldUnit=%d, setting SSID.MLDUnit=-1",
++                        pAP->alias, pAP->savedMldUnit);
++        newMldUnit = -1;
++    } else {
++        if(pAP->savedMldUnit < 0) {
++            SAH_TRACEZ_INFO(ME, "%s: no saved mldUnit (savedMldUnit=%d) - nothing to restore",
++                            pAP->alias, pAP->savedMldUnit);
++            SAH_TRACEZ_OUT(ME);
++            return;
++        }
++        SAH_TRACEZ_INFO(ME, "%s: LegacyMode=0 restoring SSID.MLDUnit=%d",
++                        pAP->alias, pAP->savedMldUnit);
++        newMldUnit = pAP->savedMldUnit;
++    }
++
++    amxd_trans_t trans;
++    ASSERT_TRANSACTION_INIT(pAP->pSSID->pBus, &trans, , ME, "%s: trans init failed", pAP->alias);
++    amxd_trans_set_value(int32_t, &trans, "MLDUnit", newMldUnit);
++    ASSERT_TRANSACTION_LOCAL_DM_END(&trans, , ME, "%s: trans apply failed setting MLDUnit=%d",
++                                    pAP->alias, newMldUnit);
++
++    SAH_TRACEZ_OUT(ME);
++}
++
+ static void s_setMultiAPType_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
+     SAH_TRACEZ_IN(ME);
+ 
+@@ -3398,6 +3452,7 @@ SWLA_DM_HDLRS(sApDmHdlrs,
+                   SWLA_DM_PARAM_HDLR("IEEE80211kEnabled", s_set80211kEnabled_pwf),
+                   SWLA_DM_PARAM_HDLR("WDSEnable", s_setWDSEnable_pwf),
+                   SWLA_DM_PARAM_HDLR("MBOEnable", s_setMBOEnable_pwf),
++                  SWLA_DM_PARAM_HDLR("LegacyMode", s_setLegacyMode_pwf),
+                   SWLA_DM_PARAM_HDLR("HtMcsNssSet",  s_setHtMcsNssSet_pwf),
+                   SWLA_DM_PARAM_HDLR("VhtMcsNssSet", s_setVhtMcsNssSet_pwf),
+                   SWLA_DM_PARAM_HDLR("MBOAssocDisallowReason", s_setMBOAssocDisallowReason_pwf),
+-- 
+2.43.0
+
