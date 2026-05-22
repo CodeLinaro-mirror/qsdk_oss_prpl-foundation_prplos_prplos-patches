@@ -1,0 +1,683 @@
+From 6603f6d314708b9c6db75d297f189ace15027762 Mon Sep 17 00:00:00 2001
+From: Atchaya R <ratchaya@qti.qualcomm.com>
+Date: Fri, 22 May 2026 12:22:54 +0530
+Subject: [PATCH] pwhm: add changes for DCS feature
+
+Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
+---
+ include/wld/wld.h                 |  15 +
+ odl/wld_accesspoint.odl           | 208 ++++++++++++-
+ src/nl80211/wld_hostapd_cfgFile.c |   6 +
+ src/wld_accesspoint.c             | 493 +++++++++++++++++++++++++++++-
+ 4 files changed, 720 insertions(+), 2 deletions(-)
+
+--- a/include/wld/wld.h
++++ b/include/wld/wld.h
+@@ -1919,6 +1919,21 @@ struct S_ACCESSPOINT {
+     char DPP_Role[16];
+     char DPP_BootstrapType[16];
+ 
++    uint32_t DCS_Enable;                            /* DCS enable bitmask: bit0=CW, bit1=WLAN, bit2=AWGN, bit4=OBSS */
++    uint32_t DCS_WlanIntrDetectionThreshold;        /* DCS WLAN interference detection threshold (0-6) */
++    uint32_t DCS_WlanIntrTxErrThreshold;            /* DCS WLAN TX error threshold (0-300) */
++    uint32_t DCS_WlanIntrPhyErrThreshold;           /* DCS WLAN PHY error threshold (0-300) */
++    uint32_t DCS_WlanIntrCochIntrThreshold;         /* DCS co-channel interference threshold (0-30) */
++    uint32_t DCS_MaxcuValue;                        /* DCS maximum channel utilization value (0-50) */
++    uint32_t DCS_BwReductionCtrl;                   /* DCS BW reduction ctrl bitmask: CW:0x0001, WLAN:0x0002, AWGN:0x0004, OBSS:0x0010 */
++    uint32_t DCS_SetAfcChanSelConfig;               /* AFC channel selection config (afc set_afc_chan_sel_config) */
++    uint32_t DCS_RandomChanBitmap;                  /* DCS random channel bitmap bitmask: CW:0x0001, WLAN:0x0002, AWGN:0x0004, OBSS:0x0010 */
++    uint32_t DCS_CsaTbtt;                           /* DCS CSA TBTT value (1-30) */
++    uint32_t DCS_EnableTimer;                       /* DCS enable timer in seconds (300-3600, i.e. 5-60 mins) */
++    uint32_t DCS_ReEnableTimer;                     /* DCS re-enable timer (read-only, from get_dcs_enable_timer) */
++    uint32_t DCS_EventAction;                       /* DCS event action bitmask: CW:0x0001, WLAN:0x0002, OBSS:0x0010 */
++    uint32_t DCS_EventNotify;                       /* DCS event notify bitmask: CW:0x0001, WLAN:0x0002, OBSS:0x0010 */
++
+     int WPS_CertMode;                               /* Correct default behavior for Certification Mode */
+     int WPS_Enable;                                 /* WPS enabled? */
+     wld_wps_status_e WPS_Status;                    /* WPS real status  */
+--- a/odl/wld_accesspoint.odl
++++ b/odl/wld_accesspoint.odl
+@@ -984,6 +984,194 @@ define rrm_t{
+ 			string configureDPP(%in string curve, %in %mandatory string QR);
+ 		}
+ 
++		/** This object contains parameters related to Dynamic Channel Selection (DCS)
++		 *  for this access point. */
++		%persistent object DCS {
++			on event "*" call wld_ap_setDcsConf_ocf;
++
++			/**
++			 * DCS enable bitmask written to the hostapd configuration file as dcs_enable.
++			 * Only the following bits are valid (ALLOWED_DCS_MASK = 0x0013):
++			 *   Bit 0 (0x0001): CW (Continuous Wave) interference detection
++			 *   Bit 1 (0x0002): WLAN interference detection
++			 *   Bit 4 (0x0010): OBSS (Overlapping BSS) interference detection
++			 * A value of 0 disables DCS.
++			 * Valid range: 0 to 19 (0x0013)
++			 */
++			%persistent uint32 Enable {
++				default 0;
++				on action validate call check_range { min = 0, max = 19 };
++			}
++
++			/**
++			 * WLAN interference detection threshold.
++			 * When changed, automatically sends:
++			 *   hostapd_cli -i wlanX [-l Y] DCS set_wlan_intr_params intr_detection_threshold <value>
++			 * Not persistent: applied dynamically via hostapd_cli.
++			 * hostapd default: 6 (DCS_INTR_DETECTION_THR)
++			 * Valid range: 0 to 6
++			 */
++			uint32 WlanIntrDetectionThreshold {
++				default 6;
++				on action validate call check_range { min = 0, max = 6 };
++			}
++
++			/**
++			 * WLAN TX error threshold.
++			 * When changed, automatically sends:
++			 *   hostapd_cli -i wlanX [-l Y] DCS set_wlan_intr_params txerr_threshold <value>
++			 * Not persistent: applied dynamically via hostapd_cli.
++			 * hostapd default: 30 (DCS_TXERR_THRESHOLD)
++			 * Valid range: 0 to 300
++			 */
++			uint32 WlanIntrTxErrThreshold {
++				default 30;
++				on action validate call check_range { min = 0, max = 300 };
++			}
++
++			/**
++			 * WLAN PHY error threshold.
++			 * When changed, automatically sends:
++			 *   hostapd_cli -i wlanX [-l Y] DCS set_wlan_intr_params phyerr_threshold <value>
++			 * Not persistent: applied dynamically via hostapd_cli.
++			 * hostapd default: 300 (DCS_PHYERR_THRESHOLD)
++			 * Valid range: 0 to 300
++			 */
++			uint32 WlanIntrPhyErrThreshold {
++				default 300;
++				on action validate call check_range { min = 0, max = 300 };
++			}
++
++			/**
++			 * Co-channel interference threshold.
++			 * When changed, automatically sends:
++			 *   hostapd_cli -i wlanX [-l Y] DCS set_wlan_intr_params coch_intr_threshold <value>
++			 * Not persistent: applied dynamically via hostapd_cli.
++			 * hostapd default: 30 (DCS_COCH_INTR_THRESHOLD)
++			 * Valid range: 0 to 30
++			 */
++			uint32 WlanIntrCochIntrThreshold {
++				default 30;
++				on action validate call check_range { min = 0, max = 30 };
++			}
++
++			/**
++			 * Maximum channel utilization value.
++			 * When changed, automatically sends:
++			 *   hostapd_cli -i wlanX [-l Y] DCS set_wlan_intr_params user_max_cu <value>
++			 * Not persistent: applied dynamically via hostapd_cli.
++			 * hostapd default: 50 (DCS_USER_MAX_CU)
++			 * Valid range: 0 to 50
++			 */
++			uint32 MaxcuValue {
++				default 50;
++				on action validate call check_range { min = 0, max = 50 };
++			}
++
++			/**
++			 * BW reduction control bitmask.
++			 * Set dynamically at runtime via hostapd_cli:
++			 *   hostapd_cli -i wlanX [-l Y] DCS bw_reduction_ctrl <value>
++			 * Not persistent: runtime only, not saved across reboots.
++			 * Only bits 0-4 are valid (0x001F):
++			 *   Bit 0 (0x0001): CW, Bit 1 (0x0002): WLAN,
++			 *   Bit 2 (0x0004): AWGN, Bit 4 (0x0010): OBSS
++			 * Valid range: 0 to 31 (0x001F)
++			 */
++			uint32 BwReductionCtrl {
++				default 0;
++				on action validate call check_range { min = 0, max = 31 };
++			}
++
++			/**
++			 * AFC channel selection configuration.
++			 * Set dynamically at runtime via hostapd_cli:
++			 *   hostapd_cli -i wlanX AFC set_afc_chan_sel_config <value>
++			 * Not persistent: runtime only, not saved across reboots.
++			 * Note: uses 'AFC' command prefix (no -l Y link ID).
++			 */
++			uint32 SetAfcChanSelConfig {
++				default 0;
++			}
++
++			/**
++			 * DCS random channel bitmap.
++			 * Set dynamically at runtime via hostapd_cli:
++			 *   hostapd_cli -i wlanX [-l Y] DCS random_chan_bitmap <value>
++			 * Not persistent: runtime only, not saved across reboots.
++			 * Only bits 0-4 are valid (0x001F):
++			 *   Bit 0 (0x0001): CW, Bit 1 (0x0002): WLAN,
++			 *   Bit 2 (0x0004): AWGN, Bit 4 (0x0010): OBSS
++			 * Valid range: 0 to 31 (0x001F)
++			 */
++			uint32 RandomChanBitmap {
++				default 0;
++				on action validate call check_range { min = 0, max = 31 };
++			}
++
++			/**
++			 * DCS CSA TBTT value.
++			 * Set dynamically at runtime via hostapd_cli:
++			 *   hostapd_cli -i wlanX [-l Y] DCS csa_tbtt <value>
++			 * Not persistent: runtime only, not saved across reboots.
++			 * hostapd range: DCS_CSA_TBTT_MIN=1 to DCS_CSA_TBTT_MAX=30
++			 * hostapd default: DCS_CSA_TBTT_DEFAULT=5
++			 * Valid range: 1 to 30
++			 */
++			uint32 CsaTbtt {
++				default 5;
++				on action validate call check_range { min = 1, max = 30 };
++			}
++
++			/**
++			 * DCS re-enable timer in seconds.
++			 * Set dynamically at runtime via hostapd_cli:
++			 *   hostapd_cli -i wlanX [-l Y] DCS set_dcs_enable_timer <value>
++			 * Not persistent: runtime only, not saved across reboots.
++			 * hostapd range: DCS_ENABLE_TIME_MIN=300s to DCS_ENABLE_TIME_MAX=3600s
++			 * hostapd default: DCS_ENABLE_TIME=1800s (30 minutes)
++			 * Reading this parameter returns the value last set via this DM parameter.
++			 * Valid range: 300 to 3600 seconds
++			 */
++			uint32 EnableTimer {
++				default 1800;
++				on action validate call check_range { min = 300, max = 3600 };
++			}
++
++			/**
++			 * DCS event action bitmask.
++			 * Set dynamically at runtime via hostapd_cli:
++			 *   hostapd_cli -i wlanX [-l Y] DCS event_action <mask>
++			 * Not persistent: runtime only, not saved across reboots.
++			 * Only bits 0, 1, 4 are valid (ALLOWED_DCS_EVENT_ACTION_MASK = 0x0013):
++			 *   Bit 0 (0x0001): process CW, Bit 1 (0x0002): process WLAN,
++			 *   Bit 4 (0x0010): process OBSS
++			 * hostapd default: 0x0013 (all interference types processed)
++			 * Valid range: 0 to 19 (0x0013)
++			 */
++			uint32 EventAction {
++				default 19;
++				on action validate call check_range { min = 0, max = 19 };
++			}
++
++			/**
++			 * DCS event notify bitmask.
++			 * Set dynamically at runtime via hostapd_cli:
++			 *   hostapd_cli -i wlanX [-l Y] DCS event_notify <mask>
++			 * Not persistent: runtime only, not saved across reboots.
++			 * Only bits 0, 1, 4 are valid (ALLOWED_DCS_EVENT_ACTION_MASK = 0x0013):
++			 *   Bit 0 (0x0001): notify CW, Bit 1 (0x0002): notify WLAN,
++			 *   Bit 4 (0x0010): notify OBSS
++			 * hostapd default: 0 (no notifications)
++			 * Valid range: 0 to 19 (0x0013)
++			 */
++			uint32 EventNotify {
++				default 0;
++				on action validate call check_range { min = 0, max = 19 };
++			}
++
++		}
++
+ 		/** This object contains parameters related to Wi-Fi Protected
+ 		 *  Setup [WPSv1.0] for this access point.*/
+ 		%persistent object WPS{
+@@ -2698,4 +2886,3 @@ define rrm_t{
+ 	} /* object AccessPoint */
+     }
+ }
+-
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -279,7 +279,14 @@ void wld_hostapd_cfgFile_setRadioConfig(
+     bool enableRad11ac = wld_rad_checkEnabledRadStd(pRad, SWL_RADSTD_AC);
+ 
+     swl_channel_t tgtChan = tgtChspec.channel;
+-    swl_mapCharFmt_addValInt32(radConfigMap, "channel", tgtChan);
++    /* When auto channel selection is enabled (and not managed externally),
++     * write channel=0 to hostapd config to indicate auto channel selection.
++     * This is equivalent to: uci set wireless.wifiX.channel=auto */
++    if(pRad->autoChannelEnable && !pRad->externalAcsMgmt) {
++        swl_mapCharFmt_addValInt32(radConfigMap, "channel", 0);
++    } else {
++        swl_mapCharFmt_addValInt32(radConfigMap, "channel", tgtChan);
++    }
+     swl_mapCharFmt_addValInt32(radConfigMap, "op_class", swl_chanspec_getOperClass(&tgtChspec));
+     swl_mapChar_add(radConfigMap, "country_code", pRad->regulatoryDomain);
+     swl_mapChar_add(radConfigMap, "ieee80211d", "1");
+@@ -1445,6 +1452,12 @@ void wld_hostapd_cfgFile_setVapConfig(T_
+         swl_mapChar_add(vapConfigMap, "dpp_configurator_connectivity", "1");
+     }
+ 
++    /* DCS: write dcs_enable bitmask to hostapd config when non-zero.
++     * Bit 0 = CW, Bit 1 = WLAN, Bit 2 = AWGN, Bit 4 = OBSS */
++    if(pAP->DCS_Enable) {
++        swl_mapCharFmt_addValInt32(vapConfigMap, "dcs_enable", (int32_t) pAP->DCS_Enable);
++    }
++
+ 
+     // rnr standard config
+     bool isIEEE80211k = pAP->IEEE80211kEnable && pAP->pRadio->IEEE80211kSupported;
+--- a/src/wld_accesspoint.c
++++ b/src/wld_accesspoint.c
+@@ -185,6 +185,21 @@ static void s_setDefaults(T_AccessPoint*
+     pAP->MaxStations = pRad->maxNrHwSta;
+     swl_str_copy(pAP->DPP_Role, sizeof(pAP->DPP_Role), "Configurator");
+     swl_str_copy(pAP->DPP_BootstrapType, sizeof(pAP->DPP_BootstrapType), "QR");
++    pAP->DCS_Enable = 0;
++    pAP->DCS_WlanIntrDetectionThreshold = 0;
++    pAP->DCS_WlanIntrTxErrThreshold = 0;
++    pAP->DCS_WlanIntrPhyErrThreshold = 0;
++    pAP->DCS_WlanIntrCochIntrThreshold = 0;
++    pAP->DCS_MaxcuValue = 0;
++    pAP->DCS_BwReductionCtrl = 0;
++    pAP->DCS_SetAfcChanSelConfig = 0;
++    pAP->DCS_RandomChanBitmap = 0;
++    pAP->DCS_CsaTbtt = 0;
++    pAP->DCS_EnableTimer = 0;
++    /* Initialize ReEnableTimer to hostapd default (DCS_ENABLE_TIME = 30*60 = 1800s) */
++    pAP->DCS_ReEnableTimer = 1800;
++    pAP->DCS_EventAction = 0;
++    pAP->DCS_EventNotify = 0;
+ 
+     pAP->UAPSDCapability = pAP->pFA->mfn_misc_has_support(pAP->pRadio, pAP, "UAPSD", 0);
+     pAP->WMMCapability = pAP->pFA->mfn_misc_has_support(pAP->pRadio, pAP, "WME", 0);
+@@ -964,6 +979,10 @@ void SyncData_AP2OBJ(amxd_object_t* obje
+         amxd_trans_set_cstring_t(&trans, "Role", pAP->DPP_Role);
+         amxd_trans_set_cstring_t(&trans, "BootstrapType", pAP->DPP_BootstrapType);
+ 
++        /** DCS Part */
++        amxd_trans_select_object(&trans, amxd_object_findf(object, "DCS"));
++        amxd_trans_set_uint32_t(&trans, "Enable", pAP->DCS_Enable);
++
+         /** WPS Part */
+ 
+         if(wpsObj != NULL) {
+@@ -1217,6 +1236,14 @@ void SyncData_AP2OBJ(amxd_object_t* obje
+         }
+         free(dppBootstrapType);
+ 
++        /* DCS - read Enable from DM */
++        amxd_object_t* dcsObj = amxd_object_findf(object, "DCS");
++        uint32_t dcsEnable = amxd_object_get_uint32_t(dcsObj, "Enable", NULL);
++        if(pAP->DCS_Enable != dcsEnable) {
++            pAP->DCS_Enable = dcsEnable;
++            commit = true;
++        }
++
+         tmp_bool = amxd_object_get_bool(wpsObj, "Enable", NULL);
+         if(pAP->WPS_Enable != tmp_bool) {
+             pAP->WPS_Enable = tmp_bool;
+@@ -1579,6 +1606,357 @@ void _wld_ap_setDppConf_ocf(const char*
+     swla_dm_procObjEvtOfLocalDm(&sApDppDmHdlrs, sig_name, data, priv);
+ }
+ 
++/* =========================================================================
++ * DCS (Dynamic Channel Selection) implementation
++ * =========================================================================
++ */
++
++/**
++ * @brief Helper to send a DCS wlan_intr_params command via the hostapd wpaCtrl interface.
++ *
++ * Equivalent to: hostapd_cli -i wlanX [-l linkId] dcs set_wlan_intr_params <param_name> <value>
++ *
++ * When the AP is part of an MLD the MLD link ID (pAP->pSSID->mldLinkId) is
++ * prepended as "LINK_ID=<id> " to the command, matching the behaviour of
++ * hostapd_cli's -l flag.
++ *
++ * @param pAP        AccessPoint context
++ * @param param_name DCS parameter name (e.g. "intr_detection_threshold")
++ * @param value      Parameter value
++ * @return true on success, false on failure
++ */
++static bool s_sendDcsWlanIntrParams(T_AccessPoint* pAP, const char* param_name, uint32_t value) {
++    ASSERTS_NOT_NULL(pAP, false, ME, "NULL");
++    char cmd[256] = {0};
++    char reply[256] = {0};
++
++    /* DCS commands must be sent directly to the AP's own socket file (e.g., wlan1.1)
++     * using wld_wpaCtrl_queryToSock — equivalent to hostapd_cli -i wlan1.1 dcs ...
++     *
++     * We CANNOT use pAP->wpaCtrlInterface because it may be connected to wlan1.1_link0
++     * (the MLD link socket) which does NOT support 'dcs' commands.
++     *
++     * For MLO: send to the primary link interface socket with LINK_ID=<id> prefix,
++     * equivalent to: hostapd_cli -i wlan2.1 -l <linkId> dcs ...
++     */
++    const char* serverPath = wld_wpaCtrlInterface_getConnectionDirPath(pAP->wpaCtrlInterface);
++    ASSERTS_STR(serverPath, false, ME, "%s: no server path", pAP->alias);
++
++    const char* primLinkIfaceName = wld_hostapd_ap_selectApLinkIface(pAP);
++    int16_t linkId = (pAP->pSSID != NULL) ? pAP->pSSID->mldLinkId : -1;
++
++    if(!swl_str_matches(primLinkIfaceName, pAP->alias) && (linkId >= 0)) {
++        /* MLO: send to primary link interface socket with LINK_ID prefix
++         * NOTE: hostapd ctrl interface expects uppercase "DCS" command */
++        snprintf(cmd, sizeof(cmd), "LINK_ID=%d DCS set_wlan_intr_params %s %u", (int) linkId, param_name, value);
++        SAH_TRACEZ_INFO(ME, "%s: DCS cmd='%s' via sock='%s'", pAP->alias, cmd, primLinkIfaceName);
++        swl_rc_ne rc = wld_wpaCtrl_queryToSock(serverPath, primLinkIfaceName, cmd, reply, sizeof(reply));
++        /* DCS set commands return 0 with no reply text on success — empty reply is OK */
++        bool bRet = (rc == SWL_RC_OK) && !swl_str_matches(reply, "FAIL");
++        if(!bRet) {
++            SAH_TRACEZ_ERROR(ME, "%s: DCS command failed: cmd='%s' rc=%d reply='%s'",
++                             pAP->alias, cmd, rc, reply);
++        }
++        return bRet;
++    } else {
++        /* SLO: send directly to AP's own socket (pAP->alias = e.g. "wlan1.1")
++         * NOTE: hostapd ctrl interface expects uppercase "DCS" command */
++        snprintf(cmd, sizeof(cmd), "DCS set_wlan_intr_params %s %u", param_name, value);
++        SAH_TRACEZ_INFO(ME, "%s: DCS cmd='%s' via sock='%s'", pAP->alias, cmd, pAP->alias);
++        swl_rc_ne rc = wld_wpaCtrl_queryToSock(serverPath, pAP->alias, cmd, reply, sizeof(reply));
++        /* DCS set commands return 0 with no reply text on success — empty reply is OK */
++        bool bRet = (rc == SWL_RC_OK) && !swl_str_matches(reply, "FAIL");
++        if(!bRet) {
++            SAH_TRACEZ_ERROR(ME, "%s: DCS command failed: cmd='%s' rc=%d reply='%s'",
++                             pAP->alias, cmd, rc, reply);
++        }
++        return bRet;
++    }
++}
++
++/**
++ * @brief Handler for DCS.Enable parameter change.
++ *
++ * Updates pAP->DCS_Enable and triggers a full AP sync so that the hostapd
++ * configuration file is regenerated with the new dcs_enable value.
++ */
++static void s_setDcsEnable_pwf(void* priv _UNUSED, amxd_object_t* object,
++                                amxd_param_t* param _UNUSED,
++                                const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_AccessPoint* pAP = wld_ap_fromObj(amxd_object_get_parent(object));
++    ASSERT_NOT_NULL(pAP, , ME, "Invalid AP Ctx");
++
++    uint32_t enable = amxc_var_dyncast(uint32_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set DCS Enable 0x%x", pAP->alias, enable);
++    ASSERTI_NOT_EQUALS(pAP->DCS_Enable, enable, , ME, "EQUALS");
++    pAP->DCS_Enable = enable;
++    wld_ap_doSync(pAP);
++
++    SAH_TRACEZ_OUT(ME);
++}
++
++/**
++ * @brief Handler for DCS persistent threshold parameter changes.
++ *
++ * When a threshold parameter is changed, the new value is stored in the
++ * internal struct and immediately sent to hostapd via wpaCtrl.
++ */
++static void s_setDcsWlanIntrDetectionThreshold_pwf(void* priv _UNUSED,
++                                                    amxd_object_t* object,
++                                                    amxd_param_t* param _UNUSED,
++                                                    const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++    T_AccessPoint* pAP = wld_ap_fromObj(amxd_object_get_parent(object));
++    ASSERT_NOT_NULL(pAP, , ME, "Invalid AP Ctx");
++    uint32_t value = amxc_var_dyncast(uint32_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set DCS WlanIntrDetectionThreshold %u", pAP->alias, value);
++    pAP->DCS_WlanIntrDetectionThreshold = value;
++    s_sendDcsWlanIntrParams(pAP, "intr_detection_threshold", value);
++    SAH_TRACEZ_OUT(ME);
++}
++
++static void s_setDcsWlanIntrTxErrThreshold_pwf(void* priv _UNUSED,
++                                                amxd_object_t* object,
++                                                amxd_param_t* param _UNUSED,
++                                                const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++    T_AccessPoint* pAP = wld_ap_fromObj(amxd_object_get_parent(object));
++    ASSERT_NOT_NULL(pAP, , ME, "Invalid AP Ctx");
++    uint32_t value = amxc_var_dyncast(uint32_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set DCS WlanIntrTxErrThreshold %u", pAP->alias, value);
++    pAP->DCS_WlanIntrTxErrThreshold = value;
++    s_sendDcsWlanIntrParams(pAP, "txerr_threshold", value);
++    SAH_TRACEZ_OUT(ME);
++}
++
++static void s_setDcsWlanIntrPhyErrThreshold_pwf(void* priv _UNUSED,
++                                                 amxd_object_t* object,
++                                                 amxd_param_t* param _UNUSED,
++                                                 const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++    T_AccessPoint* pAP = wld_ap_fromObj(amxd_object_get_parent(object));
++    ASSERT_NOT_NULL(pAP, , ME, "Invalid AP Ctx");
++    uint32_t value = amxc_var_dyncast(uint32_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set DCS WlanIntrPhyErrThreshold %u", pAP->alias, value);
++    pAP->DCS_WlanIntrPhyErrThreshold = value;
++    s_sendDcsWlanIntrParams(pAP, "phyerr_threshold", value);
++    SAH_TRACEZ_OUT(ME);
++}
++
++static void s_setDcsWlanIntrCochIntrThreshold_pwf(void* priv _UNUSED,
++                                                   amxd_object_t* object,
++                                                   amxd_param_t* param _UNUSED,
++                                                   const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++    T_AccessPoint* pAP = wld_ap_fromObj(amxd_object_get_parent(object));
++    ASSERT_NOT_NULL(pAP, , ME, "Invalid AP Ctx");
++    uint32_t value = amxc_var_dyncast(uint32_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set DCS WlanIntrCochIntrThreshold %u", pAP->alias, value);
++    pAP->DCS_WlanIntrCochIntrThreshold = value;
++    s_sendDcsWlanIntrParams(pAP, "coch_intr_threshold", value);
++    SAH_TRACEZ_OUT(ME);
++}
++
++static void s_setDcsMaxcuValue_pwf(void* priv _UNUSED,
++                                    amxd_object_t* object,
++                                    amxd_param_t* param _UNUSED,
++                                    const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++    T_AccessPoint* pAP = wld_ap_fromObj(amxd_object_get_parent(object));
++    ASSERT_NOT_NULL(pAP, , ME, "Invalid AP Ctx");
++    uint32_t value = amxc_var_dyncast(uint32_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set DCS MaxcuValue %u", pAP->alias, value);
++    pAP->DCS_MaxcuValue = value;
++    s_sendDcsWlanIntrParams(pAP, "user_max_cu", value);
++    SAH_TRACEZ_OUT(ME);
++}
++
++/**
++ * @brief Helper to send a generic DCS command (not set_wlan_intr_params) via wpaCtrl.
++ *
++ * Equivalent to: hostapd_cli -i wlanX [-l Y] dcs <cmd> <value>
++ * When MLD link ID is valid, prepends "LINK_ID=<id> ".
++ */
++static bool s_sendDcsCmd(T_AccessPoint* pAP, const char* dcs_cmd, uint32_t value) {
++    ASSERTS_NOT_NULL(pAP, false, ME, "NULL");
++    char cmd[256] = {0};
++    char reply[256] = {0};
++
++    /* DCS commands must be sent directly to the AP's own socket file (e.g., wlan1.1)
++     * using wld_wpaCtrl_queryToSock — equivalent to hostapd_cli -i wlan1.1 DCS ...
++     *
++     * We CANNOT use pAP->wpaCtrlInterface because it may be connected to wlan1.1_link0
++     * (the MLD link socket) which does NOT support 'DCS' commands.
++     *
++     * NOTE: hostapd ctrl interface expects uppercase "DCS" command prefix.
++     *
++     * For MLO: send to the primary link interface socket with LINK_ID=<id> prefix,
++     * equivalent to: hostapd_cli -i wlan2.1 -l <linkId> DCS ...
++     */
++    const char* serverPath = wld_wpaCtrlInterface_getConnectionDirPath(pAP->wpaCtrlInterface);
++    const char* primLinkIfaceName = wld_hostapd_ap_selectApLinkIface(pAP);
++    int16_t linkId = (pAP->pSSID != NULL) ? pAP->pSSID->mldLinkId : -1;
++
++    ASSERTS_STR(serverPath, false, ME, "%s: no server path", pAP->alias);
++
++    if(!swl_str_matches(primLinkIfaceName, pAP->alias) && (linkId >= 0)) {
++        /* MLO: send to primary link interface socket with LINK_ID prefix */
++        snprintf(cmd, sizeof(cmd), "LINK_ID=%d DCS %s %u", (int) linkId, dcs_cmd, value);
++        SAH_TRACEZ_INFO(ME, "%s: DCS MLO cmd='%s' via sock='%s'", pAP->alias, cmd, primLinkIfaceName);
++        swl_rc_ne rc = wld_wpaCtrl_queryToSock(serverPath, primLinkIfaceName, cmd, reply, sizeof(reply));
++        /* DCS set commands return 0 with no reply text on success — empty reply is OK */
++        bool bRet = (rc == SWL_RC_OK) && !swl_str_matches(reply, "FAIL");
++        if(!bRet) {
++            SAH_TRACEZ_ERROR(ME, "%s: DCS command failed: cmd='%s' rc=%d reply='%s'",
++                             pAP->alias, cmd, rc, reply);
++        }
++        return bRet;
++    } else {
++        /* SLO: send directly to AP's own socket (pAP->alias = e.g. "wlan1.1") */
++        snprintf(cmd, sizeof(cmd), "DCS %s %u", dcs_cmd, value);
++        SAH_TRACEZ_INFO(ME, "%s: DCS SLO cmd='%s' via sock='%s'", pAP->alias, cmd, pAP->alias);
++        swl_rc_ne rc = wld_wpaCtrl_queryToSock(serverPath, pAP->alias, cmd, reply, sizeof(reply));
++        /* DCS set commands return 0 with no reply text on success — empty reply is OK */
++        bool bRet = (rc == SWL_RC_OK) && !swl_str_matches(reply, "FAIL");
++        if(!bRet) {
++            SAH_TRACEZ_ERROR(ME, "%s: DCS command failed: cmd='%s' rc=%d reply='%s'",
++                             pAP->alias, cmd, rc, reply);
++        }
++        return bRet;
++    }
++}
++
++/**
++ * @brief Helper to send an AFC command (no dcs prefix, no link ID) via wpaCtrl.
++ *
++ * Equivalent to: hostapd_cli -i wlanX afc <cmd> <value>
++ */
++static bool s_sendAfcCmd(T_AccessPoint* pAP, const char* afc_cmd, uint32_t value) {
++    ASSERTS_NOT_NULL(pAP, false, ME, "NULL");
++    char cmd[256] = {0};
++    snprintf(cmd, sizeof(cmd), "afc %s %u", afc_cmd, value);
++    bool bRet = wld_wpaCtrl_sendCmdCheckResponse(pAP->wpaCtrlInterface, cmd, "OK");
++    if(!bRet) {
++        SAH_TRACEZ_ERROR(ME, "%s: AFC command failed: %s", pAP->alias, cmd);
++    }
++    return bRet;
++}
++
++static void s_setDcsBwReductionCtrl_pwf(void* priv _UNUSED, amxd_object_t* object,
++                                         amxd_param_t* param _UNUSED,
++                                         const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++    T_AccessPoint* pAP = wld_ap_fromObj(amxd_object_get_parent(object));
++    ASSERT_NOT_NULL(pAP, , ME, "Invalid AP Ctx");
++    uint32_t value = amxc_var_dyncast(uint32_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set DCS BwReductionCtrl 0x%x", pAP->alias, value);
++    pAP->DCS_BwReductionCtrl = value;
++    s_sendDcsCmd(pAP, "bw_reduction_ctrl", value);
++    SAH_TRACEZ_OUT(ME);
++}
++
++static void s_setDcsSetAfcChanSelConfig_pwf(void* priv _UNUSED, amxd_object_t* object,
++                                             amxd_param_t* param _UNUSED,
++                                             const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++    T_AccessPoint* pAP = wld_ap_fromObj(amxd_object_get_parent(object));
++    ASSERT_NOT_NULL(pAP, , ME, "Invalid AP Ctx");
++    uint32_t value = amxc_var_dyncast(uint32_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set DCS SetAfcChanSelConfig %u", pAP->alias, value);
++    pAP->DCS_SetAfcChanSelConfig = value;
++    s_sendAfcCmd(pAP, "set_afc_chan_sel_config", value);
++    SAH_TRACEZ_OUT(ME);
++}
++
++static void s_setDcsRandomChanBitmap_pwf(void* priv _UNUSED, amxd_object_t* object,
++                                          amxd_param_t* param _UNUSED,
++                                          const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++    T_AccessPoint* pAP = wld_ap_fromObj(amxd_object_get_parent(object));
++    ASSERT_NOT_NULL(pAP, , ME, "Invalid AP Ctx");
++    uint32_t value = amxc_var_dyncast(uint32_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set DCS RandomChanBitmap 0x%x", pAP->alias, value);
++    pAP->DCS_RandomChanBitmap = value;
++    s_sendDcsCmd(pAP, "random_chan_bitmap", value);
++    SAH_TRACEZ_OUT(ME);
++}
++
++static void s_setDcsCsaTbtt_pwf(void* priv _UNUSED, amxd_object_t* object,
++                                  amxd_param_t* param _UNUSED,
++                                  const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++    T_AccessPoint* pAP = wld_ap_fromObj(amxd_object_get_parent(object));
++    ASSERT_NOT_NULL(pAP, , ME, "Invalid AP Ctx");
++    uint32_t value = amxc_var_dyncast(uint32_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set DCS CsaTbtt %u", pAP->alias, value);
++    pAP->DCS_CsaTbtt = value;
++    s_sendDcsCmd(pAP, "csa_tbtt", value);
++    SAH_TRACEZ_OUT(ME);
++}
++
++static void s_setDcsEnableTimer_pwf(void* priv _UNUSED, amxd_object_t* object,
++                                     amxd_param_t* param _UNUSED,
++                                     const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++    T_AccessPoint* pAP = wld_ap_fromObj(amxd_object_get_parent(object));
++    ASSERT_NOT_NULL(pAP, , ME, "Invalid AP Ctx");
++    uint32_t value = amxc_var_dyncast(uint32_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set DCS EnableTimer %u", pAP->alias, value);
++    pAP->DCS_EnableTimer = value;
++    s_sendDcsCmd(pAP, "set_dcs_enable_timer", value);
++    SAH_TRACEZ_OUT(ME);
++}
++
++static void s_setDcsEventAction_pwf(void* priv _UNUSED, amxd_object_t* object,
++                                     amxd_param_t* param _UNUSED,
++                                     const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++    T_AccessPoint* pAP = wld_ap_fromObj(amxd_object_get_parent(object));
++    ASSERT_NOT_NULL(pAP, , ME, "Invalid AP Ctx");
++    uint32_t value = amxc_var_dyncast(uint32_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set DCS EventAction 0x%x", pAP->alias, value);
++    pAP->DCS_EventAction = value;
++    s_sendDcsCmd(pAP, "event_action", value);
++    SAH_TRACEZ_OUT(ME);
++}
++
++static void s_setDcsEventNotify_pwf(void* priv _UNUSED, amxd_object_t* object,
++                                     amxd_param_t* param _UNUSED,
++                                     const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++    T_AccessPoint* pAP = wld_ap_fromObj(amxd_object_get_parent(object));
++    ASSERT_NOT_NULL(pAP, , ME, "Invalid AP Ctx");
++    uint32_t value = amxc_var_dyncast(uint32_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set DCS EventNotify 0x%x", pAP->alias, value);
++    pAP->DCS_EventNotify = value;
++    s_sendDcsCmd(pAP, "event_notify", value);
++    SAH_TRACEZ_OUT(ME);
++}
++
++SWLA_DM_HDLRS(sApDcsDmHdlrs,
++              ARR(SWLA_DM_PARAM_HDLR("Enable", s_setDcsEnable_pwf),
++                  SWLA_DM_PARAM_HDLR("WlanIntrDetectionThreshold", s_setDcsWlanIntrDetectionThreshold_pwf),
++                  SWLA_DM_PARAM_HDLR("WlanIntrTxErrThreshold", s_setDcsWlanIntrTxErrThreshold_pwf),
++                  SWLA_DM_PARAM_HDLR("WlanIntrPhyErrThreshold", s_setDcsWlanIntrPhyErrThreshold_pwf),
++                  SWLA_DM_PARAM_HDLR("WlanIntrCochIntrThreshold", s_setDcsWlanIntrCochIntrThreshold_pwf),
++                  SWLA_DM_PARAM_HDLR("MaxcuValue", s_setDcsMaxcuValue_pwf),
++                  SWLA_DM_PARAM_HDLR("BwReductionCtrl", s_setDcsBwReductionCtrl_pwf),
++                  SWLA_DM_PARAM_HDLR("SetAfcChanSelConfig", s_setDcsSetAfcChanSelConfig_pwf),
++                  SWLA_DM_PARAM_HDLR("RandomChanBitmap", s_setDcsRandomChanBitmap_pwf),
++                  SWLA_DM_PARAM_HDLR("CsaTbtt", s_setDcsCsaTbtt_pwf),
++                  SWLA_DM_PARAM_HDLR("EnableTimer", s_setDcsEnableTimer_pwf),
++                  SWLA_DM_PARAM_HDLR("EventAction", s_setDcsEventAction_pwf),
++                  SWLA_DM_PARAM_HDLR("EventNotify", s_setDcsEventNotify_pwf))
++              );
++
++void _wld_ap_setDcsConf_ocf(const char* const sig_name,
++                             const amxc_var_t* const data,
++                             void* const priv) {
++    swla_dm_procObjEvtOfLocalDm(&sApDcsDmHdlrs, sig_name, data, priv);
++}
++
+ static void s_setApRole_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
+     SAH_TRACEZ_IN(ME);
+ 
+@@ -3435,4 +3813,3 @@ void _wld_ap_setConf_ocf(const char* con
+                          void* const priv) {
+     swla_dm_procObjEvtOfLocalDm(&sApDmHdlrs, sig_name, data, priv);
+ }
+-
