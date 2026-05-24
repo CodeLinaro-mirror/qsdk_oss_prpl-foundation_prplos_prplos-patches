@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Harini Pavithra Elangovan <helangov@qti.qualcomm.com>
+Date: Mon, 19 May 2026 10:00:00 +0530
+Subject: [PATCH] Add TargetWakeTimeEnable TWT support
+
+Implement WiFi.Radio.{i}.TargetWakeTimeEnable data model parameter
+to configure TWT (Target Wake Time) responder capabilities.
+
+Changes:
+- Change ODL type from bool to uint32 (values 0-3)
+- Update C struct field from bool to uint32_t
+- Write twt_responder_caps to hostapd VAP config
+- Write he_twt_responder to hostapd radio config
+
+TWT values:
+  0 = TWT_DISABLED
+  1 = TWT_ITWT_ENABLED (Individual TWT)
+  2 = TWT_ITWT_BTWT_ENABLED (Individual + Broadcast TWT)
+  3 = TWT_ITWT_BTWT_RTWT_ENABLED (Individual + Broadcast + Restricted TWT)
+
+Signed-off-by: Harini Pavithra Elangovan <helangov@qti.qualcomm.com>
+---
+ include/wld/wld.h                 |  2 +-
+ odl/wld_radio.odl                 |  5 +++--
+ src/nl80211/wld_hostapd_cfgFile.c |  8 ++++++++
+ src/wld_radio.c                   | 10 +++++-----
+ 4 files changed, 18 insertions(+), 7 deletions(-)
+
+--- a/include/wld/wld.h
++++ b/include/wld/wld.h
+@@ -1587,6 +1587,6 @@
+     uint8_t retryLimit;                         /* The maximum number of retransmissions of a short packet */
+     uint8_t longRetryLimit;                     /* The maximum number of retransmissions of a long packet */
+-    bool twtEnable;                             /* Enable the target wake time 11ax feature */
++    uint32_t twtEnable;                         /* TWT responder caps: 0=disabled, 1=iTWT, 2=iTWT+bTWT, 3=iTWT+bTWT+rTWT */
+     bool IEEE80211hSupported;                   /* Indicate if we've 802.11h support */
+     bool IEEE80211kSupported;                   /* Indicate if we've 802.11k support */
+     bool IEEE80211rSupported;                   /* Indicate if we've 802.11r support */
+--- a/odl/wld_radio.odl
++++ b/odl/wld_radio.odl
+@@ -1143,7 +1143,8 @@
+		 * @version 9.1
+		 */
+-		%persistent bool TargetWakeTimeEnable{
+-			default false;
++		%persistent uint32 TargetWakeTimeEnable{
++			on action validate call check_range { min = 0, max = 3 };
++			default 0;
+		}
+ 
+		/**
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+
+@@ -858,4 +863,8 @@
+     swl_mapCharFmt_addValInt32(vapConfigMap, "multicast_to_unicast", pRad->multicastTounicast);
+     SAH_TRACEZ_INFO(ME, "%s: Set multicast_to_unicast = %d", pRad->Name, pRad->multicastTounicast);
+ 
++    /* TWT responder capabilities per VAP (0=disabled, 1=iTWT, 2=iTWT+bTWT, 3=iTWT+bTWT+rTWT) */
++    swl_mapCharFmt_addValInt32(vapConfigMap, "twt_responder_caps", pRad->twtEnable);
++    SAH_TRACEZ_INFO(ME, "%s: TWT twt_responder_caps set to %u", pRad->Name, pRad->twtEnable);
++
+     swl_mapCharFmt_addValInt32(vapConfigMap, "ap_isolate", pAP->clientIsolationEnable);
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -1183,6 +1183,6 @@
+     T_Radio* pR = wld_rad_fromObj(object);
+     ASSERTS_NOT_NULL(pR, , ME, "NULL");
+-    pR->twtEnable = amxc_var_dyncast(bool, newValue);
++    pR->twtEnable = amxc_var_dyncast(uint32_t, newValue);
+     wld_rad_doSync(pR);
+ 
+     SAH_TRACEZ_OUT(ME);
+@@ -2250,9 +2250,9 @@
+             pR->pFA->mfn_wrad_autochannelenable(pR, pR->autoChannelEnable, SET);
+         }
+ 
+-        tmp_bool = amxd_object_get_bool(object, "TargetWakeTimeEnable", NULL);
+-        if(pR->twtEnable != tmp_bool) {
+-            pR->twtEnable = tmp_bool;
++        uint32_t tmp_twt = amxd_object_get_uint32_t(object, "TargetWakeTimeEnable", NULL);
++        if(pR->twtEnable != tmp_twt) {
++            pR->twtEnable = tmp_twt;
+             pR->pFA->mfn_wrad_sync(pR, SET);
+             commit = true;
+         }
+@@ -2627,3 +2627,3 @@
+     {TPH_BOOL, "MulticastToUnicast", TPH_BOOL, offsetof(T_Radio, multicastTounicast)},
+-    {TPH_BOOL, "TargetWakeTimeEnable", TPH_BOOL, offsetof(T_Radio, twtEnable)},
++    {TPH_UINT32, "TargetWakeTimeEnable", TPH_UINT32, offsetof(T_Radio, twtEnable)},
+     {TPH_BOOL, "OfdmaEnable", TPH_BOOL, offsetof(T_Radio, ofdmaEnable)},
