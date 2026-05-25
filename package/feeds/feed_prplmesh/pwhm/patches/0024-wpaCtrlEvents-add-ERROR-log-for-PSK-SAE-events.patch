@@ -1,27 +1,17 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Harini Pavithra Elangovan <helangov@qti.qualcomm.com>
 Date: Mon, 19 May 2026 15:00:00 +0530
-Subject: [PATCH] wpaCtrlEvents: add ERROR log in s_apStationAssocFailure
-
-Add SAH_TRACEZ_ERROR log in s_apStationAssocFailure() which is the
-first entry point in pwhm when it receives AP-STA-POSSIBLE-PSK-MISMATCH
-or CTRL-EVENT-SAE-UNKNOWN-PASSWORD-IDENTIFIER from hostapd via wpa_ctrl.
-
-This confirms pwhm received and processed the event. The log is at
-ERROR level to ensure visibility without requiring INFO-level logging.
-
-Note: These events are only triggered in prplmesh/beerocks setup.
-The ath12k driver handles the 4-way handshake in firmware and does
-not expose these events to hostapd in standalone pwhm setup.
+Subject: [PATCH] wpaCtrlEvents: add ERROR logs for key wpaCtrl events
 
 Signed-off-by: Harini Pavithra Elangovan <helangov@qti.qualcomm.com>
 ---
- src/nl80211/wld_wpaCtrl_events.c | 4 +++-
- 1 file changed, 3 insertions(+), 1 deletion(-)
+ src/nl80211/wld_wpaCtrl_events.c   | 7 +++++--
+ src/Plugin/wifiGen_eventHandlers.c | 7 ++++---
+ 2 files changed, 9 insertions(+), 5 deletions(-)
 
 --- a/src/nl80211/wld_wpaCtrl_events.c
 +++ b/src/nl80211/wld_wpaCtrl_events.c
-@@ -337,10 +337,12 @@ static void s_apStationAssocFailure(wld_wpaCtrlInterface_t* pInterface, char* e
+@@ -337,10 +337,12 @@
 -static void s_apStationAssocFailure(wld_wpaCtrlInterface_t* pInterface, char* event _UNUSED, char* params) {
 +static void s_apStationAssocFailure(wld_wpaCtrlInterface_t* pInterface, char* event, char* params) {
      //Example: AP-STA-POSSIBLE-PSK-MISMATCH xx:xx:xx:xx:xx:xx
@@ -35,3 +25,39 @@ Signed-off-by: Harini Pavithra Elangovan <helangov@qti.qualcomm.com>
      memcpy(buf, params, SWL_MAC_CHAR_LEN - 1);
      bool ret = swl_mac_charToBin(&bStationMac, (swl_macChar_t*) buf);
      ASSERT_TRUE(ret, , ME, "fail to convert mac address to binary");
+@@ -805,5 +805,6 @@ static void s_beaconResponseEvt(wld_wpaCtrlInterface_t* pInterface, char* event
+-static void s_beaconResponseEvt(wld_wpaCtrlInterface_t* pInterface, char* event _UNUSED, char* params) {
++static void s_beaconResponseEvt(wld_wpaCtrlInterface_t* pInterface, char* event, char* params) {
+     // Example: BEACON-RESP-RX be:e9:46:09:57:8a 1 00 00010000000000000000640002bb00d47bb0bf73f00048dc020001b28741084de2000000640011150017536f66744174486f6d652d314332392d4d53637265656e010882848b962430486c0301010504000300000706455520010d1420010023020f002a010432040c12186030140100000fac040100000fac040100000fac020c000b0501008d0000460532000000002d1aad0117ffffff00000000000000000000000000000000000000003d16010804000000000000000000000000000000000000007f080400000000000040
+     // Example: <3>BEACON-RESP-RX 8c:7c:92:68:a8:13 1 00
+     char buf[SWL_MAC_CHAR_LEN] = {0};
++    SAH_TRACEZ_ERROR(ME, "%s: pwhm received wpaCtrlEvent: %s %s", pInterface->name, event, params);
+     swl_macBin_t station;
+--- a/src/Plugin/wifiGen_eventHandlers.c
++++ b/src/Plugin/wifiGen_eventHandlers.c
+@@ -136,6 +136,6 @@
+ 
+-        SAH_TRACEZ_INFO(ME, "%s: notify wpaCtrlEvents eventData=%s", ifName, msgData);
++    SAH_TRACEZ_ERROR(ME, "%s: notify wpaCtrlEvents eventData=%s", ifName, msgData);
+ 
+         amxd_object_trigger_signal(object, "wpaCtrlEvents", &eventData);
+         amxc_var_clean(&eventData);
+     }
+@@ -158,5 +158,5 @@
+     ASSERTS_NOT_NULL(object, , ME, "NULL");
+-    SAH_TRACEZ_INFO(ME, "%s: received wpaCtrl iface standard event %s", ifName, eventName);
++    SAH_TRACEZ_ERROR(ME, "%s: received wpaCtrl iface standard event %s", ifName, eventName);
+ 
+     s_notifyWpaCtrlEvent(object, ifName, eventName, s_fwdIfaceStdWpaCtrlEventsList,
+                          SWL_ARRAY_SIZE(s_fwdIfaceStdWpaCtrlEventsList), msgData);
+@@ -1159,8 +1159,8 @@ static void s_beaconResponseEvt(void* userData, char* ifName _UNUSED, swl_macBi
+ 
+ 
+ 
+-    SAH_TRACEZ_INFO(ME, "%s: RRM reply received station:%s bssid:%s", pAP->alias, cStation.cMac, cBssid.cMac);
++    SAH_TRACEZ_ERROR(ME, "%s: RRM reply received station:%s bssid:%s", pAP->alias, cStation.cMac, cBssid.cMac);
+ 
+-    SAH_TRACEZ_INFO(ME, "%s: opclass: %d channel: %d, duration: %d, frame info: %d, rcpi: %d, rsni: %d, antenna id: %d, parent tsf: %u\n",
++    SAH_TRACEZ_ERROR(ME, "%s: opclass: %d channel: %d, duration: %d, frame info: %d, rcpi: %d, rsni: %d, antenna id: %d, parent tsf: %u\n",
+                     pAP->alias, rrmBeaconResponse->opclass, rrmBeaconResponse->channel, rrmBeaconResponse->duration, rrmBeaconResponse->frameInfo,
+                     rrmBeaconResponse->rcpi, rrmBeaconResponse->rsni, rrmBeaconResponse->antennaId, rrmBeaconResponse->parentTsf);
