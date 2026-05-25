@@ -1,0 +1,50 @@
+From b169cc283c9edf7968a6aac4a0926cd5f1465145 Mon Sep 17 00:00:00 2001
+From: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+Date: Mon, 25 May 2026 14:56:45 +0530
+Subject: [PATCH] pwhm: Validate MultiAPType values and remove unsupported
+ None/Open security for 6GHz VAPs
+
+Signed-off-by: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+---
+ odl/wld_accesspoint.odl | 5 +++++
+ src/wld_accesspoint.c   | 4 ++++
+ 2 files changed, 9 insertions(+)
+
+diff --git a/odl/wld_accesspoint.odl b/odl/wld_accesspoint.odl
+index cec32b9..418c3d5 100644
+--- a/odl/wld_accesspoint.odl
++++ b/odl/wld_accesspoint.odl
+@@ -365,10 +365,15 @@ define rrm_t{
+ 		 * Comma-separated list of strings. List items indicate which IEEE 1905
+ 		 * Multi-AP type is used for this Access Point.
+ 		 * Supported options are : "Off", "FronthaulBSS", "BackhaulBSS".
++		 * multi_ap=0 - Off
++		 * multi_ap=1 - BackhaulBSS
++		 * multi_ap=2 - FronthaulBSS
++		 * multi_ap=3 - FronthaulBSS,BackhaulBSS
+ 		 * @version 9.2
+ 		 */
+ 		%persistent string MultiAPType {
+ 			default "Off";
++			on action validate call check_enum ["Off", "BackhaulBSS", "FronthaulBSS", "FronthaulBSS,BackhaulBSS"];
+ 		}
+ 
+ 		/**
+diff --git a/src/wld_accesspoint.c b/src/wld_accesspoint.c
+index 59ac475..41604cd 100644
+--- a/src/wld_accesspoint.c
++++ b/src/wld_accesspoint.c
+@@ -219,6 +219,10 @@ static void s_setDefaults(T_AccessPoint* pAP, T_Radio* pRad, const char* vapName
+         pAP->secModeEnabled = SWL_SECURITY_APMODE_WPA2_P;
+     }
+     pAP->secModesAvailable = pAP->secModesSupported;
++    /* Exclude M_SWL_SECURITY_APMODE_NONE from secModesAvailable for 6GHz VAPs */
++    if(pAP->pRadio->operatingFrequencyBand == SWL_FREQ_BAND_EXT_6GHZ) {
++        pAP->secModesAvailable &= ~M_SWL_SECURITY_APMODE_NONE;
++    }
+     pAP->mfpConfig = SWL_SECURITY_MFPMODE_DISABLED;
+     pAP->MF_AddressList = NULL;
+     pAP->MF_AddressListBlockSync = false;
+-- 
+2.34.1
+
