@@ -8,7 +8,7 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
 ---
  .../patches/0002-disable-prplmesh-during-boot.patch   | 11 +++++++++++
  1 file changed, 11 insertions(+)
- create mode 100644 package/feeds/feed_prplmesh/prplmesh/patches/0002-disable-prplmesh-during-boot.patch
+ create mode 100644 package/feeds/feed_prplmesh/prplmesh-process-manager/patches/0001-disable-prplmesh-during-boot.patch
 
 --- a/odl/defaults.d/00_services_defaults.odl.in
 +++ b/odl/defaults.d/00_services_defaults.odl.in
