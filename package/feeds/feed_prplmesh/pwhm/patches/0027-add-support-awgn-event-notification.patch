@@ -1,0 +1,210 @@
+From 6133a47731890b9c60f1dc20c0b62383eb90c5da Mon Sep 17 00:00:00 2001
+From: Atchaya R <ratchaya@qti.qualcomm.com>
+Date: Thu, 28 May 2026 21:19:19 +0530
+Subject: [PATCH] pwhm: add support to subscribe awgn event notification from
+ host
+
+Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
+---
+ include/wld/wld_wpaCtrl_events.h   |  2 ++
+ src/Plugin/wifiGen_eventHandlers.c | 18 ++++++++++++++++--
+ src/nl80211/wld_wpaCtrl_events.c   |  7 +++++++
+ 3 files changed, 25 insertions(+), 2 deletions(-)
+
+--- a/include/wld/wld_wpaCtrl_events.h
++++ b/include/wld/wld_wpaCtrl_events.h
+@@ -227,6 +227,8 @@ typedef void (* wld_wpaCtrl_dfsNopFinish
+ typedef void (* wld_wpaCtrl_dfsNewChannelCb_f)(void* userData, char* ifName, swl_chanspec_t* chanSpec);
+ typedef void (* wld_wpaCtrl_uplinkCsaCb_f)(void* userData, char* ifName, char* params);
+ typedef void (* wld_wpaCtrl_uplinkCsaTimeoutCb_f)(void* userData, char* ifName, char* params);
++typedef void (* wld_wpaCtrl_awgnInterferenceDetectedCb_f)(void* userData, char* ifName, char* params);
++typedef void (* wld_wpaCtrl_acsCompletedCb_f)(void* userData, char* ifName, swl_chanspec_t* chanSpec);
+ typedef void (* wld_wpaCtrl_mainApSetupCompletedCb_f)(void* userData, char* ifName);
+ typedef void (* wld_wpaCtrl_mainApDisabledCb_f)(void* userData, char* ifName);
+ typedef void (* wld_wpaCtrl_syncOnReadyCb_f)(void* userData, char* ifName, bool state);
+@@ -256,6 +258,8 @@ typedef struct {
+     wld_wpaCtrl_dfsNewChannelCb_f fDfsNewChannelCb; //fallback after dfs radar detection
+     wld_wpaCtrl_uplinkCsaCb_f fUplinkCsaCb;
+     wld_wpaCtrl_uplinkCsaTimeoutCb_f fUplinkCsaTimeoutCb;
++    wld_wpaCtrl_awgnInterferenceDetectedCb_f fAwgnInterferenceDetectedCb; // AWGN interference detected
++    wld_wpaCtrl_acsCompletedCb_f fAcsCompletedCb;                        // ACS completed (DCS-triggered)
+     wld_wpaCtrl_mainApSetupCompletedCb_f fMainApSetupCompletedCb;
+     wld_wpaCtrl_mainApDisabledCb_f fMainApDisabledCb;
+ 
+--- a/src/Plugin/wifiGen_eventHandlers.c
++++ b/src/Plugin/wifiGen_eventHandlers.c
+@@ -121,7 +121,8 @@ static const char* s_fwdRadioStdWpaCtrlE
+     "DFS-NOP-FINISHED"
+     "DFS-NOP-FINISHED",
+     "DFS-UPLINK-CSA",
+-    "DFS-UPLINK-CSA-TIMEOUT"
++    "DFS-UPLINK-CSA-TIMEOUT",
++    "INTERFERENCE-DETECTED"
+ };
+ 
+ static void s_notifyWpaCtrlEvent(amxd_object_t* object, char* ifName, char* eventName,
+@@ -559,6 +560,93 @@ static void s_uplinkCsaCb(void* userData
+     }
+ }
+ 
++static void s_awgnInterferenceDetectedCb(void* userData, char* ifName, char* params) {
++    /*
++     * Interference detected event from hostapd (type=AWGN, WLAN, CW, or OBSS).
++     * hostapd already handles the channel switch or ACS internally.
++     * For WLAN/CW interference: hostapd triggers dynamic ACS which needs wpa_supplicant
++     * scans to be stopped first. Send DISCONNECT to ALL EP interfaces on ALL radios
++     * so that wpa_supplicant stops scanning and stays disconnected until ACS completes.
++     *
++     * In the WiFi 7 MLO setup, the INTERFERENCE-DETECTED event may be received on a
++     * different radio than the one running ACS (e.g., event on wlan1.1/5GHz radio but
++     * ACS runs on wlan2.1/MLO AP which shares the physical radio with wlan2/6GHz STA).
++     * Sending DISCONNECT to all radios' endpoints ensures all wpa_supplicant interfaces
++     * on the same physical chip stop scanning.
++     *
++     * After ACS completes (ACS-COMPLETED event), s_acsCompletedCb sends RECONNECT.
++     * This mirrors what the OpenWrt ucode notify_acs_start / disconnect_backhaul does.
++     * The event is also forwarded to prplmesh and other subscribers via the AMX
++     * wpaCtrlEvents signal on the Radio object (see s_fwdRadioStdWpaCtrlEventsList).
++     * Event format: INTERFERENCE-DETECTED type=<WLAN|AWGN|CW|OBSS> freq=<MHz>
++     *               chan_width=<id> cf1=<MHz> cf2=<MHz> bitmap=0x<hex>
++     */
++    SAH_TRACEZ_ERROR(ME, "%s: Interference detected: %s", ifName, params);
++    T_Radio* pRad = (T_Radio*) userData;
++    ASSERT_NOT_NULL(pRad, , ME, "NULL");
++
++    /* Check if this is a WLAN/CW interference event that will trigger ACS */
++    char typeStr[32] = {0};
++    if(wld_wpaCtrl_getValueStr(params, "type", typeStr, sizeof(typeStr)) > 0 &&
++       (swl_str_matches(typeStr, "WLAN") || swl_str_matches(typeStr, "CW"))) {
++        /*
++         * Send DISCONNECT to ALL wpa_supplicant endpoints on ALL radios.
++         * DISCONNECT stops any ongoing scan and prevents wpa_supplicant from
++         * starting new scans (it waits for RECONNECT). This ensures acs_init()
++         * can request its scan without getting EBUSY from the kernel.
++         * RECONNECT will be sent in s_acsCompletedCb when ACS-COMPLETED is received.
++         */
++        T_Radio* pRadIter;
++        wld_for_eachRad(pRadIter) {
++            T_EndPoint* pEP = NULL;
++            wld_rad_forEachEp(pEP, pRadIter) {
++                if((pEP == NULL) || (pEP->wpaCtrlInterface == NULL)) {
++                    continue;
++                }
++                if(!wld_wpaCtrlInterface_isReady(pEP->wpaCtrlInterface)) {
++                    SAH_TRACEZ_WARNING(ME, "%s: wpa_supplicant interface not ready, skip DISCONNECT for %s interference",
++                                       pEP->Name, typeStr);
++                    continue;
++                }
++                SAH_TRACEZ_ERROR(ME, "%s: sending DISCONNECT to wpa_supplicant for %s interference (DCS-triggered ACS)",
++                                 pEP->Name, typeStr);
++                wld_wpaCtrl_sendCmdCheckResponse(pEP->wpaCtrlInterface, "DISCONNECT", "OK");
++            }
++        }
++    }
++}
++
++static void s_acsCompletedCb(void* userData, char* ifName _UNUSED, swl_chanspec_t* chanSpec) {
++    /*
++     * ACS-COMPLETED event: hostapd has finished automatic channel selection.
++     * Send RECONNECT to ALL wpa_supplicant endpoints on ALL radios so the backhaul
++     * STA can reconnect on the new channel. This pairs with the DISCONNECT sent in
++     * s_awgnInterferenceDetectedCb when WLAN/CW interference triggered ACS.
++     * All radios are reconnected because DISCONNECT was sent to all of them.
++     */
++    T_Radio* pRad = (T_Radio*) userData;
++    ASSERT_NOT_NULL(pRad, , ME, "NULL");
++    SAH_TRACEZ_ERROR(ME, "%s: ACS completed on channel=%d, sending RECONNECT to all wpa_supplicant endpoints",
++                     pRad->Name, chanSpec ? chanSpec->channel : 0);
++    T_Radio* pRadIter;
++    wld_for_eachRad(pRadIter) {
++        T_EndPoint* pEP = NULL;
++        wld_rad_forEachEp(pEP, pRadIter) {
++            if((pEP == NULL) || (pEP->wpaCtrlInterface == NULL)) {
++                continue;
++            }
++            if(!wld_wpaCtrlInterface_isReady(pEP->wpaCtrlInterface)) {
++                SAH_TRACEZ_WARNING(ME, "%s: wpa_supplicant interface not ready, skip RECONNECT after ACS",
++                                   pEP->Name);
++                continue;
++            }
++            SAH_TRACEZ_ERROR(ME, "%s: sending RECONNECT to wpa_supplicant after ACS completion (channel=%d)",
++                             pEP->Name, chanSpec ? chanSpec->channel : 0);
++            wld_wpaCtrl_sendCmdCheckResponse(pEP->wpaCtrlInterface, "RECONNECT", "OK");
++        }
++    }
++}
++
+ static void s_uplinkCsaTimeoutCb(void* userData, char* ifName _UNUSED, char* params _UNUSED) {
+     T_Radio* pRad = (T_Radio*) userData;
+     ASSERT_NOT_NULL(pRad, , ME, "NULL");
+@@ -615,6 +703,8 @@ static swl_rc_ne s_setWpaCtrlRadEvtHandl
+     SET_HDLR(wpaCtrlRadEvthandlers.fFetchSockLinkIface, s_fetchSockLinkIface);
+     SET_HDLR(wpaCtrlRadEvthandlers.fUplinkCsaCb, s_uplinkCsaCb);
+     SET_HDLR(wpaCtrlRadEvthandlers.fUplinkCsaTimeoutCb, s_uplinkCsaTimeoutCb);
++    SET_HDLR(wpaCtrlRadEvthandlers.fAwgnInterferenceDetectedCb, s_awgnInterferenceDetectedCb);
++    SET_HDLR(wpaCtrlRadEvthandlers.fAcsCompletedCb, s_acsCompletedCb);
+     wld_wpaCtrlMngr_setEvtHandlers(wpaCtrlMngr, pRad, &wpaCtrlRadEvthandlers);
+     return SWL_RC_OK;
+ }
+@@ -1666,4 +1756,3 @@ swl_rc_ne wifiGen_setEpEvtHandlers(T_End
+ 
+     return SWL_RC_OK;
+ }
+-
+--- a/src/nl80211/wld_wpaCtrl_events.c
++++ b/src/nl80211/wld_wpaCtrl_events.c
+@@ -541,6 +541,24 @@ static void s_uplinkCsaTimeoutEvtCb(wld_
+     CALL_MGR_I(pInterface, fUplinkCsaTimeoutCb, params);
+ }
+ 
++static void s_acsCompletedEvt(wld_wpaCtrlInterface_t* pInterface, char* event _UNUSED, char* params) {
++    // Example: ACS-COMPLETED freq=5180 channel=36
++    // Log the ACS-selected channel. The AP-ENABLED event that follows will
++    // trigger the radio state update and channel sync in pWHM.
++    swl_chanspec_t chanSpec = SWL_CHANSPEC_EMPTY;
++    if(s_freqParamToChanSpec(params, "freq", &chanSpec) >= SWL_RC_OK) {
++        SAH_TRACEZ_INFO(ME, "%s: ACS completed, selected channel=%d",
++                        pInterface->name, chanSpec.channel);
++    } else {
++        SAH_TRACEZ_INFO(ME, "%s: ACS completed (%s)", pInterface->name, params);
++    }
++    /* Use fChanSwitchCb to notify the radio layer of the ACS-selected channel,
++     * reusing the existing channel-change callback infrastructure. */
++    CALL_MGR_I(pInterface, fChanSwitchCb, &chanSpec);
++    /* Notify DCS handler so it can reconnect wpa_supplicant after ACS */
++    CALL_MGR_I(pInterface, fAcsCompletedCb, &chanSpec);
++}
++
+ static void s_apEnabledEvt(wld_wpaCtrlInterface_t* pInterface, char* event, char* params _UNUSED) {
+     // Example: AP-ENABLED
+     // This event notifies that hapd main interface has setup completed
+@@ -646,6 +664,13 @@ static void s_radDfsNewChannelEvt(wld_wp
+     CALL_MGR_I(pInterface, fDfsNewChannelCb, &chanSpec);
+ }
+ 
++static void s_awgnInterferenceDetectedEvt(wld_wpaCtrlInterface_t* pInterface, char* event, char* params) {
++    // Example: INTERFERENCE-DETECTED type=AWGN freq=6135 chan_width=5 cf1=6105 cf2=0 bitmap=0x01
++    // Example: INTERFERENCE-DETECTED type=WLAN freq=5805 chan_width=3 cf1=5775 cf2=0 bitmap=0x00000000
++    SAH_TRACEZ_ERROR(ME, "%s: pwhm received wpaCtrlEvent: %s %s", pInterface->name, event, params);
++    CALL_MGR_I(pInterface, fAwgnInterferenceDetectedCb, params);
++}
++
+ static void s_mgtFrameEvt(wld_wpaCtrlInterface_t* pInterface, char* event _UNUSED, char* params) {
+     // Example: <3>AP-MGMT-FRAME-RECEIVED buf=b0003c0000000000001012d4159a59e7000000000010a082000001000000
+     char data[swl_str_len(params) + 1];
+@@ -878,6 +903,7 @@ SWL_TABLE(sWpaCtrlEvents,
+               {"CTRL-EVENT-CHANNEL-SWITCH", &s_chanSwitchEvtCb},
+               {"AP-CSA-FINISHED", &s_apCsaFinishedEvtCb},
+               {"AP-MGMT-FRAME-RECEIVED", &s_mgtFrameEvt},
++              {"ACS-COMPLETED", &s_acsCompletedEvt},
+               {"AP-ENABLED", &s_apEnabledEvt},
+               {"AP-DISABLED", &s_apDisabledEvt},
+               {"INTERFACE-ENABLED", &s_apIfaceEnabledEvt},
+@@ -903,6 +929,7 @@ SWL_TABLE(sWpaCtrlEvents,
+               {"BEACON-RESP-RX", &s_beaconResponseEvt},
+ 	      {"DFS-UPLINK-CSA", &s_uplinkCsaEvtCb},
+ 	      {"DFS-UPLINK-CSA-TIMEOUT", &s_uplinkCsaTimeoutEvtCb},
++              {"INTERFERENCE-DETECTED", &s_awgnInterferenceDetectedEvt},
+               ));
+ 
+ static evtParser_f s_getEventParser(char* eventName) {
