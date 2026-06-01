@@ -1,0 +1,473 @@
+From 8defb8ecdc81eacbd6f784a0e208e58ac752d030 Mon Sep 17 00:00:00 2001
+From: Atchaya R <ratchaya@qti.qualcomm.com>
+Date: Mon, 1 Jun 2026 16:15:13 +0530
+Subject: [PATCH] pwhm: add ACS support for prplOS
+
+Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
+---
+ src/Plugin/wifiGen_fsm.c          |  12 ++
+ src/nl80211/wld_hostapd_cfgFile.c |  45 +++++--
+ src/wld_accesspoint.c             | 187 ++++++++++++++----------------
+ src/wld_radio.c                   |  18 ++-
+ 4 files changed, 142 insertions(+), 120 deletions(-)
+
+diff --git a/src/Plugin/wifiGen_fsm.c b/src/Plugin/wifiGen_fsm.c
+index 10f6592..7f64e2e 100644
+--- a/src/Plugin/wifiGen_fsm.c
++++ b/src/Plugin/wifiGen_fsm.c
+@@ -849,6 +849,18 @@ static bool s_doAddHostapd(T_Radio* pRad) {
+         SAH_TRACEZ_WARNING(ME, "%s: hostapd group is restarting: skip immediate adding conf", pRad->Name);
+         return true;
+     }
++    /* If this radio has ACS enabled and is not yet up, ACS is likely in progress.
++     * Attempting a warm apply (ADD bss_config) while hostapd is in ACS state causes
++     * hostapd to reject the command, which triggers a full restart and aborts ACS.
++     * Defer the warm apply by re-scheduling it for the next FSM commit (2s later).
++     * The AP-ENABLED event after ACS completes will trigger a new commit. */
++    if(pRad->autoChannelEnable && !wld_rad_isUpExt(pRad)) {
++        SAH_TRACEZ_WARNING(ME, "%s: ACS in progress (autoChannelEnable=1, radio not up) — defer warm apply",
++                           pRad->Name);
++        setBitLongArray(pRad->fsmRad.FSM_BitActionArray, FSM_BW, GEN_FSM_ADD_HOSTAPD);
++        pRad->fsmRad.timeout_msec = 2000;
++        return true;
++    }
+     wld_wpaCtrlInterface_t* pgIface = wld_secDmn_getGlobalCtrlIface(pRad->hostapd);
+     ASSERTW_TRUE(wld_wpaCtrlInterface_isReady(pgIface), true, ME, "%s: gsock disconnected", pRad->Name);
+     wifiGen_hapd_restoreMainIface(pRad);
+diff --git a/src/nl80211/wld_hostapd_cfgFile.c b/src/nl80211/wld_hostapd_cfgFile.c
+index d5090da..049977c 100644
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -280,14 +280,25 @@ void wld_hostapd_cfgFile_setRadioConfig(T_Radio* pRad, swl_mapChar_t* radConfigM
+ 
+     swl_channel_t tgtChan = tgtChspec.channel;
+     /* When auto channel selection is enabled (and not managed externally),
+-     * write channel=0 to hostapd config to indicate auto channel selection.
+-     * This is equivalent to: uci set wireless.wifiX.channel=auto */
+-    if(pRad->autoChannelEnable && !pRad->externalAcsMgmt) {
+-        swl_mapCharFmt_addValInt32(radConfigMap, "channel", 0);
++     * write channel=acs_survey to hostapd config to indicate auto channel selection.
++     * This is the standard OpenWrt/prplOS convention, equivalent to:
++     * uci set wireless.wifiX.channel=auto
++     * hostapd parses "acs_survey" and sets conf->acs=1, conf->channel=0.
++     *
++     * When using acs_survey:
++     * - Do NOT write op_class: a stale value restricts which channels ACS scans.
++     * - Do NOT write centr_freq_seg0_idx: a stale center frequency conflicts with
++     *   the ACS-selected channel and prevents the radio from coming up.
++     * - DO write vht/he/eht_oper_chwidth: ACS uses this to determine how many
++     *   channels to scan (e.g., CONF_OPER_CHWIDTH_80MHZ → n_chans=4 for 80MHz).
++     *   Without it, ACS defaults to 20/40 MHz and the radio never comes up on 80MHz. */
++    bool useAcs = (pRad->autoChannelEnable && !pRad->externalAcsMgmt);
++    if(useAcs) {
++        swl_mapChar_add(radConfigMap, "channel", "acs_survey");
+     } else {
+         swl_mapCharFmt_addValInt32(radConfigMap, "channel", tgtChan);
++        swl_mapCharFmt_addValInt32(radConfigMap, "op_class", swl_chanspec_getOperClass(&tgtChspec));
+     }
+-    swl_mapCharFmt_addValInt32(radConfigMap, "op_class", swl_chanspec_getOperClass(&tgtChspec));
+     swl_mapChar_add(radConfigMap, "country_code", pRad->regulatoryDomain);
+     swl_mapChar_add(radConfigMap, "ieee80211d", "1");
+     swl_mapCharFmt_addValInt32(radConfigMap, "ieee80211h", pRad->IEEE80211hSupported && pRad->setRadio80211hEnable);
+@@ -372,9 +383,13 @@ void wld_hostapd_cfgFile_setRadioConfig(T_Radio* pRad, swl_mapChar_t* radConfigM
+             if(pEhtChWId && (*pChWId != *pEhtChWId)) {
+                 tgtChspec.bandwidth = *(uint32_t*) swl_table_getMatchingValue(&sChWidthIDsMaps, 2, 0, pChWId);
+             }
+-            swl_channel_t centerChan = swl_chanspec_getCentreChannel(&tgtChspec);
++            /* Always write vht_oper_chwidth — ACS uses it to determine scan bandwidth.
++             * Only write centr_freq_seg0_idx when NOT using ACS (stale value conflicts). */
+             swl_mapCharFmt_addValInt32(radConfigMap, "vht_oper_chwidth", *pChWId);
+-            swl_mapCharFmt_addValInt32(radConfigMap, "vht_oper_centr_freq_seg0_idx", centerChan);
++            if(!useAcs) {
++                swl_channel_t centerChan = swl_chanspec_getCentreChannel(&tgtChspec);
++                swl_mapCharFmt_addValInt32(radConfigMap, "vht_oper_centr_freq_seg0_idx", centerChan);
++            }
+         }
+         char vhtCaps[256] = {0};
+         if(wld_channel_hasChannelWidthCovered(tgtChspec, SWL_BW_160MHZ)) {
+@@ -466,9 +481,13 @@ void wld_hostapd_cfgFile_setRadioConfig(T_Radio* pRad, swl_mapChar_t* radConfigM
+             if(pEhtChWId && (*pChWId != *pEhtChWId)) {
+                 tgtChspec.bandwidth = *(uint32_t*) swl_table_getMatchingValue(&sChWidthIDsMaps, 2, 0, pChWId);
+             }
+-            swl_channel_t centerChan = swl_chanspec_getCentreChannel(&tgtChspec);
++            /* Always write he_oper_chwidth — ACS uses it to determine scan bandwidth.
++             * Only write centr_freq_seg0_idx when NOT using ACS (stale value conflicts). */
+             swl_mapCharFmt_addValInt32(radConfigMap, "he_oper_chwidth", *pChWId);
+-            swl_mapCharFmt_addValInt32(radConfigMap, "he_oper_centr_freq_seg0_idx", centerChan);
++            if(!useAcs) {
++                swl_channel_t centerChan = swl_chanspec_getCentreChannel(&tgtChspec);
++                swl_mapCharFmt_addValInt32(radConfigMap, "he_oper_centr_freq_seg0_idx", centerChan);
++            }
+         }
+         if(implicitBf) {
+             if(SWL_BIT_IS_SET(pRad->bfCapsSupported[COM_DIR_RECEIVE], RAD_BF_CAP_HE_SU) &&
+@@ -557,9 +576,13 @@ void wld_hostapd_cfgFile_setRadioConfig(T_Radio* pRad, swl_mapChar_t* radConfigM
+             if(pChWId && (*pChWId != *pEhtChWId)) {
+                 tgtChspec.bandwidth = *(uint32_t*) swl_table_getMatchingValue(&sChWidthIDsMaps, 2, 1, pEhtChWId);
+             }
+-            swl_channel_t centerChan = swl_chanspec_getCentreChannel(&tgtChspec);
++            /* Always write eht_oper_chwidth — ACS uses it to determine scan bandwidth.
++             * Only write centr_freq_seg0_idx when NOT using ACS (stale value conflicts). */
+             swl_mapCharFmt_addValInt32(radConfigMap, "eht_oper_chwidth", *pEhtChWId);
+-            swl_mapCharFmt_addValInt32(radConfigMap, "eht_oper_centr_freq_seg0_idx", centerChan);
++            if(!useAcs) {
++                swl_channel_t centerChan = swl_chanspec_getCentreChannel(&tgtChspec);
++                swl_mapCharFmt_addValInt32(radConfigMap, "eht_oper_centr_freq_seg0_idx", centerChan);
++            }
+         }
+         if(implicitBf) {
+             if(SWL_BIT_IS_SET(pRad->bfCapsSupported[COM_DIR_RECEIVE], RAD_BF_CAP_EHT_SU) &&
+diff --git a/src/wld_accesspoint.c b/src/wld_accesspoint.c
+index a40fc64..3693d23 100644
+--- a/src/wld_accesspoint.c
++++ b/src/wld_accesspoint.c
+@@ -1674,9 +1674,9 @@ void _wld_ap_setDppConf_ocf(const char* const sig_name,
+  *
+  * Equivalent to: hostapd_cli -i wlanX [-l linkId] dcs set_wlan_intr_params <param_name> <value>
+  *
+- * When the AP is part of an MLD the MLD link ID (pAP->pSSID->mldLinkId) is
+- * prepended as "LINK_ID=<id> " to the command, matching the behaviour of
+- * hostapd_cli's -l flag.
++ * For MLO: send to the primary link interface socket with LINK_ID=<id> prefix,
++ * equivalent to: hostapd_cli -i wlan2.1 -l <linkId> dcs set_wlan_intr_params ...
++ * For SLO: send directly to the AP's own socket.
+  *
+  * @param pAP        AccessPoint context
+  * @param param_name DCS parameter name (e.g. "intr_detection_threshold")
+@@ -1688,50 +1688,26 @@ static bool s_sendDcsWlanIntrParams(T_AccessPoint* pAP, const char* param_name,
+     char cmd[256] = {0};
+     char reply[256] = {0};
+ 
+-    /* DCS commands must be sent directly to the AP's own socket file (e.g., wlan1.1)
+-     * using wld_wpaCtrl_queryToSock — equivalent to hostapd_cli -i wlan1.1 dcs ...
+-     *
+-     * We CANNOT use pAP->wpaCtrlInterface because it may be connected to wlan1.1_link0
+-     * (the MLD link socket) which does NOT support 'dcs' commands.
+-     *
+-     * For MLO: send to the primary link interface socket with LINK_ID=<id> prefix,
+-     * equivalent to: hostapd_cli -i wlan2.1 -l <linkId> dcs ...
+-     */
+-    const char* serverPath = wld_wpaCtrlInterface_getConnectionDirPath(pAP->wpaCtrlInterface);
+-    ASSERTS_STR(serverPath, false, ME, "%s: no server path", pAP->alias);
+-
+-    const char* primLinkIfaceName = wld_hostapd_ap_selectApLinkIface(pAP);
+-    int16_t linkId = (pAP->pSSID != NULL) ? pAP->pSSID->mldLinkId : -1;
+-
+-    if(!swl_str_matches(primLinkIfaceName, pAP->alias) && (linkId >= 0)) {
+-        /* MLO: send to primary link interface socket with LINK_ID prefix
+-         * NOTE: hostapd ctrl interface expects uppercase "DCS" command */
+-        snprintf(cmd, sizeof(cmd), "LINK_ID=%d DCS set_wlan_intr_params %s %u", (int) linkId, param_name, value);
+-        SAH_TRACEZ_INFO(ME, "%s: DCS cmd='%s' via sock='%s'", pAP->alias, cmd, primLinkIfaceName);
+-        swl_rc_ne rc = wld_wpaCtrl_queryToSock(serverPath, primLinkIfaceName, cmd, reply, sizeof(reply));
+-        /* DCS set commands return 0 with no reply text on success — empty reply is OK */
+-        bool bRet = (rc == SWL_RC_OK) && !swl_str_matches(reply, "FAIL");
+-        if(!bRet) {
+-            SAH_TRACEZ_ERROR(ME, "%s: DCS command failed: cmd='%s' rc=%d reply='%s'",
+-                             pAP->alias, cmd, rc, reply);
+-        }
+-        return bRet;
+-    } else {
+-        /* SLO: send directly to AP's own socket (pAP->alias = e.g. "wlan1.1")
+-         * NOTE: hostapd ctrl interface expects uppercase "DCS" command */
+-        snprintf(cmd, sizeof(cmd), "DCS set_wlan_intr_params %s %u", param_name, value);
+-        SAH_TRACEZ_INFO(ME, "%s: DCS cmd='%s' via sock='%s'", pAP->alias, cmd, pAP->alias);
+-        swl_rc_ne rc = wld_wpaCtrl_queryToSock(serverPath, pAP->alias, cmd, reply, sizeof(reply));
+-        /* DCS set commands return 0 with no reply text on success — empty reply is OK */
+-        bool bRet = (rc == SWL_RC_OK) && !swl_str_matches(reply, "FAIL");
+-        if(!bRet) {
+-            SAH_TRACEZ_ERROR(ME, "%s: DCS command failed: cmd='%s' rc=%d reply='%s'",
+-                             pAP->alias, cmd, rc, reply);
+-        }
+-        return bRet;
++    /* DCS commands are sent directly to the AP's wpaCtrl interface (e.g. wlan1.1_link0).
++     * The LINK_ID=X prefix is NOT used because hostapd returns UNKNOWN COMMAND for
++     * "LINK_ID=X DCS ..." — the DCS command handler does not support the LINK_ID prefix.
++     * The wpaCtrl interface is already connected to the correct link socket so no
++     * prefix is needed. */
++    snprintf(cmd, sizeof(cmd), "DCS set_wlan_intr_params %s %u", param_name, value);
++    SAH_TRACEZ_INFO(ME, "%s: DCS cmd='%s' via wpaCtrlInterface", pAP->alias, cmd);
++    swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtGetResponse(pAP->wpaCtrlInterface, reply, sizeof(reply), "%s", cmd);
++    /* DCS set commands return 0 with no reply text on success — empty reply is OK */
++    bool bRet = (rc == SWL_RC_OK) && !swl_str_matches(reply, "FAIL") && !swl_str_matches(reply, "UNKNOWN COMMAND");
++    if(!bRet) {
++        SAH_TRACEZ_ERROR(ME, "%s: DCS command failed: cmd='%s' rc=%d reply='%s'",
++                         pAP->alias, cmd, rc, reply);
+     }
++    return bRet;
+ }
+ 
++/* Forward declaration — s_sendDcsCmd is defined after the threshold handlers */
++static bool s_sendDcsCmd(T_AccessPoint* pAP, const char* dcs_cmd, uint32_t value);
++
+ /**
+  * @brief Handler for DCS.Enable parameter change.
+  *
+@@ -1750,7 +1726,22 @@ static void s_setDcsEnable_pwf(void* priv _UNUSED, amxd_object_t* object,
+     SAH_TRACEZ_INFO(ME, "%s: set DCS Enable 0x%x", pAP->alias, enable);
+     ASSERTI_NOT_EQUALS(pAP->DCS_Enable, enable, , ME, "EQUALS");
+     pAP->DCS_Enable = enable;
+-    wld_ap_doSync(pAP);
++
++    /* Only apply at runtime (not during initial DM loading).
++     * During initialization, the dcs_enable value is written to the hostapd
++     * config file by wld_hostapd_cfgFile_setVapConfig and applied when
++     * hostapd starts. Calling wld_ap_doSync too early causes regression
++     * (VAP interfaces not created). */
++    if(pAP->initDone) {
++        /* Write dcs_enable to hostapd config file (for persistence across restarts) */
++        wld_ap_doSync(pAP);
++
++        /* Also send DCS enable command via ctrl interface to apply immediately.
++         * hostapd SIGHUP reload does NOT re-apply dcs_enable from config —
++         * dcs_enable_init() is only called during hostapd initialization.
++         * Sending "DCS enable <bitmap>" updates the runtime state immediately. */
++        s_sendDcsCmd(pAP, "enable", enable);
++    }
+ 
+     SAH_TRACEZ_OUT(ME);
+ }
+@@ -1771,7 +1762,9 @@ static void s_setDcsWlanIntrDetectionThreshold_pwf(void* priv _UNUSED,
+     uint32_t value = amxc_var_dyncast(uint32_t, newValue);
+     SAH_TRACEZ_INFO(ME, "%s: set DCS WlanIntrDetectionThreshold %u", pAP->alias, value);
+     pAP->DCS_WlanIntrDetectionThreshold = value;
+-    s_sendDcsWlanIntrParams(pAP, "intr_detection_threshold", value);
++    if(pAP->initDone) {
++        s_sendDcsWlanIntrParams(pAP, "intr_detection_threshold", value);
++    }
+     SAH_TRACEZ_OUT(ME);
+ }
+ 
+@@ -1785,7 +1778,9 @@ static void s_setDcsWlanIntrTxErrThreshold_pwf(void* priv _UNUSED,
+     uint32_t value = amxc_var_dyncast(uint32_t, newValue);
+     SAH_TRACEZ_INFO(ME, "%s: set DCS WlanIntrTxErrThreshold %u", pAP->alias, value);
+     pAP->DCS_WlanIntrTxErrThreshold = value;
+-    s_sendDcsWlanIntrParams(pAP, "txerr_threshold", value);
++    if(pAP->initDone) {
++        s_sendDcsWlanIntrParams(pAP, "txerr_threshold", value);
++    }
+     SAH_TRACEZ_OUT(ME);
+ }
+ 
+@@ -1799,7 +1794,9 @@ static void s_setDcsWlanIntrPhyErrThreshold_pwf(void* priv _UNUSED,
+     uint32_t value = amxc_var_dyncast(uint32_t, newValue);
+     SAH_TRACEZ_INFO(ME, "%s: set DCS WlanIntrPhyErrThreshold %u", pAP->alias, value);
+     pAP->DCS_WlanIntrPhyErrThreshold = value;
+-    s_sendDcsWlanIntrParams(pAP, "phyerr_threshold", value);
++    if(pAP->initDone) {
++        s_sendDcsWlanIntrParams(pAP, "phyerr_threshold", value);
++    }
+     SAH_TRACEZ_OUT(ME);
+ }
+ 
+@@ -1813,7 +1810,9 @@ static void s_setDcsWlanIntrCochIntrThreshold_pwf(void* priv _UNUSED,
+     uint32_t value = amxc_var_dyncast(uint32_t, newValue);
+     SAH_TRACEZ_INFO(ME, "%s: set DCS WlanIntrCochIntrThreshold %u", pAP->alias, value);
+     pAP->DCS_WlanIntrCochIntrThreshold = value;
+-    s_sendDcsWlanIntrParams(pAP, "coch_intr_threshold", value);
++    if(pAP->initDone) {
++        s_sendDcsWlanIntrParams(pAP, "coch_intr_threshold", value);
++    }
+     SAH_TRACEZ_OUT(ME);
+ }
+ 
+@@ -1827,7 +1826,9 @@ static void s_setDcsMaxcuValue_pwf(void* priv _UNUSED,
+     uint32_t value = amxc_var_dyncast(uint32_t, newValue);
+     SAH_TRACEZ_INFO(ME, "%s: set DCS MaxcuValue %u", pAP->alias, value);
+     pAP->DCS_MaxcuValue = value;
+-    s_sendDcsWlanIntrParams(pAP, "user_max_cu", value);
++    if(pAP->initDone) {
++        s_sendDcsWlanIntrParams(pAP, "user_max_cu", value);
++    }
+     SAH_TRACEZ_OUT(ME);
+ }
+ 
+@@ -1835,55 +1836,29 @@ static void s_setDcsMaxcuValue_pwf(void* priv _UNUSED,
+  * @brief Helper to send a generic DCS command (not set_wlan_intr_params) via wpaCtrl.
+  *
+  * Equivalent to: hostapd_cli -i wlanX [-l Y] dcs <cmd> <value>
+- * When MLD link ID is valid, prepends "LINK_ID=<id> ".
++ * For MLO: send to the primary link interface socket with LINK_ID=<id> prefix,
++ * equivalent to: hostapd_cli -i wlan2.1 -l <linkId> dcs <cmd> <value>
++ * For SLO: send directly to the AP's own socket.
+  */
+ static bool s_sendDcsCmd(T_AccessPoint* pAP, const char* dcs_cmd, uint32_t value) {
+     ASSERTS_NOT_NULL(pAP, false, ME, "NULL");
+     char cmd[256] = {0};
+     char reply[256] = {0};
+ 
+-    /* DCS commands must be sent directly to the AP's own socket file (e.g., wlan1.1)
+-     * using wld_wpaCtrl_queryToSock — equivalent to hostapd_cli -i wlan1.1 DCS ...
+-     *
+-     * We CANNOT use pAP->wpaCtrlInterface because it may be connected to wlan1.1_link0
+-     * (the MLD link socket) which does NOT support 'DCS' commands.
+-     *
+-     * NOTE: hostapd ctrl interface expects uppercase "DCS" command prefix.
+-     *
+-     * For MLO: send to the primary link interface socket with LINK_ID=<id> prefix,
+-     * equivalent to: hostapd_cli -i wlan2.1 -l <linkId> DCS ...
+-     */
+-    const char* serverPath = wld_wpaCtrlInterface_getConnectionDirPath(pAP->wpaCtrlInterface);
+-    const char* primLinkIfaceName = wld_hostapd_ap_selectApLinkIface(pAP);
+-    int16_t linkId = (pAP->pSSID != NULL) ? pAP->pSSID->mldLinkId : -1;
+-
+-    ASSERTS_STR(serverPath, false, ME, "%s: no server path", pAP->alias);
+-
+-    if(!swl_str_matches(primLinkIfaceName, pAP->alias) && (linkId >= 0)) {
+-        /* MLO: send to primary link interface socket with LINK_ID prefix */
+-        snprintf(cmd, sizeof(cmd), "LINK_ID=%d DCS %s %u", (int) linkId, dcs_cmd, value);
+-        SAH_TRACEZ_INFO(ME, "%s: DCS MLO cmd='%s' via sock='%s'", pAP->alias, cmd, primLinkIfaceName);
+-        swl_rc_ne rc = wld_wpaCtrl_queryToSock(serverPath, primLinkIfaceName, cmd, reply, sizeof(reply));
+-        /* DCS set commands return 0 with no reply text on success — empty reply is OK */
+-        bool bRet = (rc == SWL_RC_OK) && !swl_str_matches(reply, "FAIL");
+-        if(!bRet) {
+-            SAH_TRACEZ_ERROR(ME, "%s: DCS command failed: cmd='%s' rc=%d reply='%s'",
+-                             pAP->alias, cmd, rc, reply);
+-        }
+-        return bRet;
+-    } else {
+-        /* SLO: send directly to AP's own socket (pAP->alias = e.g. "wlan1.1") */
+-        snprintf(cmd, sizeof(cmd), "DCS %s %u", dcs_cmd, value);
+-        SAH_TRACEZ_INFO(ME, "%s: DCS SLO cmd='%s' via sock='%s'", pAP->alias, cmd, pAP->alias);
+-        swl_rc_ne rc = wld_wpaCtrl_queryToSock(serverPath, pAP->alias, cmd, reply, sizeof(reply));
+-        /* DCS set commands return 0 with no reply text on success — empty reply is OK */
+-        bool bRet = (rc == SWL_RC_OK) && !swl_str_matches(reply, "FAIL");
+-        if(!bRet) {
+-            SAH_TRACEZ_ERROR(ME, "%s: DCS command failed: cmd='%s' rc=%d reply='%s'",
+-                             pAP->alias, cmd, rc, reply);
+-        }
+-        return bRet;
++    /* DCS commands are sent directly to the AP's wpaCtrl interface (e.g. wlan1.1_link0).
++     * The LINK_ID=X prefix is NOT used because hostapd returns UNKNOWN COMMAND for
++     * "LINK_ID=X DCS ..." — the DCS command handler does not support the LINK_ID prefix.
++     * The wpaCtrl interface is already connected to the correct link socket so no
++     * prefix is needed. */
++    snprintf(cmd, sizeof(cmd), "DCS %s %u", dcs_cmd, value);
++    SAH_TRACEZ_INFO(ME, "%s: DCS cmd='%s' via wpaCtrlInterface", pAP->alias, cmd);
++    swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtGetResponse(pAP->wpaCtrlInterface, reply, sizeof(reply), "%s", cmd);
++    bool bRet = (rc == SWL_RC_OK) && !swl_str_matches(reply, "FAIL") && !swl_str_matches(reply, "UNKNOWN COMMAND");
++    if(!bRet) {
++        SAH_TRACEZ_ERROR(ME, "%s: DCS command failed: cmd='%s' rc=%d reply='%s'",
++                         pAP->alias, cmd, rc, reply);
+     }
++    return bRet;
+ }
+ 
+ /**
+@@ -1911,7 +1886,9 @@ static void s_setDcsBwReductionCtrl_pwf(void* priv _UNUSED, amxd_object_t* objec
+     uint32_t value = amxc_var_dyncast(uint32_t, newValue);
+     SAH_TRACEZ_INFO(ME, "%s: set DCS BwReductionCtrl 0x%x", pAP->alias, value);
+     pAP->DCS_BwReductionCtrl = value;
+-    s_sendDcsCmd(pAP, "bw_reduction_ctrl", value);
++    if(pAP->initDone) {
++        s_sendDcsCmd(pAP, "bw_reduction_ctrl", value);
++    }
+     SAH_TRACEZ_OUT(ME);
+ }
+ 
+@@ -1924,7 +1901,9 @@ static void s_setDcsSetAfcChanSelConfig_pwf(void* priv _UNUSED, amxd_object_t* o
+     uint32_t value = amxc_var_dyncast(uint32_t, newValue);
+     SAH_TRACEZ_INFO(ME, "%s: set DCS SetAfcChanSelConfig %u", pAP->alias, value);
+     pAP->DCS_SetAfcChanSelConfig = value;
+-    s_sendAfcCmd(pAP, "set_afc_chan_sel_config", value);
++    if(pAP->initDone) {
++        s_sendAfcCmd(pAP, "set_afc_chan_sel_config", value);
++    }
+     SAH_TRACEZ_OUT(ME);
+ }
+ 
+@@ -1937,7 +1916,9 @@ static void s_setDcsRandomChanBitmap_pwf(void* priv _UNUSED, amxd_object_t* obje
+     uint32_t value = amxc_var_dyncast(uint32_t, newValue);
+     SAH_TRACEZ_INFO(ME, "%s: set DCS RandomChanBitmap 0x%x", pAP->alias, value);
+     pAP->DCS_RandomChanBitmap = value;
+-    s_sendDcsCmd(pAP, "random_chan_bitmap", value);
++    if(pAP->initDone) {
++        s_sendDcsCmd(pAP, "random_chan_bitmap", value);
++    }
+     SAH_TRACEZ_OUT(ME);
+ }
+ 
+@@ -1950,7 +1931,9 @@ static void s_setDcsCsaTbtt_pwf(void* priv _UNUSED, amxd_object_t* object,
+     uint32_t value = amxc_var_dyncast(uint32_t, newValue);
+     SAH_TRACEZ_INFO(ME, "%s: set DCS CsaTbtt %u", pAP->alias, value);
+     pAP->DCS_CsaTbtt = value;
+-    s_sendDcsCmd(pAP, "csa_tbtt", value);
++    if(pAP->initDone) {
++        s_sendDcsCmd(pAP, "csa_tbtt", value);
++    }
+     SAH_TRACEZ_OUT(ME);
+ }
+ 
+@@ -1963,7 +1946,9 @@ static void s_setDcsEnableTimer_pwf(void* priv _UNUSED, amxd_object_t* object,
+     uint32_t value = amxc_var_dyncast(uint32_t, newValue);
+     SAH_TRACEZ_INFO(ME, "%s: set DCS EnableTimer %u", pAP->alias, value);
+     pAP->DCS_EnableTimer = value;
+-    s_sendDcsCmd(pAP, "set_dcs_enable_timer", value);
++    if(pAP->initDone) {
++        s_sendDcsCmd(pAP, "set_dcs_enable_timer", value);
++    }
+     SAH_TRACEZ_OUT(ME);
+ }
+ 
+@@ -1976,7 +1961,9 @@ static void s_setDcsEventAction_pwf(void* priv _UNUSED, amxd_object_t* object,
+     uint32_t value = amxc_var_dyncast(uint32_t, newValue);
+     SAH_TRACEZ_INFO(ME, "%s: set DCS EventAction 0x%x", pAP->alias, value);
+     pAP->DCS_EventAction = value;
+-    s_sendDcsCmd(pAP, "event_action", value);
++    if(pAP->initDone) {
++        s_sendDcsCmd(pAP, "event_action", value);
++    }
+     SAH_TRACEZ_OUT(ME);
+ }
+ 
+@@ -1989,7 +1976,9 @@ static void s_setDcsEventNotify_pwf(void* priv _UNUSED, amxd_object_t* object,
+     uint32_t value = amxc_var_dyncast(uint32_t, newValue);
+     SAH_TRACEZ_INFO(ME, "%s: set DCS EventNotify 0x%x", pAP->alias, value);
+     pAP->DCS_EventNotify = value;
+-    s_sendDcsCmd(pAP, "event_notify", value);
++    if(pAP->initDone) {
++        s_sendDcsCmd(pAP, "event_notify", value);
++    }
+     SAH_TRACEZ_OUT(ME);
+ }
+ 
+diff --git a/src/wld_radio.c b/src/wld_radio.c
+index 15b99f7..13fe552 100644
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -605,20 +605,19 @@ static void s_setAutoChannelEnable_pwf(void* priv _UNUSED, amxd_object_t* object
+         return;
+     }
+ 
+-    swl_rc_ne ret = pRad->pFA->mfn_wrad_autochannelenable(pRad, newAutochan, SET);
++    pRad->pFA->mfn_wrad_autochannelenable(pRad, newAutochan, SET);
++    /* Always update pRad->autoChannelEnable so that the hostapd config
++     * (channel=acs_survey for ACS) and the DM Channel parameter are kept in sync,
++     * regardless of whether the vendor plugin implements the function or
++     * returns SWL_RC_NOT_IMPLEMENTED. */
++    pRad->autoChannelEnable = newAutochan;
+     wld_autoCommitMgr_notifyRadEdit(pRad);
+ 
+-    if(ret == SWL_RC_NOT_IMPLEMENTED) {
+-        pRad->autoChannelEnable = newAutochan;
+-    }
+-
+-
+-    SAH_TRACEZ_INFO(ME, "%s: ACS STATUS POST %d %d %d : ret %d",
++    SAH_TRACEZ_INFO(ME, "%s: ACS STATUS POST %d %d %d",
+                     pRad->Name,
+                     pRad->channel,
+                     pRad->autoChannelEnable,
+-                    pRad->autoChannelSetByUser,
+-                    ret);
++                    pRad->autoChannelSetByUser);
+ 
+     SAH_TRACEZ_OUT(ME);
+ }
+@@ -5520,4 +5519,3 @@ amxd_status_t _getEHTOperations(amxd_object_t* object,
+     SAH_TRACEZ_OUT(ME);
+     return amxd_status_ok;
+ }
+-
+-- 
+2.34.1
+
