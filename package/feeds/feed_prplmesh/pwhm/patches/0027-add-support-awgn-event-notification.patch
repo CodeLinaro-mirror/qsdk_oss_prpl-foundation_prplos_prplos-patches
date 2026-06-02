@@ -9,7 +9,12 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
  include/wld/wld_wpaCtrl_events.h   |  2 ++
  src/Plugin/wifiGen_eventHandlers.c | 18 ++++++++++++++++--
  src/nl80211/wld_wpaCtrl_events.c   |  7 +++++++
- 3 files changed, 25 insertions(+), 2 deletions(-)
+ include/wld/wld.h                  |  1 +
+ odl/wld_radio.odl                  | 11 +++++++++++
+ src/nl80211/wld_hostapd_cfgFile.c  | 11 +++++++++++
+ src/wld_radio.c                    | 17 ++++++++++++++---
+
+ 7 files changed, 62 insertions(+), 5 deletions(-)
 
 --- a/include/wld/wld_wpaCtrl_events.h
 +++ b/include/wld/wld_wpaCtrl_events.h
@@ -208,3 +213,93 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
                ));
  
  static evtParser_f s_getEventParser(char* eventName) {
+--- a/include/wld/wld.h
++++ b/include/wld/wld.h
+@@ -1736,6 +1736,7 @@ struct WLD_RADIO {
+     amxp_timer_t* setMaxNumStaTimer;                        /* Timer used to delay the setMaxNumStation task */
+     swl_channel_t disabledSubchannels[SWL_BW_CHANNELS_MAX]; /* Disabled Subchannel list, for 11be static channel puncturing */
+     uint32_t nrDisabledSubChannels;                         /* Nr of disabled sub channels */
++    bool discardAwgnEvent;                                  /* When true, add discard_6g_awgn_event=1 to hostapd config (6GHz only) */
+ };
+ 
+ typedef struct {
+--- a/odl/wld_radio.odl
++++ b/odl/wld_radio.odl
+@@ -3311,6 +3311,17 @@ define probelist_t{
+ 		%read-only string ChipsetVendor;
+ 
+ 		/**
++		 * When set to 1 for a 6GHz radio, instructs hostapd to discard AWGN
++		 * events (discard_6g_awgn_event) to prevent ath12k driver crashes
++		 * during AWGN simulation in prplOS (which does not use ucode).
++		 * Valid values: 0 = disabled (default), 1 = enabled (6GHz only)
++		 */
++		%persistent uint32 DiscardAwgnEvent {
++			on action validate call check_range { min = 0, max = 1 };
++			default 0;
++		}
++
++		/**
+ 		 * Static puncturing feature
+ 		 */
+ 		%persistent object StaticPuncturing{
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -627,6 +627,17 @@ void wld_hostapd_cfgFile_setRadioConfig(
+ 
+     pRad->pFA->mfn_wrad_updateConfigMap(pRad, radConfigMap);
+ 
++    /*
++     * discard_6g_awgn_event: prplOS-specific workaround to prevent ath12k driver
++     * crashes when an AWGN event is simulated on a 6GHz radio.
++     * OpenWrt handles this via ucode; in prplOS we add it directly to the hostapd
++     * config when WiFi.Radio.{i}.DiscardAwgnEvent is set to 1 on a 6GHz radio.
++     */
++    if(pRad->operatingFrequencyBand == SWL_FREQ_BAND_EXT_6GHZ && pRad->discardAwgnEvent) {
++        SAH_TRACEZ_INFO(ME, "%s: Adding discard_6g_awgn_event=1 to hostapd config", pRad->Name);
++        swl_mapCharFmt_addValInt32(radConfigMap, "discard_6g_awgn_event", 1);
++    }
++
+     if(!configMbssid) {
+         const char* mbssidKeys[] = {"mbssid", "ema"};
+         s_filterEntries(radConfigMap, mbssidKeys, SWL_ARRAY_SIZE(mbssidKeys));
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -5025,6 +5025,19 @@ amxd_status_t _Radio_debug(amxd_object_t
+     return amxd_status_ok;
+ }
+ 
++static void s_setDiscardAwgnEvent_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_Radio* pRad = wld_rad_fromObj(object);
++    ASSERTS_NOT_NULL(pRad, , ME, "NULL");
++    uint32_t val = amxc_var_dyncast(uint32_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set DiscardAwgnEvent %u", pRad->Name, val);
++    pRad->discardAwgnEvent = (val != 0);
++    wld_rad_doSync(pRad);
++
++    SAH_TRACEZ_OUT(ME);
++}
++
+ SWLA_DM_HDLRS(sRadioDmHdlrs,
+               ARR(SWLA_DM_PARAM_HDLR("RegulatoryDomain", s_setCountryCode_pwf),
+                   SWLA_DM_PARAM_HDLR("IEEE80211hEnabled", s_set80211hEnable_pwf),
+@@ -5074,6 +5087,7 @@ SWLA_DM_HDLRS(sRadioDmHdlrs,
+                   SWLA_DM_PARAM_HDLR("OperationalDataTransmitRates", s_setOperationalDataTransmitRates_pwf),
+                   SWLA_DM_PARAM_HDLR("BasicDataTransmitRates", s_setBasicDataTransmitRates_pwf),
+                   SWLA_DM_PARAM_HDLR("PowerType", s_setPowerType_pwf),
++                  SWLA_DM_PARAM_HDLR("DiscardAwgnEvent", s_setDiscardAwgnEvent_pwf),
+                   ),
+               .instAddedCb = s_addInstance_oaf);
+ 
+@@ -5452,9 +5466,6 @@ amxd_status_t _wld_rad_validateDisabledS
+     return status;
+ }
+ 
+-/*
+- * Callback to configure parameters of Static Puncturing object
+- */
+ static void s_setDisabledSubChannels_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
+     SAH_TRACEZ_IN(ME);
+ 
