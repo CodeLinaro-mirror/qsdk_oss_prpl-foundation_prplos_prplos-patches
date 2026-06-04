@@ -16,9 +16,11 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
 
  7 files changed, 62 insertions(+), 5 deletions(-)
 
---- a/include/wld/wld_wpaCtrl_events.h
-+++ b/include/wld/wld_wpaCtrl_events.h
-@@ -227,6 +227,8 @@ typedef void (* wld_wpaCtrl_dfsNopFinish
+Index: pwhm-v7.27.4/include/wld/wld_wpaCtrl_events.h
+===================================================================
+--- pwhm-v7.27.4.orig/include/wld/wld_wpaCtrl_events.h
++++ pwhm-v7.27.4/include/wld/wld_wpaCtrl_events.h
+@@ -228,6 +228,8 @@ typedef void (* wld_wpaCtrl_dfsNopFinish
  typedef void (* wld_wpaCtrl_dfsNewChannelCb_f)(void* userData, char* ifName, swl_chanspec_t* chanSpec);
  typedef void (* wld_wpaCtrl_uplinkCsaCb_f)(void* userData, char* ifName, char* params);
  typedef void (* wld_wpaCtrl_uplinkCsaTimeoutCb_f)(void* userData, char* ifName, char* params);
@@ -27,7 +29,7 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
  typedef void (* wld_wpaCtrl_mainApSetupCompletedCb_f)(void* userData, char* ifName);
  typedef void (* wld_wpaCtrl_mainApDisabledCb_f)(void* userData, char* ifName);
  typedef void (* wld_wpaCtrl_syncOnReadyCb_f)(void* userData, char* ifName, bool state);
-@@ -256,6 +258,8 @@ typedef struct {
+@@ -257,6 +259,8 @@ typedef struct {
      wld_wpaCtrl_dfsNewChannelCb_f fDfsNewChannelCb; //fallback after dfs radar detection
      wld_wpaCtrl_uplinkCsaCb_f fUplinkCsaCb;
      wld_wpaCtrl_uplinkCsaTimeoutCb_f fUplinkCsaTimeoutCb;
@@ -36,9 +38,11 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
      wld_wpaCtrl_mainApSetupCompletedCb_f fMainApSetupCompletedCb;
      wld_wpaCtrl_mainApDisabledCb_f fMainApDisabledCb;
  
---- a/src/Plugin/wifiGen_eventHandlers.c
-+++ b/src/Plugin/wifiGen_eventHandlers.c
-@@ -121,7 +121,8 @@ static const char* s_fwdRadioStdWpaCtrlE
+Index: pwhm-v7.27.4/src/Plugin/wifiGen_eventHandlers.c
+===================================================================
+--- pwhm-v7.27.4.orig/src/Plugin/wifiGen_eventHandlers.c
++++ pwhm-v7.27.4/src/Plugin/wifiGen_eventHandlers.c
+@@ -122,7 +122,8 @@ static const char* s_fwdRadioStdWpaCtrlE
      "DFS-NOP-FINISHED"
      "DFS-NOP-FINISHED",
      "DFS-UPLINK-CSA",
@@ -48,7 +52,7 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
  };
  
  static void s_notifyWpaCtrlEvent(amxd_object_t* object, char* ifName, char* eventName,
-@@ -559,6 +560,93 @@ static void s_uplinkCsaCb(void* userData
+@@ -571,6 +572,93 @@ static void s_uplinkCsaCb(void* userData
      }
  }
  
@@ -142,7 +146,7 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
  static void s_uplinkCsaTimeoutCb(void* userData, char* ifName _UNUSED, char* params _UNUSED) {
      T_Radio* pRad = (T_Radio*) userData;
      ASSERT_NOT_NULL(pRad, , ME, "NULL");
-@@ -615,6 +703,8 @@ static swl_rc_ne s_setWpaCtrlRadEvtHandl
+@@ -627,6 +715,8 @@ static swl_rc_ne s_setWpaCtrlRadEvtHandl
      SET_HDLR(wpaCtrlRadEvthandlers.fFetchSockLinkIface, s_fetchSockLinkIface);
      SET_HDLR(wpaCtrlRadEvthandlers.fUplinkCsaCb, s_uplinkCsaCb);
      SET_HDLR(wpaCtrlRadEvthandlers.fUplinkCsaTimeoutCb, s_uplinkCsaTimeoutCb);
@@ -151,13 +155,15 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
      wld_wpaCtrlMngr_setEvtHandlers(wpaCtrlMngr, pRad, &wpaCtrlRadEvthandlers);
      return SWL_RC_OK;
  }
-@@ -1666,4 +1756,3 @@ swl_rc_ne wifiGen_setEpEvtHandlers(T_End
+@@ -1700,4 +1790,3 @@ swl_rc_ne wifiGen_setEpEvtHandlers(T_End
  
      return SWL_RC_OK;
  }
 -
---- a/src/nl80211/wld_wpaCtrl_events.c
-+++ b/src/nl80211/wld_wpaCtrl_events.c
+Index: pwhm-v7.27.4/src/nl80211/wld_wpaCtrl_events.c
+===================================================================
+--- pwhm-v7.27.4.orig/src/nl80211/wld_wpaCtrl_events.c
++++ pwhm-v7.27.4/src/nl80211/wld_wpaCtrl_events.c
 @@ -541,6 +541,24 @@ static void s_uplinkCsaTimeoutEvtCb(wld_
      CALL_MGR_I(pInterface, fUplinkCsaTimeoutCb, params);
  }
@@ -197,7 +203,7 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
  static void s_mgtFrameEvt(wld_wpaCtrlInterface_t* pInterface, char* event _UNUSED, char* params) {
      // Example: <3>AP-MGMT-FRAME-RECEIVED buf=b0003c0000000000001012d4159a59e7000000000010a082000001000000
      char data[swl_str_len(params) + 1];
-@@ -878,6 +903,7 @@ SWL_TABLE(sWpaCtrlEvents,
+@@ -879,6 +904,7 @@ SWL_TABLE(sWpaCtrlEvents,
                {"CTRL-EVENT-CHANNEL-SWITCH", &s_chanSwitchEvtCb},
                {"AP-CSA-FINISHED", &s_apCsaFinishedEvtCb},
                {"AP-MGMT-FRAME-RECEIVED", &s_mgtFrameEvt},
@@ -205,7 +211,7 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
                {"AP-ENABLED", &s_apEnabledEvt},
                {"AP-DISABLED", &s_apDisabledEvt},
                {"INTERFACE-ENABLED", &s_apIfaceEnabledEvt},
-@@ -903,6 +929,7 @@ SWL_TABLE(sWpaCtrlEvents,
+@@ -904,6 +930,7 @@ SWL_TABLE(sWpaCtrlEvents,
                {"BEACON-RESP-RX", &s_beaconResponseEvt},
  	      {"DFS-UPLINK-CSA", &s_uplinkCsaEvtCb},
  	      {"DFS-UPLINK-CSA-TIMEOUT", &s_uplinkCsaTimeoutEvtCb},
@@ -213,19 +219,23 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
                ));
  
  static evtParser_f s_getEventParser(char* eventName) {
---- a/include/wld/wld.h
-+++ b/include/wld/wld.h
-@@ -1736,6 +1736,7 @@ struct WLD_RADIO {
-     amxp_timer_t* setMaxNumStaTimer;                        /* Timer used to delay the setMaxNumStation task */
+Index: pwhm-v7.27.4/include/wld/wld.h
+===================================================================
+--- pwhm-v7.27.4.orig/include/wld/wld.h
++++ pwhm-v7.27.4/include/wld/wld.h
+@@ -1739,6 +1739,7 @@ struct WLD_RADIO {
      swl_channel_t disabledSubchannels[SWL_BW_CHANNELS_MAX]; /* Disabled Subchannel list, for 11be static channel puncturing */
      uint32_t nrDisabledSubChannels;                         /* Nr of disabled sub channels */
+     uint8_t mLReconfigurationCount;                         /** Number of beacons with ML Reconfiguration IE before link removal */
 +    bool discardAwgnEvent;                                  /* When true, add discard_6g_awgn_event=1 to hostapd config (6GHz only) */
  };
  
  typedef struct {
---- a/odl/wld_radio.odl
-+++ b/odl/wld_radio.odl
-@@ -3311,6 +3311,17 @@ define probelist_t{
+Index: pwhm-v7.27.4/odl/wld_radio.odl
+===================================================================
+--- pwhm-v7.27.4.orig/odl/wld_radio.odl
++++ pwhm-v7.27.4/odl/wld_radio.odl
+@@ -3365,6 +3365,17 @@ define probelist_t{
  		%read-only string ChipsetVendor;
  
  		/**
@@ -243,8 +253,10 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
  		 * Static puncturing feature
  		 */
  		%persistent object StaticPuncturing{
---- a/src/nl80211/wld_hostapd_cfgFile.c
-+++ b/src/nl80211/wld_hostapd_cfgFile.c
+Index: pwhm-v7.27.4/src/nl80211/wld_hostapd_cfgFile.c
+===================================================================
+--- pwhm-v7.27.4.orig/src/nl80211/wld_hostapd_cfgFile.c
++++ pwhm-v7.27.4/src/nl80211/wld_hostapd_cfgFile.c
 @@ -627,6 +627,17 @@ void wld_hostapd_cfgFile_setRadioConfig(
  
      pRad->pFA->mfn_wrad_updateConfigMap(pRad, radConfigMap);
@@ -263,9 +275,11 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
      if(!configMbssid) {
          const char* mbssidKeys[] = {"mbssid", "ema"};
          s_filterEntries(radConfigMap, mbssidKeys, SWL_ARRAY_SIZE(mbssidKeys));
---- a/src/wld_radio.c
-+++ b/src/wld_radio.c
-@@ -5025,6 +5025,19 @@ amxd_status_t _Radio_debug(amxd_object_t
+Index: pwhm-v7.27.4/src/wld_radio.c
+===================================================================
+--- pwhm-v7.27.4.orig/src/wld_radio.c
++++ pwhm-v7.27.4/src/wld_radio.c
+@@ -5035,6 +5035,19 @@ amxd_status_t _Radio_debug(amxd_object_t
      return amxd_status_ok;
  }
  
@@ -285,7 +299,7 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
  SWLA_DM_HDLRS(sRadioDmHdlrs,
                ARR(SWLA_DM_PARAM_HDLR("RegulatoryDomain", s_setCountryCode_pwf),
                    SWLA_DM_PARAM_HDLR("IEEE80211hEnabled", s_set80211hEnable_pwf),
-@@ -5074,6 +5087,7 @@ SWLA_DM_HDLRS(sRadioDmHdlrs,
+@@ -5084,6 +5097,7 @@ SWLA_DM_HDLRS(sRadioDmHdlrs,
                    SWLA_DM_PARAM_HDLR("OperationalDataTransmitRates", s_setOperationalDataTransmitRates_pwf),
                    SWLA_DM_PARAM_HDLR("BasicDataTransmitRates", s_setBasicDataTransmitRates_pwf),
                    SWLA_DM_PARAM_HDLR("PowerType", s_setPowerType_pwf),
@@ -293,7 +307,7 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
                    ),
                .instAddedCb = s_addInstance_oaf);
  
-@@ -5452,9 +5466,6 @@ amxd_status_t _wld_rad_validateDisabledS
+@@ -5481,9 +5495,6 @@ amxd_status_t _wld_rad_validateDisabledS
      return status;
  }
  
