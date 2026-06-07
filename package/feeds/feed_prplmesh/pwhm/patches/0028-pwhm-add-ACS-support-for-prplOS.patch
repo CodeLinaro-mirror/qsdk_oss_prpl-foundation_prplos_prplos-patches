@@ -11,11 +11,9 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
  src/wld_radio.c                   |  18 ++-
  4 files changed, 142 insertions(+), 120 deletions(-)
 
-diff --git a/src/Plugin/wifiGen_fsm.c b/src/Plugin/wifiGen_fsm.c
-index 10f6592..7f64e2e 100644
 --- a/src/Plugin/wifiGen_fsm.c
 +++ b/src/Plugin/wifiGen_fsm.c
-@@ -849,6 +849,18 @@ static bool s_doAddHostapd(T_Radio* pRad) {
+@@ -1126,6 +1126,18 @@ static bool s_doAddHostapd(T_Radio* pRad
          SAH_TRACEZ_WARNING(ME, "%s: hostapd group is restarting: skip immediate adding conf", pRad->Name);
          return true;
      }
@@ -34,11 +32,9 @@ index 10f6592..7f64e2e 100644
      wld_wpaCtrlInterface_t* pgIface = wld_secDmn_getGlobalCtrlIface(pRad->hostapd);
      ASSERTW_TRUE(wld_wpaCtrlInterface_isReady(pgIface), true, ME, "%s: gsock disconnected", pRad->Name);
      wifiGen_hapd_restoreMainIface(pRad);
-diff --git a/src/nl80211/wld_hostapd_cfgFile.c b/src/nl80211/wld_hostapd_cfgFile.c
-index d5090da..049977c 100644
 --- a/src/nl80211/wld_hostapd_cfgFile.c
 +++ b/src/nl80211/wld_hostapd_cfgFile.c
-@@ -280,14 +280,25 @@ void wld_hostapd_cfgFile_setRadioConfig(T_Radio* pRad, swl_mapChar_t* radConfigM
+@@ -280,14 +280,25 @@ void wld_hostapd_cfgFile_setRadioConfig(
  
      swl_channel_t tgtChan = tgtChspec.channel;
      /* When auto channel selection is enabled (and not managed externally),
@@ -69,7 +65,7 @@ index d5090da..049977c 100644
      swl_mapChar_add(radConfigMap, "country_code", pRad->regulatoryDomain);
      swl_mapChar_add(radConfigMap, "ieee80211d", "1");
      swl_mapCharFmt_addValInt32(radConfigMap, "ieee80211h", pRad->IEEE80211hSupported && pRad->setRadio80211hEnable);
-@@ -372,9 +383,13 @@ void wld_hostapd_cfgFile_setRadioConfig(T_Radio* pRad, swl_mapChar_t* radConfigM
+@@ -372,9 +383,13 @@ void wld_hostapd_cfgFile_setRadioConfig(
              if(pEhtChWId && (*pChWId != *pEhtChWId)) {
                  tgtChspec.bandwidth = *(uint32_t*) swl_table_getMatchingValue(&sChWidthIDsMaps, 2, 0, pChWId);
              }
@@ -85,7 +81,29 @@ index d5090da..049977c 100644
          }
          char vhtCaps[256] = {0};
          if(wld_channel_hasChannelWidthCovered(tgtChspec, SWL_BW_160MHZ)) {
-@@ -466,9 +481,13 @@ void wld_hostapd_cfgFile_setRadioConfig(T_Radio* pRad, swl_mapChar_t* radConfigM
+@@ -456,9 +471,18 @@ void wld_hostapd_cfgFile_setRadioConfig(
+         swl_mapCharFmt_addValInt32(radConfigMap, "ieee80211ax", enableRad11ax);
+     }
+ 
+-    if(wld_rad_is_5ghz(pRad) && pRad->isSTA) {
+-        swl_mapCharFmt_addValInt32(radConfigMap,"uplink_csa", 1);
+-	swl_mapCharFmt_addValInt32(radConfigMap, "skip_cac", 1);
++    /* uplink_csa and skip_cac are only relevant when the radio is operating as a
++     * repeater with an active backhaul STA connection to a root AP.
++     * pRad->isSTA is a configuration flag (set by STA_Mode in the data model) that
++     * indicates STA mode is *configured*, not that the STA is currently connected.
++     * Using pRad->isSTA here causes skip_cac=1 to be written for all 5GHz radios
++     * with STA mode enabled, even when no backhaul connection exists.
++     * This results in CAC being skipped (cac_time=0s) on DFS channels, causing
++     * "Failed to set beacon parameters" -> AP disabled -> restart loop.
++     * Fix: only set skip_cac=1 when the STA is actually connected. */
++    if(wld_rad_is_5ghz(pRad) && wld_rad_hasConnectedEp(pRad)) {
++        swl_mapCharFmt_addValInt32(radConfigMap, "uplink_csa", 1);
++        swl_mapCharFmt_addValInt32(radConfigMap, "skip_cac", 1);
+     }
+ 
+     if(enableRad11ax) {
+@@ -466,9 +490,13 @@ void wld_hostapd_cfgFile_setRadioConfig(
              if(pEhtChWId && (*pChWId != *pEhtChWId)) {
                  tgtChspec.bandwidth = *(uint32_t*) swl_table_getMatchingValue(&sChWidthIDsMaps, 2, 0, pChWId);
              }
@@ -101,7 +119,7 @@ index d5090da..049977c 100644
          }
          if(implicitBf) {
              if(SWL_BIT_IS_SET(pRad->bfCapsSupported[COM_DIR_RECEIVE], RAD_BF_CAP_HE_SU) &&
-@@ -557,9 +576,13 @@ void wld_hostapd_cfgFile_setRadioConfig(T_Radio* pRad, swl_mapChar_t* radConfigM
+@@ -557,9 +585,13 @@ void wld_hostapd_cfgFile_setRadioConfig(
              if(pChWId && (*pChWId != *pEhtChWId)) {
                  tgtChspec.bandwidth = *(uint32_t*) swl_table_getMatchingValue(&sChWidthIDsMaps, 2, 1, pEhtChWId);
              }
@@ -117,11 +135,46 @@ index d5090da..049977c 100644
          }
          if(implicitBf) {
              if(SWL_BIT_IS_SET(pRad->bfCapsSupported[COM_DIR_RECEIVE], RAD_BF_CAP_EHT_SU) &&
-diff --git a/src/wld_accesspoint.c b/src/wld_accesspoint.c
-index a40fc64..3693d23 100644
 --- a/src/wld_accesspoint.c
 +++ b/src/wld_accesspoint.c
-@@ -1674,9 +1674,9 @@ void _wld_ap_setDppConf_ocf(const char* const sig_name,
+@@ -1670,13 +1670,46 @@ void _wld_ap_setDppConf_ocf(const char*
+  */
+ 
+ /**
++ * Allowed DCS enable bitmask: only bits 0 (CW), 1 (WLAN), 4 (OBSS) are valid.
++ * Matches ALLOWED_DCS_MASK in hostapd qcn_extns/dcs.c.
++ */
++#define DCS_ALLOWED_ENABLE_MASK 0x0013U
++
++/**
++ * @brief Validator for DCS.Enable parameter.
++ *
++ * Rejects any value that has bits set outside the allowed mask
++ * (bits 0=CW, 1=WLAN, 4=OBSS). For example:
++ *   - 4 (0x04 = AWGN bit) is rejected
++ *   - 16 (0x10 = OBSS) is accepted
++ *   - 2 (0x02 = WLAN) is accepted
++ */
++amxd_status_t _wld_ap_validateDcsEnable_pvf(amxd_object_t* object _UNUSED,
++                                             amxd_param_t* param _UNUSED,
++                                             amxd_action_t reason _UNUSED,
++                                             const amxc_var_t* const args,
++                                             amxc_var_t* const retval _UNUSED,
++                                             void* priv _UNUSED) {
++    ASSERTS_FALSE(amxc_var_is_null(args), amxd_status_invalid_value, ME, "invalid");
++    uint32_t value = amxc_var_dyncast(uint32_t, args);
++    if(value & ~DCS_ALLOWED_ENABLE_MASK) {
++        SAH_TRACEZ_ERROR(ME,
++                         "DCS.Enable: invalid value 0x%x — only bits 0(CW=1), 1(WLAN=2), 4(OBSS=16) are allowed",
++                         value);
++        return amxd_status_invalid_value;
++    }
++    return amxd_status_ok;
++}
++
++
++/**
+  * @brief Helper to send a DCS wlan_intr_params command via the hostapd wpaCtrl interface.
   *
   * Equivalent to: hostapd_cli -i wlanX [-l linkId] dcs set_wlan_intr_params <param_name> <value>
   *
@@ -134,7 +187,7 @@ index a40fc64..3693d23 100644
   *
   * @param pAP        AccessPoint context
   * @param param_name DCS parameter name (e.g. "intr_detection_threshold")
-@@ -1688,50 +1688,26 @@ static bool s_sendDcsWlanIntrParams(T_AccessPoint* pAP, const char* param_name,
+@@ -1688,50 +1721,26 @@ static bool s_sendDcsWlanIntrParams(T_Ac
      char cmd[256] = {0};
      char reply[256] = {0};
  
@@ -202,7 +255,7 @@ index a40fc64..3693d23 100644
  /**
   * @brief Handler for DCS.Enable parameter change.
   *
-@@ -1750,7 +1726,22 @@ static void s_setDcsEnable_pwf(void* priv _UNUSED, amxd_object_t* object,
+@@ -1750,7 +1759,22 @@ static void s_setDcsEnable_pwf(void* pri
      SAH_TRACEZ_INFO(ME, "%s: set DCS Enable 0x%x", pAP->alias, enable);
      ASSERTI_NOT_EQUALS(pAP->DCS_Enable, enable, , ME, "EQUALS");
      pAP->DCS_Enable = enable;
@@ -226,7 +279,7 @@ index a40fc64..3693d23 100644
  
      SAH_TRACEZ_OUT(ME);
  }
-@@ -1771,7 +1762,9 @@ static void s_setDcsWlanIntrDetectionThreshold_pwf(void* priv _UNUSED,
+@@ -1771,7 +1795,9 @@ static void s_setDcsWlanIntrDetectionThr
      uint32_t value = amxc_var_dyncast(uint32_t, newValue);
      SAH_TRACEZ_INFO(ME, "%s: set DCS WlanIntrDetectionThreshold %u", pAP->alias, value);
      pAP->DCS_WlanIntrDetectionThreshold = value;
@@ -237,7 +290,7 @@ index a40fc64..3693d23 100644
      SAH_TRACEZ_OUT(ME);
  }
  
-@@ -1785,7 +1778,9 @@ static void s_setDcsWlanIntrTxErrThreshold_pwf(void* priv _UNUSED,
+@@ -1785,7 +1811,9 @@ static void s_setDcsWlanIntrTxErrThresho
      uint32_t value = amxc_var_dyncast(uint32_t, newValue);
      SAH_TRACEZ_INFO(ME, "%s: set DCS WlanIntrTxErrThreshold %u", pAP->alias, value);
      pAP->DCS_WlanIntrTxErrThreshold = value;
@@ -248,7 +301,7 @@ index a40fc64..3693d23 100644
      SAH_TRACEZ_OUT(ME);
  }
  
-@@ -1799,7 +1794,9 @@ static void s_setDcsWlanIntrPhyErrThreshold_pwf(void* priv _UNUSED,
+@@ -1799,7 +1827,9 @@ static void s_setDcsWlanIntrPhyErrThresh
      uint32_t value = amxc_var_dyncast(uint32_t, newValue);
      SAH_TRACEZ_INFO(ME, "%s: set DCS WlanIntrPhyErrThreshold %u", pAP->alias, value);
      pAP->DCS_WlanIntrPhyErrThreshold = value;
@@ -259,7 +312,7 @@ index a40fc64..3693d23 100644
      SAH_TRACEZ_OUT(ME);
  }
  
-@@ -1813,7 +1810,9 @@ static void s_setDcsWlanIntrCochIntrThreshold_pwf(void* priv _UNUSED,
+@@ -1813,7 +1843,9 @@ static void s_setDcsWlanIntrCochIntrThre
      uint32_t value = amxc_var_dyncast(uint32_t, newValue);
      SAH_TRACEZ_INFO(ME, "%s: set DCS WlanIntrCochIntrThreshold %u", pAP->alias, value);
      pAP->DCS_WlanIntrCochIntrThreshold = value;
@@ -270,7 +323,7 @@ index a40fc64..3693d23 100644
      SAH_TRACEZ_OUT(ME);
  }
  
-@@ -1827,7 +1826,9 @@ static void s_setDcsMaxcuValue_pwf(void* priv _UNUSED,
+@@ -1827,7 +1859,9 @@ static void s_setDcsMaxcuValue_pwf(void*
      uint32_t value = amxc_var_dyncast(uint32_t, newValue);
      SAH_TRACEZ_INFO(ME, "%s: set DCS MaxcuValue %u", pAP->alias, value);
      pAP->DCS_MaxcuValue = value;
@@ -281,7 +334,7 @@ index a40fc64..3693d23 100644
      SAH_TRACEZ_OUT(ME);
  }
  
-@@ -1835,55 +1836,29 @@ static void s_setDcsMaxcuValue_pwf(void* priv _UNUSED,
+@@ -1835,55 +1869,29 @@ static void s_setDcsMaxcuValue_pwf(void*
   * @brief Helper to send a generic DCS command (not set_wlan_intr_params) via wpaCtrl.
   *
   * Equivalent to: hostapd_cli -i wlanX [-l Y] dcs <cmd> <value>
@@ -353,7 +406,7 @@ index a40fc64..3693d23 100644
  }
  
  /**
-@@ -1911,7 +1886,9 @@ static void s_setDcsBwReductionCtrl_pwf(void* priv _UNUSED, amxd_object_t* objec
+@@ -1911,7 +1919,9 @@ static void s_setDcsBwReductionCtrl_pwf(
      uint32_t value = amxc_var_dyncast(uint32_t, newValue);
      SAH_TRACEZ_INFO(ME, "%s: set DCS BwReductionCtrl 0x%x", pAP->alias, value);
      pAP->DCS_BwReductionCtrl = value;
@@ -364,7 +417,7 @@ index a40fc64..3693d23 100644
      SAH_TRACEZ_OUT(ME);
  }
  
-@@ -1924,7 +1901,9 @@ static void s_setDcsSetAfcChanSelConfig_pwf(void* priv _UNUSED, amxd_object_t* o
+@@ -1924,7 +1934,9 @@ static void s_setDcsSetAfcChanSelConfig_
      uint32_t value = amxc_var_dyncast(uint32_t, newValue);
      SAH_TRACEZ_INFO(ME, "%s: set DCS SetAfcChanSelConfig %u", pAP->alias, value);
      pAP->DCS_SetAfcChanSelConfig = value;
@@ -375,7 +428,7 @@ index a40fc64..3693d23 100644
      SAH_TRACEZ_OUT(ME);
  }
  
-@@ -1937,7 +1916,9 @@ static void s_setDcsRandomChanBitmap_pwf(void* priv _UNUSED, amxd_object_t* obje
+@@ -1937,7 +1949,9 @@ static void s_setDcsRandomChanBitmap_pwf
      uint32_t value = amxc_var_dyncast(uint32_t, newValue);
      SAH_TRACEZ_INFO(ME, "%s: set DCS RandomChanBitmap 0x%x", pAP->alias, value);
      pAP->DCS_RandomChanBitmap = value;
@@ -386,7 +439,7 @@ index a40fc64..3693d23 100644
      SAH_TRACEZ_OUT(ME);
  }
  
-@@ -1950,7 +1931,9 @@ static void s_setDcsCsaTbtt_pwf(void* priv _UNUSED, amxd_object_t* object,
+@@ -1950,7 +1964,9 @@ static void s_setDcsCsaTbtt_pwf(void* pr
      uint32_t value = amxc_var_dyncast(uint32_t, newValue);
      SAH_TRACEZ_INFO(ME, "%s: set DCS CsaTbtt %u", pAP->alias, value);
      pAP->DCS_CsaTbtt = value;
@@ -397,7 +450,7 @@ index a40fc64..3693d23 100644
      SAH_TRACEZ_OUT(ME);
  }
  
-@@ -1963,7 +1946,9 @@ static void s_setDcsEnableTimer_pwf(void* priv _UNUSED, amxd_object_t* object,
+@@ -1963,7 +1979,9 @@ static void s_setDcsEnableTimer_pwf(void
      uint32_t value = amxc_var_dyncast(uint32_t, newValue);
      SAH_TRACEZ_INFO(ME, "%s: set DCS EnableTimer %u", pAP->alias, value);
      pAP->DCS_EnableTimer = value;
@@ -408,7 +461,7 @@ index a40fc64..3693d23 100644
      SAH_TRACEZ_OUT(ME);
  }
  
-@@ -1976,7 +1961,9 @@ static void s_setDcsEventAction_pwf(void* priv _UNUSED, amxd_object_t* object,
+@@ -1976,7 +1994,9 @@ static void s_setDcsEventAction_pwf(void
      uint32_t value = amxc_var_dyncast(uint32_t, newValue);
      SAH_TRACEZ_INFO(ME, "%s: set DCS EventAction 0x%x", pAP->alias, value);
      pAP->DCS_EventAction = value;
@@ -419,7 +472,7 @@ index a40fc64..3693d23 100644
      SAH_TRACEZ_OUT(ME);
  }
  
-@@ -1989,7 +1976,9 @@ static void s_setDcsEventNotify_pwf(void* priv _UNUSED, amxd_object_t* object,
+@@ -1989,7 +2009,9 @@ static void s_setDcsEventNotify_pwf(void
      uint32_t value = amxc_var_dyncast(uint32_t, newValue);
      SAH_TRACEZ_INFO(ME, "%s: set DCS EventNotify 0x%x", pAP->alias, value);
      pAP->DCS_EventNotify = value;
@@ -430,11 +483,9 @@ index a40fc64..3693d23 100644
      SAH_TRACEZ_OUT(ME);
  }
  
-diff --git a/src/wld_radio.c b/src/wld_radio.c
-index 15b99f7..13fe552 100644
 --- a/src/wld_radio.c
 +++ b/src/wld_radio.c
-@@ -605,20 +605,19 @@ static void s_setAutoChannelEnable_pwf(void* priv _UNUSED, amxd_object_t* object
+@@ -605,20 +605,19 @@ static void s_setAutoChannelEnable_pwf(v
          return;
      }
  
@@ -463,11 +514,211 @@ index 15b99f7..13fe552 100644
  
      SAH_TRACEZ_OUT(ME);
  }
-@@ -5520,4 +5519,3 @@ amxd_status_t _getEHTOperations(amxd_object_t* object,
+@@ -5560,4 +5559,3 @@ amxd_status_t _getEHTOperations(amxd_obj
      SAH_TRACEZ_OUT(ME);
      return amxd_status_ok;
  }
 -
--- 
-2.34.1
-
+--- a/odl/wld_accesspoint.odl
++++ b/odl/wld_accesspoint.odl
+@@ -1034,6 +1034,7 @@ define rrm_t{
+ 			%persistent uint32 Enable {
+ 				default 0;
+ 				on action validate call check_range { min = 0, max = 19 };
++				on action validate call wld_ap_validateDcsEnable_pvf;
+ 			}
+ 
+ 			/**
+--- a/src/Plugin/wifiGen_hapd.c
++++ b/src/Plugin/wifiGen_hapd.c
+@@ -62,6 +62,8 @@
+ #include "wld/wld.h"
+ #include "wld/wld_util.h"
+ #include "wld/wld_radio.h"
++#include "wld/wld_chanmgt.h"
++#include "wld/wld_mld.h"
+ #include "wld/wld_ssid.h"
+ #include "wld/wld_accesspoint.h"
+ #include "wld/wld_apMld_tidLinkMap.h"
+@@ -488,8 +490,80 @@ swl_rc_ne wifiGen_hapd_reloadDaemon(T_Ra
+     return rc;
+ }
+ 
++static uint8_t s_get6GhzAcsOpClass(T_Radio* pRad) {
++    swl_radBw_e bw = pRad->operatingChannelBandwidth;
++    if(bw == SWL_RAD_BW_AUTO) {
++        bw = wld_chanmgt_getHighestApplicableRadBw(pRad);
++    }
++    switch(bw) {
++    case SWL_RAD_BW_40MHZ:   return 132;
++    case SWL_RAD_BW_80MHZ:   return 133;
++    case SWL_RAD_BW_160MHZ:  return 134;
++    case SWL_RAD_BW_320MHZ1:
++    case SWL_RAD_BW_320MHZ2: return 137;
++    default:                  return 131; /* 20 MHz */
++    }
++}
++
+ void wifiGen_hapd_writeConfig(T_Radio* pRad) {
+     wld_hostapd_cfgFile_createExt(pRad);
++
++    /*
++     * For 6GHz ACS (channel=acs_survey / channel=0), hostapd's skip_mode()
++     * uses is_6ghz_op_class(op_class) to distinguish the 6GHz hw_mode from
++     * the 5GHz hw_mode — both share hw_mode=a (HOSTAPD_MODE_IEEE80211A).
++     * Without op_class set to a 6GHz operating class, skip_mode() returns
++     * false for both modes and hostapd selects the 5GHz mode (listed first
++     * in hw_features[]), causing ACS to scan only 5GHz channels.
++     * This is not needed for 2.4GHz (hw_mode=g is unique) or 5GHz (5GHz
++     * mode is listed first so it is picked correctly without op_class).
++     *
++     * In MLO mode the global hostapd instance orders config files by datamodel
++     * index (e.g. wlan2→wlan1→wlan0), so the primary link interface may be the
++     * 2.4GHz AP (wlan2.1) rather than the 6GHz AP (wlan0.1). hostapd triggers
++     * ACS on the primary link interface and uses its op_class. Therefore we must
++     * also write op_class into every neighbor MLO link's config file so that
++     * whichever interface ends up as primary, the 6GHz op_class is present.
++     */
++    if(pRad->autoChannelEnable && wld_rad_is_6ghz(pRad)) {
++        uint8_t op_class = s_get6GhzAcsOpClass(pRad);
++        char op_class_str[8] = {0};
++        snprintf(op_class_str, sizeof(op_class_str), "%u", op_class);
++
++        /* Apply op_class to the 6GHz radio's own config */
++        char confFilePath[128] = {0};
++        swl_str_catFormat(confFilePath, sizeof(confFilePath),
++                          HOSTAPD_CONF_FILE_PATH_FORMAT, pRad->Name);
++        const char* mainIface = s_getMainIface(pRad);
++        wld_hostapd_cfgFile_update(confFilePath, mainIface, "op_class", op_class_str);
++        SAH_TRACEZ_WARNING(ME, "%s: 6GHz ACS: added op_class=%u to hostapd config",
++                           pRad->Name, op_class);
++
++        /* Also apply op_class to all neighbor MLO link interfaces */
++        T_AccessPoint* pAP = NULL;
++        wld_rad_forEachAp(pAP, pRad) {
++            if((pAP == NULL) || (pAP->pSSID == NULL) || (pAP->pSSID->pMldLink == NULL)) {
++                continue;
++            }
++            wld_mldLink_t* pNeighLink = NULL;
++            wld_for_eachNeighMldLink(pNeighLink, pAP->pSSID->pMldLink) {
++                T_SSID* pNeighSSID = wld_mld_getLinkSsid(pNeighLink);
++                if((pNeighSSID == NULL) || (pNeighSSID->RADIO_PARENT == NULL) ||
++                   (pNeighSSID->AP_HOOK == NULL)) {
++                    continue;
++                }
++                T_Radio* pNeighRad = pNeighSSID->RADIO_PARENT;
++                T_AccessPoint* pNeighAP = pNeighSSID->AP_HOOK;
++                char neighConfFilePath[128] = {0};
++                swl_str_catFormat(neighConfFilePath, sizeof(neighConfFilePath),
++                                  HOSTAPD_CONF_FILE_PATH_FORMAT, pNeighRad->Name);
++                wld_hostapd_cfgFile_update(neighConfFilePath, pNeighAP->alias,
++                                           "op_class", op_class_str);
++                SAH_TRACEZ_WARNING(ME, "%s: 6GHz ACS MLO: added op_class=%u to %s hostapd config",
++                                   pRad->Name, op_class, pNeighAP->alias);
++            }
++        }
++    }
+ }
+ 
+ static wld_wpaCtrlInterface_t* s_mainInterface(T_Radio* pRad) {
+--- a/src/Plugin/wifiGen_eventHandlers.c
++++ b/src/Plugin/wifiGen_eventHandlers.c
+@@ -572,6 +572,13 @@ static void s_uplinkCsaCb(void* userData
+     }
+ }
+ 
++/*
++ * Set to true when WLAN/CW interference-triggered ACS sends DISCONNECT to all radios,
++ * so that s_acsCompletedCb knows to RECONNECT all radios (not just the ACS radio).
++ * Reset to false in s_acsCompletedCb after use.
++ */
++static bool s_acsDisconnectAllRads = false;
++
+ static void s_awgnInterferenceDetectedCb(void* userData, char* ifName, char* params) {
+     /*
+      * Interference detected event from hostapd (type=AWGN, WLAN, CW, or OBSS).
+@@ -599,9 +606,14 @@ static void s_awgnInterferenceDetectedCb
+ 
+     /* Check if this is a WLAN/CW interference event that will trigger ACS */
+     char typeStr[32] = {0};
+-    if(wld_wpaCtrl_getValueStr(params, "type", typeStr, sizeof(typeStr)) > 0 &&
++        if(wld_wpaCtrl_getValueStr(params, "type", typeStr, sizeof(typeStr)) > 0 &&
+        (swl_str_matches(typeStr, "WLAN") || swl_str_matches(typeStr, "CW"))) {
+         /*
++         * Mark that DISCONNECT is being sent to all radios so that s_acsCompletedCb
++         * knows to RECONNECT all radios when ACS finishes (not just the ACS radio).
++         */
++        s_acsDisconnectAllRads = true;
++        /*
+          * Send DISCONNECT to ALL wpa_supplicant endpoints on ALL radios.
+          * DISCONNECT stops any ongoing scan and prevents wpa_supplicant from
+          * starting new scans (it waits for RECONNECT). This ensures acs_init()
+@@ -631,19 +643,48 @@ static void s_awgnInterferenceDetectedCb
+ static void s_acsCompletedCb(void* userData, char* ifName _UNUSED, swl_chanspec_t* chanSpec) {
+     /*
+      * ACS-COMPLETED event: hostapd has finished automatic channel selection.
+-     * Send RECONNECT to ALL wpa_supplicant endpoints on ALL radios so the backhaul
+-     * STA can reconnect on the new channel. This pairs with the DISCONNECT sent in
+-     * s_awgnInterferenceDetectedCb when WLAN/CW interference triggered ACS.
+-     * All radios are reconnected because DISCONNECT was sent to all of them.
++     *
++     * Two cases:
++     * 1. Interference-triggered ACS (WLAN/CW): s_awgnInterferenceDetectedCb sent DISCONNECT
++     *    to ALL radios' endpoints to stop scanning. Here we must RECONNECT all radios so
++     *    the backhaul STA can reconnect on the new channel. s_acsDisconnectAllRads tracks
++     *    this case.
++     *
++     * 2. AutoChannelEnable-triggered ACS: no DISCONNECT was sent to other radios. Only
++     *    RECONNECT the radio that completed ACS. Sending RECONNECT to other radios in this
++     *    case incorrectly causes their wpa_supplicant to reconnect and update their channel
++     *    (e.g., 5GHz channel changes when 6GHz ACS completes in MLO mode).
+      */
+     T_Radio* pRad = (T_Radio*) userData;
+     ASSERT_NOT_NULL(pRad, , ME, "NULL");
+-    SAH_TRACEZ_ERROR(ME, "%s: ACS completed on channel=%d, sending RECONNECT to all wpa_supplicant endpoints",
+-                     pRad->Name, chanSpec ? chanSpec->channel : 0);
+-    T_Radio* pRadIter;
+-    wld_for_eachRad(pRadIter) {
++    bool reconnectAllRads = s_acsDisconnectAllRads;
++    s_acsDisconnectAllRads = false;
++    SAH_TRACEZ_WARNING(ME, "%s: ACS completed on channel=%d, sending RECONNECT to %s wpa_supplicant endpoints",
++                       pRad->Name, chanSpec ? chanSpec->channel : 0,
++                       reconnectAllRads ? "all" : "own radio's");
++    if(reconnectAllRads) {
++        /* Interference-triggered ACS: RECONNECT all radios (DISCONNECT was sent to all) */
++        T_Radio* pRadIter;
++        wld_for_eachRad(pRadIter) {
++            T_EndPoint* pEP = NULL;
++            wld_rad_forEachEp(pEP, pRadIter) {
++                if((pEP == NULL) || (pEP->wpaCtrlInterface == NULL)) {
++                    continue;
++                }
++                if(!wld_wpaCtrlInterface_isReady(pEP->wpaCtrlInterface)) {
++                    SAH_TRACEZ_WARNING(ME, "%s: wpa_supplicant interface not ready, skip RECONNECT after ACS",
++                                       pEP->Name);
++                    continue;
++                }
++                SAH_TRACEZ_WARNING(ME, "%s: sending RECONNECT to wpa_supplicant after interference ACS (channel=%d)",
++                                   pEP->Name, chanSpec ? chanSpec->channel : 0);
++                wld_wpaCtrl_sendCmdCheckResponse(pEP->wpaCtrlInterface, "RECONNECT", "OK");
++            }
++        }
++    } else {
++        /* AutoChannelEnable-triggered ACS: only RECONNECT the radio that completed ACS */
+         T_EndPoint* pEP = NULL;
+-        wld_rad_forEachEp(pEP, pRadIter) {
++        wld_rad_forEachEp(pEP, pRad) {
+             if((pEP == NULL) || (pEP->wpaCtrlInterface == NULL)) {
+                 continue;
+             }
+@@ -652,8 +693,8 @@ static void s_acsCompletedCb(void* userD
+                                    pEP->Name);
+                 continue;
+             }
+-            SAH_TRACEZ_ERROR(ME, "%s: sending RECONNECT to wpa_supplicant after ACS completion (channel=%d)",
+-                             pEP->Name, chanSpec ? chanSpec->channel : 0);
++            SAH_TRACEZ_WARNING(ME, "%s: sending RECONNECT to wpa_supplicant after ACS completion (channel=%d)",
++                               pEP->Name, chanSpec ? chanSpec->channel : 0);
+             wld_wpaCtrl_sendCmdCheckResponse(pEP->wpaCtrlInterface, "RECONNECT", "OK");
+         }
+     }
