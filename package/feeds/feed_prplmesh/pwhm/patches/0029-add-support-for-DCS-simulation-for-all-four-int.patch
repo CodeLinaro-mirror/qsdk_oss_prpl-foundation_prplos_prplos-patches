@@ -1,0 +1,281 @@
+From ddb6eed3fbb704ba8a02e8fc879752cdaff9788c Mon Sep 17 00:00:00 2001
+From: Atchaya R <ratchaya@qti.qualcomm.com>
+Date: Mon, 8 Jun 2026 18:46:58 +0530
+Subject: [PATCH] pwhm: add support for DCS simulation for all four
+ interference types
+
+Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
+---
+ odl/wld_accesspoint.odl | 26 ++++++++++++++
+ src/wld_accesspoint.c   | 78 +++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 104 insertions(+)
+
+--- a/odl/wld_accesspoint.odl
++++ b/odl/wld_accesspoint.odl
+@@ -366,6 +366,25 @@ define rrm_t{
+ 		}
+ 
+ 		/**
++		 * Allow ACS scan on DFS channels when DCS triggers a channel change.
++		 *
++		 * When DCS is enabled (e.g. WLAN or CW interference detection) on a 5G radio
++		 * with ACS enabled, a DCS-triggered channel change causes hostapd to reject
++		 * subsequent ACS scan requests on DFS channels, resulting in ACS scan failure.
++		 * Setting this to true sends:
++		 *   hostapd_cli -i <wlanX> allow_scan_on_dfs_chan 1
++		 * which allows hostapd to include DFS channels in ACS scans.
++		 *
++		 * false = DFS channels excluded from ACS scan (default, hostapd default behaviour)
++		 * true  = DFS channels included in ACS scan (workaround for DCS + ACS coexistence)
++		 *
++		 * Not persistent: applied dynamically via hostapd_cli at runtime.
++		 */
++		%persistent bool AllowScanDfsChan {
++			default false;
++		}
++
++		/**
+ 		 * Add MBO Assoc Disallow Reason in the MBO IE
+ 		 * Possible options are : "Off", "Unspecified", "MaxAssocSTA",
+ 		 * "AirInterfaceOverload", "AuthServOverload", "InsufficientRSSI"
+@@ -1204,6 +1223,32 @@ define rrm_t{
+ 				on action validate call check_range { min = 0, max = 19 };
+ 			}
+ 
++			/**
++			 * Trigger a DCS interference simulation for testing.
++			 *
++			 * Sends: hostapd_cli -i <wlanX> DCS sim <type>
++			 * to trigger a synthetic DCS interference event in hostapd.
++			 *
++			 * No state is stored — this is a pure action with input validation only.
++			 *
++			 * @param type  Mandatory interference type:
++			 *   1  = CW_INTF   (Continuous Wave interference)
++			 *   2  = WLAN_INTF (WLAN interference)
++			 *   4  = AWGN_INTF (AWGN interference)
++			 *   16 = OBSS_INTF (Overlapping BSS interference)
++			 *
++			 * Note: The -l <linkid> flag is NOT used because hostapd's DCS handler
++			 * does not support the LINK_ID=X prefix. The command is sent directly to
++			 * the AP's own wpaCtrl socket (e.g. wlan1.1_link0), which is already
++			 * bound to the correct link.
++			 *
++			 * @return amxd_status_ok on success
++			 *         amxd_status_invalid_arg if type is not 1, 2, 4, or 16
++			 *         amxd_status_invalid_action if the AP is not yet initialized
++			 *         amxd_status_unknown_error if the hostapd command fails
++			 */
++			void Simulation(%in %mandatory uint32 type, %in string intf_bitmap);
++
+ 		}
+ 
+ 		/** This object contains parameters related to Wi-Fi Protected
+--- a/src/wld_accesspoint.c
++++ b/src/wld_accesspoint.c
+@@ -200,6 +200,7 @@ static void s_setDefaults(T_AccessPoint*
+     pAP->DCS_ReEnableTimer = 1800;
+     pAP->DCS_EventAction = 0;
+     pAP->DCS_EventNotify = 0;
++    pAP->AllowScanDfsChan = false;
+ 
+     pAP->UAPSDCapability = pAP->pFA->mfn_misc_has_support(pAP->pRadio, pAP, "UAPSD", 0);
+     pAP->WMMCapability = pAP->pFA->mfn_misc_has_support(pAP->pRadio, pAP, "WME", 0);
+@@ -2031,6 +2032,136 @@ SWLA_DM_HDLRS(sApDcsDmHdlrs,
+                   SWLA_DM_PARAM_HDLR("EventNotify", s_setDcsEventNotify_pwf))
+               );
+ 
++/**
++ * @brief RPC handler for DCS.Simulation() function.
++ *
++ * Triggers a synthetic DCS interference event in hostapd for testing by sending:
++ *   DCS sim <type>
++ * via the AP's wpaCtrl interface, equivalent to:
++ *   hostapd_cli -i <wlanX> DCS sim <type>
++ *
++ * Input validation is performed here — no state is stored.
++ *
++ * @param type  Mandatory interference type (from hostapd enum hostapd_dcs_intf_type):
++ *   1  = DCS_CW_INTF   (Continuous Wave interference)
++ *   2  = DCS_WLAN_INTF (WLAN interference)
++ *   4  = DCS_AWGN_INTF (AWGN interference)
++ *   16 = DCS_OBSS_INTF (Overlapping BSS interference)
++ *
++ * @return amxd_status_ok on success
++ *         amxd_status_invalid_arg if type is not one of the valid values
++ *         amxd_status_invalid_action if the AP is not yet initialized
++ *         amxd_status_unknown_error if the hostapd command fails
++ */
++amxd_status_t _Simulation(amxd_object_t* obj,
++                           amxd_function_t* func _UNUSED,
++                           amxc_var_t* args,
++                           amxc_var_t* ret) {
++    SAH_TRACEZ_IN(ME);
++
++    const char* intf_name = "Unknown";
++    T_AccessPoint* pAP = wld_ap_fromObj(amxd_object_get_parent(obj));
++    ASSERT_NOT_NULL(pAP, amxd_status_unknown_error, ME, "No AP Ctx");
++
++    uint32_t type             = GET_UINT32(args, "type");
++    const char* bitmap_str    = GET_CHAR(args, "intf_bitmap");  /* optional string, e.g. "0xC0" or "192" */
++    uint32_t intf_bitmap      = 0;
++
++    /* Parse intf_bitmap string: accepts hex (0xC0), decimal (192), or octal (0300).
++     * strtoul with base 0 auto-detects the base from the prefix.
++     * An empty/NULL string means no intf_bitmap (value stays 0). */
++    if(!swl_str_isEmpty(bitmap_str)) {
++        char* end = NULL;
++        unsigned long parsed = strtoul(bitmap_str, &end, 0);
++        if(end != bitmap_str && *end == '\0') {
++            intf_bitmap = (uint32_t) parsed;
++        } else {
++            SAH_TRACEZ_ERROR(ME, "%s: DCS.Simulation: invalid intf_bitmap '%s' — expected hex (0xC0) or decimal (192)",
++                             pAP->alias, bitmap_str);
++            amxc_var_set_type(ret, AMXC_VAR_ID_HTABLE);
++            amxc_var_add_key(cstring_t, ret, "status", "FAIL");
++            amxc_var_add_key(uint32_t,  ret, "type",   type);
++            amxc_var_add_key(cstring_t, ret, "error",  "Invalid intf_bitmap: expected hex (e.g. 0xC0) or decimal (e.g. 192)");
++            SAH_TRACEZ_OUT(ME);
++            return amxd_status_invalid_arg;
++        }
++    }
++
++    /* Map type to human-readable name */
++    switch(type) {
++    case 1:  intf_name = "CW_INTF (Continuous Wave)";    break;
++    case 2:  intf_name = "WLAN_INTF (WLAN interference)"; break;
++    case 4:  intf_name = "AWGN_INTF (AWGN interference)"; break;
++    case 16: intf_name = "OBSS_INTF (Overlapping BSS)";   break;
++    default: break;
++    }
++
++    amxc_var_set_type(ret, AMXC_VAR_ID_HTABLE);
++
++    /* Validate: only 1 (CW), 2 (WLAN), 4 (AWGN), 16 (OBSS) are valid interference types */
++    if(type != 1 && type != 2 && type != 4 && type != 16) {
++        SAH_TRACEZ_ERROR(ME,
++                         "%s: DCS.Simulation: invalid type %u - valid: 1=CW, 2=WLAN, 4=AWGN, 16=OBSS",
++                         pAP->alias, type);
++        amxc_var_add_key(cstring_t, ret, "status",    "FAIL");
++        amxc_var_add_key(uint32_t,  ret, "type",      type);
++        amxc_var_add_key(cstring_t, ret, "error",     "Invalid type: valid values are 1(CW), 2(WLAN), 4(AWGN), 16(OBSS)");
++        SAH_TRACEZ_OUT(ME);
++        return amxd_status_invalid_arg;
++    }
++
++    if(!pAP->initDone) {
++        SAH_TRACEZ_ERROR(ME, "%s: DCS.Simulation: AP not yet initialized", pAP->alias);
++        amxc_var_add_key(cstring_t, ret, "status",    "FAIL");
++        amxc_var_add_key(uint32_t,  ret, "type",      type);
++        amxc_var_add_key(cstring_t, ret, "error",     "AP not yet initialized");
++        SAH_TRACEZ_OUT(ME);
++        return amxd_status_invalid_action;
++    }
++
++    /* Build the hostapd command:
++     *   Without intf_bitmap: "DCS sim <type>"
++     *   With    intf_bitmap: "DCS sim <type> intf_bitmap=0x<hex>"
++     *
++     * intf_bitmap specifies which 20 MHz sub-channels are affected (enum hostapd_dcs_chan_seg):
++     *   0x0001 = DCS_SEG_PRI20  (primary 20 MHz)
++     *   0x0002 = DCS_SEG_SEC20  (secondary 20 MHz)
++     *   0x000C = DCS_SEG_SEC40  (secondary 40 MHz = SEC40_L | SEC40_U)
++     *   0x00F0 = DCS_SEG_SEC80  (secondary 80 MHz)
++     *   0xFF00 = DCS_SEG_SEC160 (secondary 160 MHz)
++     * Used primarily with OBSS (type=16) to specify which sub-channels to puncture.
++     */
++    bool ok;
++    char cmd[256] = {0};
++    char reply[256] = {0};
++
++    if(intf_bitmap != 0) {
++        snprintf(cmd, sizeof(cmd), "DCS sim %u intf_bitmap=0x%x", type, intf_bitmap);
++        SAH_TRACEZ_INFO(ME, "%s: DCS Simulation type=%u (%s) intf_bitmap=0x%x",
++                        pAP->alias, type, intf_name, intf_bitmap);
++    } else {
++        snprintf(cmd, sizeof(cmd), "DCS sim %u", type);
++        SAH_TRACEZ_INFO(ME, "%s: DCS Simulation type=%u (%s)", pAP->alias, type, intf_name);
++    }
++
++    swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtGetResponse(pAP->wpaCtrlInterface, reply, sizeof(reply), "%s", cmd);
++    ok = (rc == SWL_RC_OK) && !swl_str_matches(reply, "FAIL") && !swl_str_matches(reply, "UNKNOWN COMMAND");
++    if(!ok) {
++        SAH_TRACEZ_ERROR(ME, "%s: DCS Simulation failed: cmd='%s' rc=%d reply='%s'",
++                         pAP->alias, cmd, rc, reply);
++    }
++
++    amxc_var_add_key(cstring_t, ret, "status",        ok ? "OK" : "FAIL");
++    amxc_var_add_key(uint32_t,  ret, "type",          type);
++    amxc_var_add_key(cstring_t, ret, "interference",  intf_name);
++    amxc_var_add_key(cstring_t, ret, "interface",     pAP->alias);
++    amxc_var_add_key(uint32_t,  ret, "intf_bitmap",   intf_bitmap);
++    amxc_var_add_key(cstring_t, ret, "command",       ok ? "DCS sim sent successfully" : "DCS sim command failed");
++
++    SAH_TRACEZ_OUT(ME);
++    return ok ? amxd_status_ok : amxd_status_unknown_error;
++}
++
+ void _wld_ap_setDcsConf_ocf(const char* const sig_name,
+                              const amxc_var_t* const data,
+                              void* const priv) {
+@@ -3841,6 +3972,42 @@ void _wld_ap_setQbssConf_ocf(const char*
+ }
+ 
+ 
++/**
++ * @brief Handler for AllowScanDfsChan parameter change.
++ *
++ * When enabled, sends: allow_scan_on_dfs_chan 1
++ * When disabled, sends: allow_scan_on_dfs_chan 0
++ *
++ * This fixes ACS scan failures when DCS is enabled with WLAN/CW interference
++ * and a DCS-triggered channel change occurs on a 5G radio with ACS enabled.
++ * Without this, hostapd rejects ACS scan requests on DFS channels.
++ *
++ * Equivalent to: hostapd_cli -i <wlanX> allow_scan_on_dfs_chan <0|1>
++ */
++static void s_setAllowScanDfsChan_pwf(void* priv _UNUSED, amxd_object_t* object,
++                                       amxd_param_t* param _UNUSED,
++                                       const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_AccessPoint* pAP = wld_ap_fromObj(object);
++    ASSERT_NOT_NULL(pAP, , ME, "INVALID");
++
++    bool enable = amxc_var_dyncast(bool, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set AllowScanDfsChan %d", pAP->alias, enable);
++    pAP->AllowScanDfsChan = enable;
++
++    if(pAP->initDone) {
++        char cmd[64] = {0};
++        snprintf(cmd, sizeof(cmd), "allow_scan_on_dfs_chan %d", enable ? 1 : 0);
++        bool ok = wld_wpaCtrl_sendCmdCheckResponse(pAP->wpaCtrlInterface, cmd, "OK");
++        if(!ok) {
++            SAH_TRACEZ_ERROR(ME, "%s: allow_scan_on_dfs_chan command failed", pAP->alias);
++        }
++    }
++
++    SAH_TRACEZ_OUT(ME);
++}
++
+ SWLA_DM_HDLRS(sApDmHdlrs,
+               ARR(SWLA_DM_PARAM_HDLR("SSIDReference", s_setSSIDRef_pwf),
+                   SWLA_DM_PARAM_HDLR("SSIDAdvertisementEnabled", s_setSsidAdvEnabled_pwf),
+@@ -3886,6 +4053,7 @@ SWLA_DM_HDLRS(sApDmHdlrs,
+ 		  SWLA_DM_PARAM_HDLR("RssiRejectAssocRssi", s_setRssiRejectAssocRssi_pwf),
+                   SWLA_DM_PARAM_HDLR("RssiRejectAssocTimeout", s_setRssiRejectAssocTimeout_pwf),
+                   SWLA_DM_PARAM_HDLR("RssiDeauthGraceSamples", s_setRssiDeauthGraceSamples_pwf),
++                  SWLA_DM_PARAM_HDLR("AllowScanDfsChan", s_setAllowScanDfsChan_pwf),
+                   ),
+               .instAddedCb = s_addApInst_oaf, );
+ 
+--- a/include/wld/wld.h
++++ b/include/wld/wld.h
+@@ -1945,6 +1945,7 @@ struct S_ACCESSPOINT {
+     uint32_t DCS_ReEnableTimer;                     /* DCS re-enable timer (read-only, from get_dcs_enable_timer) */
+     uint32_t DCS_EventAction;                       /* DCS event action bitmask: CW:0x0001, WLAN:0x0002, OBSS:0x0010 */
+     uint32_t DCS_EventNotify;                       /* DCS event notify bitmask: CW:0x0001, WLAN:0x0002, OBSS:0x0010 */
++    bool AllowScanDfsChan;                          /* allow_scan_on_dfs_chan: allow ACS scan on DFS channels when DCS triggers channel change */
+ 
+     int WPS_CertMode;                               /* Correct default behavior for Certification Mode */
+     int WPS_Enable;                                 /* WPS enabled? */
