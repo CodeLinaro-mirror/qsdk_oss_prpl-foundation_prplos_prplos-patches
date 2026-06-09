@@ -1,0 +1,236 @@
+From 413d5ca2a17488241f50385c5cd4a10b3cd68063 Mon Sep 17 00:00:00 2001
+From: Kartheek E <karte@qti.qualcomm.com>
+Date: Mon, 8 Jun 2026 17:58:19 +0530
+Subject: [PATCH] PWHM: Add Disable11be and Disable11ax configurable per-BSS
+
+Signed-off-by: Kartheek E <karte@qti.qualcomm.com>
+---
+ include/wld/wld.h                 |   3 +
+ odl/wld_accesspoint.odl           |  25 ++++++
+ src/nl80211/wld_hostapd_cfgFile.c |   6 ++
+ src/wld_accesspoint.c             | 128 ++++++++++++++++++++++++++++++
+ 4 files changed, 162 insertions(+)
+
+diff --git a/include/wld/wld.h b/include/wld/wld.h
+index b075a5f..070aeea 100644
+--- a/include/wld/wld.h
++++ b/include/wld/wld.h
+@@ -2039,6 +2039,9 @@ struct S_ACCESSPOINT {
+     uint32_t rssiDeauthGraceSamples;
+ 
+     int32_t savedMldUnit; /* Saved SSID.mldUnit before LegacyMode=true; -1 means no saved value */
++    int32_t savedMldUnit11be; /* Saved SSID.mldUnit before Disable11be=true; -1 means no saved value */
++    int32_t savedMldUnit11ax; /* Saved SSID.mldUnit before Disable11ax=true; -1 means no saved value */
++    bool disable11ax;  /* disable_11ax=1 in hostapd BSS config */
+     bool qbssEnable;                /* QBSS Load feature enable flag */
+     uint32_t bssLoadUpdatePeriod;   /* BSS Load Update Period in TUs (only used when qbssEnable=true) */
+     uint32_t chanUtilAvgPeriod;     /* Channel Utilization Averaging Period in TUs (only used when qbssEnable=true) */
+diff --git a/odl/wld_accesspoint.odl b/odl/wld_accesspoint.odl
+index cfa0aeb..033ed55 100644
+--- a/odl/wld_accesspoint.odl
++++ b/odl/wld_accesspoint.odl
+@@ -365,6 +365,31 @@ define rrm_t{
+ 			default false;
+ 		}
+ 
++		/**
++		 * Disable IEEE 802.11be (Wi-Fi 7 / EHT) for this BSS.
++		 * Identical to LegacyMode: removes this BSS from its MLD group
++		 * (saves mldUnit for restore) by setting SSID.MLDUnit=-1.
++		 * The existing cfgFile logic then writes disable_11be=1 and mld_ap=0
++		 * automatically when the BSS has no MLO link.
++		 * Default is false (802.11be enabled per radio capability).
++		 */
++		%persistent bool Disable11be {
++			default false;
++		}
++
++		/**
++		 * Disable IEEE 802.11ax (Wi-Fi 6 / HE) for this BSS.
++		 * Removes BSS from MLD group (saves mldUnit for restore) and writes
++		 * disable_11ax=1 to the hostapd BSS configuration.
++		 * NOTE: Only effective on 2.4GHz and 5GHz radios. On 6GHz this
++		 * parameter is silently ignored because 6GHz requires 802.11ax as
++		 * its minimum standard.
++		 * Default is false (802.11ax enabled per radio capability).
++		 */
++		%persistent bool Disable11ax {
++			default false;
++		}
++
+ 		/**
+ 		 * Add MBO Assoc Disallow Reason in the MBO IE
+ 		 * Possible options are : "Off", "Unspecified", "MaxAssocSTA",
+diff --git a/src/nl80211/wld_hostapd_cfgFile.c b/src/nl80211/wld_hostapd_cfgFile.c
+index d663225..9c1aacf 100644
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -1020,6 +1020,12 @@ static bool s_setVapCommonConfig(T_AccessPoint* pAP, swl_mapChar_t* vapConfigMap
+ 
+     bool enableRad11be = wld_rad_is11beUsable(pRad);
+     bool enableVap11be = enableRad11be;
++    bool enableRad11ax = (wld_rad_checkEnabledRadStd(pRad, SWL_RADSTD_AX) ||
++                          wld_rad_checkEnabledRadStd(pRad, SWL_RADSTD_BE));
++    if(pAP->disable11ax && enableRad11ax) {
++        SAH_TRACEZ_INFO(ME, "%s: disable_11ax=1 (downgrade to 11ac/11n)", pAP->alias);
++        swl_mapChar_addOrSet(vapConfigMap, "disable_11ax", "1");
++    }
+     if(enableRad11be && wld_rad_isMloCapable(pRad)) {
+         if(wld_mld_isLinkUsable(pSSID->pMldLink)) {
+             wld_mld_t* pMld = pSSID->pMldLink->pMld;
+diff --git a/src/wld_accesspoint.c b/src/wld_accesspoint.c
+index 3693d23..1c47487 100644
+--- a/src/wld_accesspoint.c
++++ b/src/wld_accesspoint.c
+@@ -260,6 +260,8 @@ static void s_setDefaults(T_AccessPoint* pAP, T_Radio* pRad, const char* vapName
+     pAP->wpsRestartOnRequest = false;
+     pAP->cfg11u.interworkingEnable = false;
+     memset(pAP->cfg11u.qosMapSet, 0, QOS_MAP_SET_MAX_LEN);
++    pAP->savedMldUnit11be = -1;
++    pAP->savedMldUnit11ax = -1;
+ }
+ 
+ /**
+@@ -1481,6 +1483,130 @@ static void s_setLegacyMode_pwf(void* priv _UNUSED, amxd_object_t* object,
+     SAH_TRACEZ_OUT(ME);
+ }
+ 
++/* Disable11be: removes BSS from MLD so that
++ * cfgFile's existing "if no MLO, then no 11BE" block writes disable_11be=1. */
++static void s_setDisable11be_pwf(void* priv _UNUSED, amxd_object_t* object,
++                                  amxd_param_t* param _UNUSED,
++                                  const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_AccessPoint* pAP = wld_ap_fromObj(object);
++    ASSERT_NOT_NULL(pAP, , ME, "INVALID");
++
++    bool disable = amxc_var_dyncast(bool, newValue);
++
++    if(!pAP->pSSID) {
++        SAH_TRACEZ_ERROR(ME, "%s: pSSID is NULL - cannot change MLDUnit", pAP->alias);
++        SAH_TRACEZ_OUT(ME);
++        return;
++    }
++
++    if(!pAP->pSSID->pBus) {
++        SAH_TRACEZ_ERROR(ME, "%s: pSSID->pBus is NULL - cannot update DM MLDUnit", pAP->alias);
++        SAH_TRACEZ_OUT(ME);
++        return;
++    }
++
++    int32_t newMldUnit;
++    if(disable) {
++        if(pAP->pSSID->mldUnit < 0) {
++            SAH_TRACEZ_INFO(ME, "%s: mldUnit=%d already not in MLD - no action", pAP->alias, pAP->pSSID->mldUnit);
++            SAH_TRACEZ_OUT(ME);
++            return;
++        }
++        pAP->savedMldUnit11be = pAP->pSSID->mldUnit;
++        SAH_TRACEZ_INFO(ME, "%s: Disable11be=1 saving mldUnit=%d, setting SSID.MLDUnit=-1",
++                        pAP->alias, pAP->savedMldUnit11be);
++        newMldUnit = -1;
++    } else {
++        if(pAP->savedMldUnit11be < 0) {
++            SAH_TRACEZ_INFO(ME, "%s: no saved mldUnit (savedMldUnit11be=%d) - nothing to restore",
++                            pAP->alias, pAP->savedMldUnit11be);
++            SAH_TRACEZ_OUT(ME);
++            return;
++        }
++        SAH_TRACEZ_INFO(ME, "%s: Disable11be=0 restoring SSID.MLDUnit=%d",
++                        pAP->alias, pAP->savedMldUnit11be);
++        newMldUnit = pAP->savedMldUnit11be;
++        pAP->savedMldUnit11be = -1;
++    }
++
++    amxd_trans_t trans;
++    ASSERT_TRANSACTION_INIT(pAP->pSSID->pBus, &trans, , ME, "%s: trans init failed", pAP->alias);
++    amxd_trans_set_value(int32_t, &trans, "MLDUnit", newMldUnit);
++    ASSERT_TRANSACTION_LOCAL_DM_END(&trans, , ME, "%s: trans apply failed setting MLDUnit=%d",
++                                    pAP->alias, newMldUnit);
++
++    SAH_TRACEZ_OUT(ME);
++}
++
++static void s_setDisable11ax_pwf(void* priv _UNUSED, amxd_object_t* object,
++                                  amxd_param_t* param _UNUSED,
++                                  const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_AccessPoint* pAP = wld_ap_fromObj(object);
++    ASSERT_NOT_NULL(pAP, , ME, "INVALID");
++
++    bool disable = amxc_var_dyncast(bool, newValue);
++
++    if(!pAP->pSSID) {
++        SAH_TRACEZ_ERROR(ME, "%s: pSSID is NULL - cannot change MLDUnit", pAP->alias);
++        SAH_TRACEZ_OUT(ME);
++        return;
++    }
++
++    if(!pAP->pSSID->pBus) {
++        SAH_TRACEZ_ERROR(ME, "%s: pSSID->pBus is NULL - cannot update DM MLDUnit", pAP->alias);
++        SAH_TRACEZ_OUT(ME);
++        return;
++    }
++
++    if(disable && pAP->pRadio->operatingFrequencyBand == SWL_FREQ_BAND_EXT_6GHZ) {
++        SAH_TRACEZ_WARNING(ME, "%s: Disable11ax=1 ignored on 6GHz BSS "
++                           "(6GHz requires 11ax as minimum standard)", pAP->alias);
++        SAH_TRACEZ_OUT(ME);
++        return;
++    }
++
++    int32_t newMldUnit;
++    if(disable) {
++        pAP->disable11ax = true;
++        if(pAP->pSSID->mldUnit < 0) {
++            SAH_TRACEZ_INFO(ME, "%s: mldUnit=%d already not in MLD, applying disable_11ax flag",
++                            pAP->alias, pAP->pSSID->mldUnit);
++            wld_ap_doSync(pAP);
++            SAH_TRACEZ_OUT(ME);
++            return;
++        }
++        pAP->savedMldUnit11ax = pAP->pSSID->mldUnit;
++        SAH_TRACEZ_INFO(ME, "%s: Disable11ax=1 saving mldUnit=%d, setting SSID.MLDUnit=-1",
++                        pAP->alias, pAP->savedMldUnit11ax);
++        newMldUnit = -1;
++    } else {
++        pAP->disable11ax = false;
++        if(pAP->savedMldUnit11ax < 0) {
++            SAH_TRACEZ_INFO(ME, "%s: no saved mldUnit (savedMldUnit11ax=%d) - clearing disable_11ax flag",
++                            pAP->alias, pAP->savedMldUnit11ax);
++            wld_ap_doSync(pAP);
++            SAH_TRACEZ_OUT(ME);
++            return;
++        }
++        SAH_TRACEZ_INFO(ME, "%s: Disable11ax=0 restoring SSID.MLDUnit=%d",
++                        pAP->alias, pAP->savedMldUnit11ax);
++        newMldUnit = pAP->savedMldUnit11ax;
++        pAP->savedMldUnit11ax = -1;
++    }
++
++    amxd_trans_t trans;
++    ASSERT_TRANSACTION_INIT(pAP->pSSID->pBus, &trans, , ME, "%s: trans init failed", pAP->alias);
++    amxd_trans_set_value(int32_t, &trans, "MLDUnit", newMldUnit);
++    ASSERT_TRANSACTION_LOCAL_DM_END(&trans, , ME, "%s: trans apply failed setting MLDUnit=%d",
++                                    pAP->alias, newMldUnit);
++
++    SAH_TRACEZ_OUT(ME);
++}
++
+ static void s_setMultiAPType_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
+     SAH_TRACEZ_IN(ME);
+ 
+@@ -3824,6 +3950,8 @@ SWLA_DM_HDLRS(sApDmHdlrs,
+                   SWLA_DM_PARAM_HDLR("WDSEnable", s_setWDSEnable_pwf),
+                   SWLA_DM_PARAM_HDLR("MBOEnable", s_setMBOEnable_pwf),
+                   SWLA_DM_PARAM_HDLR("LegacyMode", s_setLegacyMode_pwf),
++                  SWLA_DM_PARAM_HDLR("Disable11be", s_setDisable11be_pwf),
++                  SWLA_DM_PARAM_HDLR("Disable11ax", s_setDisable11ax_pwf),
+                   SWLA_DM_PARAM_HDLR("HtMcsNssSet",  s_setHtMcsNssSet_pwf),
+                   SWLA_DM_PARAM_HDLR("VhtMcsNssSet", s_setVhtMcsNssSet_pwf),
+                   SWLA_DM_PARAM_HDLR("MBOAssocDisallowReason", s_setMBOAssocDisallowReason_pwf),
+-- 
+2.43.0
+
