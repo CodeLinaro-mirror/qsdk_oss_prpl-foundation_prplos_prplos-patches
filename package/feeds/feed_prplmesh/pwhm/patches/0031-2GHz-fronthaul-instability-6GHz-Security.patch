@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000001 Mon Sep 17 00:00:00 2001
+From: Abhi Teja Cholleti <acholleti@qti.qualcomm.com>
+Date: Mon, 09 Jun 2026 00:00:00 +0530
+Subject: [PATCH] pwhm: fix 6GHz VAP security modes and ObssCoexistenceEnable default
+
+- Exclude M_SWL_SECURITY_APMODE_NONE from both secModesAvailable and
+  secModesSupported for 6GHz VAPs, so newly created 6GHz VAPs correctly
+  report ModesAvailable/ModesSupported without "None" (matching AP3/AP6).
+- Set ObssCoexistenceEnable default to 0 in wld-defaults-rads ODL files.
+
+Signed-off-by: Abhi Teja Cholleti <acholleti@qti.qualcomm.com>
+---
+ odl/wld_defaults/20_wld-defaults-rads.odl    | 2 +-
+ odl/wld_defaults/20_wld-defaults-rads.odl.uc | 2 +-
+ src/wld_accesspoint.c                        | 5 +++++
+ 3 files changed, 7 insertions(+), 2 deletions(-)
+
+--- a/src/wld_accesspoint.c
++++ b/src/wld_accesspoint.c
+@@ -234,6 +234,11 @@
+         pAP->secModeEnabled = SWL_SECURITY_APMODE_WPA2_P;
+     }
+     pAP->secModesAvailable = pAP->secModesSupported;
++    /* Exclude M_SWL_SECURITY_APMODE_NONE from secModesAvailable for 6GHz VAPs */
++    if(pAP->pRadio->operatingFrequencyBand == SWL_FREQ_BAND_EXT_6GHZ) {
++        pAP->secModesAvailable &= ~M_SWL_SECURITY_APMODE_NONE;
++        pAP->secModesSupported &= ~M_SWL_SECURITY_APMODE_NONE;
++    }
+     pAP->mfpConfig = SWL_SECURITY_MFPMODE_DISABLED;
+     pAP->MF_AddressList = NULL;
+     pAP->MF_AddressListBlockSync = false;
+--- a/odl/wld_defaults/20_wld-defaults-rads.odl
++++ b/odl/wld_defaults/20_wld-defaults-rads.odl
+@@ -73,7 +73,7 @@
+                 parameter RxPowerSaveEnabled = 1;
+                 parameter RetryLimit = 7;
+                 parameter TargetWakeTimeEnable = 1;
+-                parameter ObssCoexistenceEnable = 1;
++                parameter ObssCoexistenceEnable = 0;
+                 object MACConfig {
+                     parameter UseBaseMacOffset = false;
+                     parameter UseLocalBitForGuest = true;
+--- a/odl/wld_defaults/20_wld-defaults-rads.odl.uc
++++ b/odl/wld_defaults/20_wld-defaults-rads.odl.uc
+@@ -21,7 +21,7 @@
+                 parameter RxPowerSaveEnabled = 1;
+                 parameter RetryLimit = 7;
+                 parameter TargetWakeTimeEnable = 1;
+-                parameter ObssCoexistenceEnable = 1;
++                parameter ObssCoexistenceEnable = 0;
+                 object MACConfig {
+                     parameter UseBaseMacOffset = false;
+                     parameter UseLocalBitForGuest = true;
