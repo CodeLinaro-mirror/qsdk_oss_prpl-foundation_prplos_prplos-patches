@@ -1,0 +1,118 @@
+From: Kartheek E <karte@qti.qualcomm.com>
+Date: Thu, 11 Jun 2026
+Subject: [PATCH] ieee80211bn: add UHR (802.11bn) support
+
+Add ieee80211bn (802.11bn / UHR / Wi-Fi 8) support in pwhm
+
+Signed-off-by: Kartheek E <karte@qti.qualcomm.com>
+---
+ include/wld/wld_nl80211_compat.h  |  2 ++
+ include/wld/wld_radio.h           |  1 +
+ src/wld_radio.c                   | 10 ++++++++++
+ src/nl80211/wld_hostapd_cfgFile.c |  4 ++++
+ src/nl80211/wld_nl80211_parser.c  | 34 ++++++++++++++++++++++++++++++++--
+ 5 files changed, 49 insertions(+), 2 deletions(-)
+
+diff --git a/include/wld/wld_radio.h b/include/wld/wld_radio.h
+--- a/include/wld/wld_radio.h
++++ b/include/wld/wld_radio.h
+@@ -257,1 +257,2 @@ bool wld_rad_is11beUsable(T_Radio* pRad);
++bool wld_rad_is11bnUsable(T_Radio* pRad);
+ bool wld_rad_hasIntfEnableSyncMissing(T_Radio* pRad);
+
+diff --git a/src/wld_radio.c b/src/wld_radio.c
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -3864,5 +3864,15 @@ bool wld_rad_is11beUsable(T_Radio* pRad) {
+     return false;
+ }
+
++bool wld_rad_is11bnUsable(T_Radio* pRad) {
++    ASSERTS_NOT_NULL(pRad, false, ME, "NULL");
++    if(wld_rad_hasConnectedEpWithRadStd(pRad, SWL_RADSTD_BN) ||
++       (wld_rad_checkEnabledRadStd(pRad, SWL_RADSTD_BN) &&
++        (!wld_rad_isMloCapable(pRad) || wld_rad_hasUsableApMld(pRad, 1)))) {
++        return true;
++    }
++    return false;
++}
++
+ bool wld_rad_hasActiveApMld(T_Radio* pRad, uint32_t minNLinks) {
+     ASSERTS_NOT_NULL(pRad, false, ME, "NULL");
+
+diff --git a/src/nl80211/wld_hostapd_cfgFile.c b/src/nl80211/wld_hostapd_cfgFile.c
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -272,3 +272,4 @@ void wld_hostapd_cfgFile_setRadioConfig(T_Radio* pRad, swl_mapChar_t* radConfig
+     bool enableRad11be = wld_rad_is11beUsable(pRad);
++    bool enableRad11bn = wld_rad_is11bnUsable(pRad);
+     /*
+      * hostapd: Enabling HE is mandatory to enable EHT mode
+@@ -575,3 +576,6 @@ void wld_hostapd_cfgFile_setRadioConfig(T_Radio* pRad, swl_mapChar_t* radConfig
+         swl_mapCharFmt_addValInt32(radConfigMap, "ieee80211be", enableRad11be);
+     }
++    if(SWL_BIT_IS_SET(pRad->supportedStandards, SWL_RADSTD_BN)) {
++        swl_mapCharFmt_addValInt32(radConfigMap, "ieee80211bn", enableRad11bn);
++    }
+     if(enableRad11be) {
+
+diff --git a/src/nl80211/wld_nl80211_parser.c b/src/nl80211/wld_nl80211_parser.c
+--- a/src/nl80211/wld_nl80211_parser.c
++++ b/src/nl80211/wld_nl80211_parser.c
+@@ -716,7 +716,5 @@ static void s_parseEhtCapPhy(const struct nlattr* tbIfType, wld_nl80211_bandDef_
+     }
+
+     pBand->radStdsMask |= M_SWL_RADSTD_BE;
+-    pBand->radStdsMask |= M_SWL_RADSTD_BN;
+-
+     /* Support For 320MHz In 6 GHz */
+     if(phyCaps->support_320mhz &&
+@@ -808,2 +806,33 @@ static swl_rc_ne s_parseEhtAttrs(struct nlattr* tbBand[], wld_nl80211_bandDef_t*
+
++/**
++ * Parse UHR (802.11bn) band capabilities from nl80211 iftype data.
++ */
++static swl_rc_ne s_parseUhrAttrs(struct nlattr* tbBand[], wld_nl80211_bandDef_t* pBand) {
++    ASSERTS_NOT_NULL(tbBand, SWL_RC_INVALID_PARAM, ME, "NULL");
++    ASSERTS_NOT_NULL(pBand, SWL_RC_INVALID_PARAM, ME, "NULL");
++    ASSERTS_NOT_NULL(tbBand[NL80211_BAND_ATTR_IFTYPE_DATA], SWL_RC_OK, ME, "no iftype data");
++    struct nlattr* nlIfType = NULL;
++    int rem = 0;
++    struct nlattr* tbIfType[NL80211_BAND_IFTYPE_ATTR_UHR_CAP_PHY + 1] = {};
++    nla_for_each_nested(nlIfType, tbBand[NL80211_BAND_ATTR_IFTYPE_DATA], rem) {
++        nla_parse(tbIfType, NL80211_BAND_IFTYPE_ATTR_UHR_CAP_PHY, nla_data(nlIfType), nla_len(nlIfType), NULL);
++        if(!s_isSupportedNlIfType(tbIfType[NL80211_BAND_IFTYPE_ATTR_IFTYPES])) {
++            continue;
++        }
++        struct nlattr* uhrCapPhyAttr = tbIfType[NL80211_BAND_IFTYPE_ATTR_UHR_CAP_PHY];
++        if(uhrCapPhyAttr == NULL) {
++            continue;
++        }
++        /* Only set BN if the UHR PHY capability element is non-zero,
++         * i.e. the driver truly advertises 802.11bn (UHR) support. */
++        uint8_t uhrCapPhy[5] = {0};
++        NLA_GET_DATA(uhrCapPhy, uhrCapPhyAttr, sizeof(uhrCapPhy));
++        if(memcmp(uhrCapPhy, &((uint8_t[5]) {0}), sizeof(uhrCapPhy)) != 0) {
++            pBand->radStdsMask |= M_SWL_RADSTD_BN;
++            SAH_TRACEZ_INFO(ME, "UHR (802.11bn) capability detected: setting M_SWL_RADSTD_BN");
++        }
++    }
++    return SWL_RC_DONE;
++}
++
+ SWL_TABLE(sChanDfsStatusMap,
+@@ -950,4 +979,5 @@ swl_rc_ne s_parseWiphyBands(struct nlattr* tb[], wld_nl80211_wiphyInfo_t* pWiphy
+         s_parseHeAttrs(tbBand, pBand);
+         s_parseEhtAttrs(tbBand, pBand);
++        s_parseUhrAttrs(tbBand, pBand);
+         s_parseChans(tbBand, pBand);
+         s_parseDataTransmitRates(tbBand, pBand);
+
+diff --git a/include/wld/wld_nl80211_compat.h b/include/wld/wld_nl80211_compat.h
+--- a/include/wld/wld_nl80211_compat.h
++++ b/include/wld/wld_nl80211_compat.h
+@@ -292,2 +292,4 @@
+ #define NL80211_BAND_IFTYPE_ATTR_EHT_CAP_PPE 11
++#define NL80211_BAND_IFTYPE_ATTR_UHR_CAP_MAC 12
++#define NL80211_BAND_IFTYPE_ATTR_UHR_CAP_PHY 13
+ #define NL80211_CHAN_WIDTH_320 13
