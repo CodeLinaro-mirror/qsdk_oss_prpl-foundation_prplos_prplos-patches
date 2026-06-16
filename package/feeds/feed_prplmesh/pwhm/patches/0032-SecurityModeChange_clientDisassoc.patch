@@ -1,0 +1,58 @@
+From d453dcad40d06e862908578aeb260a311805b185 Mon Sep 17 00:00:00 2001
+From: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+Date: Tue, 16 Jun 2026 14:40:15 +0530
+Subject: [PATCH] SecurityModeChange disconnects clients fix
+
+Signed-off-by: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+---
+
+Index: pwhm-v7.27.2/src/Plugin/wifiGen_fsm.c
+===================================================================
+--- pwhm-v7.27.2.orig/src/Plugin/wifiGen_fsm.c
++++ pwhm-v7.27.2/src/Plugin/wifiGen_fsm.c
+@@ -1235,6 +1235,12 @@ static bool s_doSetSsid(T_AccessPoint* p
+     SAH_TRACEZ_INFO(ME, "%s: set ssid (%s)", pSSID->Name, pSSID->SSID);
+     wld_secDmn_action_rc_ne rc = wld_ap_hostapd_setSsid(pAP, pSSID->SSID);
+     ASSERT_FALSE(rc < SECDMN_ACTION_OK_DONE, true, ME, "%s: fail to set ssid", pSSID->Name);
++    // Force RELOAD_SECKEY for SSID changes to avoid warm apply issue on RE_ADD_LINK operations
++    if(rc > SECDMN_ACTION_OK_DONE) {
++        SAH_TRACEZ_WARNING(ME, "Forcing SSID change to use RELOAD_SECKEY (was action=%d) - AP=%s", rc, pAP->alias);
++        rc = SECDMN_ACTION_OK_NEED_RELOAD_SECKEY;
++    }
++
+     s_schedNextAction(rc, pAP, pRad);
+     return true;
+ }
+@@ -1253,7 +1259,11 @@ static bool s_doSetApSec(T_AccessPoint*
+     wld_ap_hostapd_sendCommand(pAP, "PMKSA_FLUSH", "refreshConfig");
+     wld_secDmn_action_rc_ne rc = wld_ap_hostapd_setSecParams(pAP);
+     ASSERT_FALSE(rc < SECDMN_ACTION_OK_DONE, true, ME, "%s: fail to set secret key", pAP->alias);
+-
++    // Force RELOAD_SECKEY for security changes to avoid warm apply issue on RE_ADD_LINK/RE_ADD operations
++    if(rc > SECDMN_ACTION_OK_DONE) {
++        SAH_TRACEZ_WARNING(ME, "Forcing security change to use RELOAD_SECKEY (was action=%d) - AP=%s", rc, pAP->alias);
++        rc = SECDMN_ACTION_OK_NEED_RELOAD_SECKEY;
++    }
+     s_schedNextAction(rc, pAP, pRad);
+     return true;
+ }
+@@ -2280,7 +2290,18 @@ static void s_mldChange(wld_mldChange_t*
+     ASSERT_NOT_NULL(pRad, , ME, "No link radio");
+     ASSERTS_EQUALS(pRad->vendor->fsmMngr, &mngr, , ME, "%s: radio managed by vendor specific FSM", pRad->Name);
+     if((event->event == WLD_MLD_EVT_ADD) || (event->event == WLD_MLD_EVT_UPDATE)) {
+-        wifiGen_mld_reconfigureNeighLinkSSIDs(pSSID);
++        T_AccessPoint* pAP = pSSID->AP_HOOK;
++        bool shouldReconfigureNeighbors = true;
++        if(pAP && pAP->enable && (pAP->status == APSTI_ENABLED)) {
++            bool isSecurityChange = isBitSetLongArray(pAP->fsm.FSM_BitActionArray, FSM_BW, GEN_FSM_MOD_SEC);
++            bool isSsidChange = isBitSetLongArray(pAP->fsm.FSM_BitActionArray, FSM_BW, GEN_FSM_MOD_SSID);
++            if(isSecurityChange || isSsidChange) {
++                shouldReconfigureNeighbors = false;
++            }
++        }
++        if(shouldReconfigureNeighbors) {
++            wifiGen_mld_reconfigureNeighLinkSSIDs(pSSID);
++        }
+     }
+ }
+ 
