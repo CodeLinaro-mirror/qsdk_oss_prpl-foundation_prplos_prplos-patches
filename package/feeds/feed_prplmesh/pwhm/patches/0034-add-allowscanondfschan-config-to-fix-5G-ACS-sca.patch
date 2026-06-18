@@ -1,0 +1,216 @@
+From ce679bcdd1ed0c3aa2af43edaf93ff187f599834 Mon Sep 17 00:00:00 2001
+From: Atchaya R <ratchaya@qti.qualcomm.com>
+Date: Thu, 18 Jun 2026 23:01:32 +0530
+Subject: [PATCH] pwhm: add allowscanondfschan config to fix 5G ACS scan
+ failure
+
+Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
+---
+ include/wld/wld.h       |  2 +-
+ odl/wld_accesspoint.odl | 19 -------------------
+ odl/wld_radio.odl       | 19 +++++++++++++++++++
+ src/wld_accesspoint.c   | 38 --------------------------------------
+ src/wld_radio.c         | 37 +++++++++++++++++++++++++++++++++++++
+ 5 files changed, 57 insertions(+), 58 deletions(-)
+
+diff --git a/include/wld/wld.h b/include/wld/wld.h
+index 47a9bc5..494e535 100644
+--- a/include/wld/wld.h
++++ b/include/wld/wld.h
+@@ -1641,6 +1641,7 @@ struct WLD_RADIO {
+     uint8_t dfsEventLogLimit;                                               /* MAX number of DFS events to be saved into datamodel */
+     uint8_t dfsEventNbr;                                                    /* Number of DFS events currently in datamodel */
+     uint8_t dfsFileEventNbr;                                                /* Number of DFS events currently in dfsEvent log file */
++    bool AllowScanDfsChan;                                                  /* allow_scan_on_dfs_chan: allow ACS scan on DFS channels when DCS triggers channel change */
+ 
+     unsigned long drv_caps;                                                 /* Driver capablities for this Radio */
+ 
+@@ -1946,7 +1947,6 @@ struct S_ACCESSPOINT {
+     uint32_t DCS_ReEnableTimer;                     /* DCS re-enable timer (read-only, from get_dcs_enable_timer) */
+     uint32_t DCS_EventAction;                       /* DCS event action bitmask: CW:0x0001, WLAN:0x0002, OBSS:0x0010 */
+     uint32_t DCS_EventNotify;                       /* DCS event notify bitmask: CW:0x0001, WLAN:0x0002, OBSS:0x0010 */
+-    bool AllowScanDfsChan;                          /* allow_scan_on_dfs_chan: allow ACS scan on DFS channels when DCS triggers channel change */
+ 
+     int WPS_CertMode;                               /* Correct default behavior for Certification Mode */
+     int WPS_Enable;                                 /* WPS enabled? */
+diff --git a/odl/wld_accesspoint.odl b/odl/wld_accesspoint.odl
+index 91625ab..b3b42dd 100644
+--- a/odl/wld_accesspoint.odl
++++ b/odl/wld_accesspoint.odl
+@@ -390,25 +390,6 @@ define rrm_t{
+ 			default false;
+ 		}
+ 
+-		/**
+-		 * Allow ACS scan on DFS channels when DCS triggers a channel change.
+-		 *
+-		 * When DCS is enabled (e.g. WLAN or CW interference detection) on a 5G radio
+-		 * with ACS enabled, a DCS-triggered channel change causes hostapd to reject
+-		 * subsequent ACS scan requests on DFS channels, resulting in ACS scan failure.
+-		 * Setting this to true sends:
+-		 *   hostapd_cli -i <wlanX> allow_scan_on_dfs_chan 1
+-		 * which allows hostapd to include DFS channels in ACS scans.
+-		 *
+-		 * false = DFS channels excluded from ACS scan (default, hostapd default behaviour)
+-		 * true  = DFS channels included in ACS scan (workaround for DCS + ACS coexistence)
+-		 *
+-		 * Not persistent: applied dynamically via hostapd_cli at runtime.
+-		 */
+-		%persistent bool AllowScanDfsChan {
+-			default false;
+-		}
+-
+ 		/**
+ 		 * Add MBO Assoc Disallow Reason in the MBO IE
+ 		 * Possible options are : "Off", "Unspecified", "MaxAssocSTA",
+diff --git a/odl/wld_radio.odl b/odl/wld_radio.odl
+index 7584029..ec834e8 100644
+--- a/odl/wld_radio.odl
++++ b/odl/wld_radio.odl
+@@ -3637,6 +3637,25 @@ define probelist_t{
+ 			default 0;
+ 		}
+ 
++		/**
++		 * Allow ACS scan on DFS channels when DCS triggers a channel change.
++		 *
++		 * When DCS is enabled (e.g. WLAN or CW interference detection) on a 5G radio
++		 * with ACS enabled, a DCS-triggered channel change causes hostapd to reject
++		 * subsequent ACS scan requests on DFS channels, resulting in ACS scan failure.
++		 * Setting this to true sends:
++		 *   hostapd_cli -i <wlanX> ALLOW_SCAN_ON_DFS_CHAN 1
++		 * which allows hostapd to include DFS channels in ACS scans.
++		 *
++		 * false = DFS channels excluded from ACS scan (default, hostapd default behaviour)
++		 * true  = DFS channels included in ACS scan (workaround for DCS + ACS coexistence)
++		 *
++		 * Applied dynamically via hostapd_cli at runtime using the radio's first active AP.
++		 */
++		%persistent bool AllowScanDfsChan {
++			default false;
++		}
++
+ 		/**
+ 		 * Static puncturing feature
+ 		 */
+diff --git a/src/wld_accesspoint.c b/src/wld_accesspoint.c
+index c67aeb6..ee2dede 100644
+--- a/src/wld_accesspoint.c
++++ b/src/wld_accesspoint.c
+@@ -200,7 +200,6 @@ static void s_setDefaults(T_AccessPoint* pAP, T_Radio* pRad, const char* vapName
+     pAP->DCS_ReEnableTimer = 1800;
+     pAP->DCS_EventAction = 0;
+     pAP->DCS_EventNotify = 0;
+-    pAP->AllowScanDfsChan = false;
+ 
+     pAP->UAPSDCapability = pAP->pFA->mfn_misc_has_support(pAP->pRadio, pAP, "UAPSD", 0);
+     pAP->WMMCapability = pAP->pFA->mfn_misc_has_support(pAP->pRadio, pAP, "WME", 0);
+@@ -4099,42 +4098,6 @@ void _wld_ap_setQbssConf_ocf(const char* const sig_name,
+ }
+ 
+ 
+-/**
+- * @brief Handler for AllowScanDfsChan parameter change.
+- *
+- * When enabled, sends: allow_scan_on_dfs_chan 1
+- * When disabled, sends: allow_scan_on_dfs_chan 0
+- *
+- * This fixes ACS scan failures when DCS is enabled with WLAN/CW interference
+- * and a DCS-triggered channel change occurs on a 5G radio with ACS enabled.
+- * Without this, hostapd rejects ACS scan requests on DFS channels.
+- *
+- * Equivalent to: hostapd_cli -i <wlanX> allow_scan_on_dfs_chan <0|1>
+- */
+-static void s_setAllowScanDfsChan_pwf(void* priv _UNUSED, amxd_object_t* object,
+-                                       amxd_param_t* param _UNUSED,
+-                                       const amxc_var_t* const newValue) {
+-    SAH_TRACEZ_IN(ME);
+-
+-    T_AccessPoint* pAP = wld_ap_fromObj(object);
+-    ASSERT_NOT_NULL(pAP, , ME, "INVALID");
+-
+-    bool enable = amxc_var_dyncast(bool, newValue);
+-    SAH_TRACEZ_INFO(ME, "%s: set AllowScanDfsChan %d", pAP->alias, enable);
+-    pAP->AllowScanDfsChan = enable;
+-
+-    if(pAP->initDone) {
+-        char cmd[64] = {0};
+-        snprintf(cmd, sizeof(cmd), "allow_scan_on_dfs_chan %d", enable ? 1 : 0);
+-        bool ok = wld_wpaCtrl_sendCmdCheckResponse(pAP->wpaCtrlInterface, cmd, "OK");
+-        if(!ok) {
+-            SAH_TRACEZ_ERROR(ME, "%s: allow_scan_on_dfs_chan command failed", pAP->alias);
+-        }
+-    }
+-
+-    SAH_TRACEZ_OUT(ME);
+-}
+-
+ SWLA_DM_HDLRS(sApDmHdlrs,
+               ARR(SWLA_DM_PARAM_HDLR("SSIDReference", s_setSSIDRef_pwf),
+                   SWLA_DM_PARAM_HDLR("SSIDAdvertisementEnabled", s_setSsidAdvEnabled_pwf),
+@@ -4182,7 +4145,6 @@ SWLA_DM_HDLRS(sApDmHdlrs,
+ 		  SWLA_DM_PARAM_HDLR("RssiRejectAssocRssi", s_setRssiRejectAssocRssi_pwf),
+                   SWLA_DM_PARAM_HDLR("RssiRejectAssocTimeout", s_setRssiRejectAssocTimeout_pwf),
+                   SWLA_DM_PARAM_HDLR("RssiDeauthGraceSamples", s_setRssiDeauthGraceSamples_pwf),
+-                  SWLA_DM_PARAM_HDLR("AllowScanDfsChan", s_setAllowScanDfsChan_pwf),
+                   ),
+               .instAddedCb = s_addApInst_oaf, );
+ 
+diff --git a/src/wld_radio.c b/src/wld_radio.c
+index 6667b6d..9b401de 100644
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -5608,6 +5608,42 @@ static void s_setDiscardAwgnEvent_pwf(void* priv _UNUSED, amxd_object_t* object,
+     SAH_TRACEZ_OUT(ME);
+ }
+ 
++/**
++ * @brief Handler for AllowScanDfsChan parameter change on the Radio object.
++ *
++ * When enabled, sends: ALLOW_SCAN_ON_DFS_CHAN 1
++ * When disabled, sends: ALLOW_SCAN_ON_DFS_CHAN 0
++ *
++ * This fixes ACS scan failures when DCS is enabled with WLAN/CW interference
++ * and a DCS-triggered channel change occurs on a 5G radio with ACS enabled.
++ * Without this, hostapd rejects ACS scan requests on DFS channels.
++ *
++ * The command is sent to the radio's first active AP (always available),
++ * which routes it to the correct hostapd_iface (per-radio setting).
++ *
++ * Equivalent to: hostapd_cli -i <wlanX> ALLOW_SCAN_ON_DFS_CHAN <0|1>
++ */
++static void s_setAllowScanDfsChan_pwf(void* priv _UNUSED, amxd_object_t* object,
++                                       amxd_param_t* param _UNUSED,
++                                       const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_Radio* pRad = wld_rad_fromObj(object);
++    ASSERTS_NOT_NULL(pRad, , ME, "NULL");
++
++    bool enable = amxc_var_dyncast(bool, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set AllowScanDfsChan %d", pRad->Name, enable);
++    pRad->AllowScanDfsChan = enable;
++
++    ASSERTI_TRUE(wld_rad_isActive(pRad), , ME, "%s: AllowScanDfsChan: radio not active", pRad->Name);
++    T_AccessPoint* pAP = s_getAcsAp(pRad);
++    ASSERTI_NOT_NULL(pAP, , ME, "%s: AllowScanDfsChan: no AP available", pRad->Name);
++    wld_wpaCtrl_sendCmdFmtCheckResponse(pAP->wpaCtrlInterface, "OK",
++                                        "ALLOW_SCAN_ON_DFS_CHAN %d", enable ? 1 : 0);
++
++    SAH_TRACEZ_OUT(ME);
++}
++
+ SWLA_DM_HDLRS(sRadioDmHdlrs,
+               ARR(SWLA_DM_PARAM_HDLR("RegulatoryDomain", s_setCountryCode_pwf),
+                   SWLA_DM_PARAM_HDLR("IEEE80211hEnabled", s_set80211hEnable_pwf),
+@@ -5658,6 +5694,7 @@ SWLA_DM_HDLRS(sRadioDmHdlrs,
+                   SWLA_DM_PARAM_HDLR("BasicDataTransmitRates", s_setBasicDataTransmitRates_pwf),
+                   SWLA_DM_PARAM_HDLR("PowerType", s_setPowerType_pwf),
+                   SWLA_DM_PARAM_HDLR("DiscardAwgnEvent", s_setDiscardAwgnEvent_pwf),
++                  SWLA_DM_PARAM_HDLR("AllowScanDfsChan", s_setAllowScanDfsChan_pwf),
+                   ),
+               .instAddedCb = s_addInstance_oaf);
+ 
+-- 
+2.34.1
+
