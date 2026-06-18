@@ -1,0 +1,47 @@
+From a42696a81099e6c543d6fe01ce60dde8cffba847 Mon Sep 17 00:00:00 2001
+From: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+Date: Wed, 17 Jun 2026 14:58:36 +0530
+Subject: [PATCH] Fix wiphy name mismatch issue
+
+Signed-off-by: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+---
+
+Index: pwhm-v7.27.2/src/Plugin/wifiGen_rad.c
+===================================================================
+--- pwhm-v7.27.2.orig/src/Plugin/wifiGen_rad.c
++++ pwhm-v7.27.2/src/Plugin/wifiGen_rad.c
+@@ -602,7 +602,7 @@ int wifiGen_rad_supports(T_Radio* pRad,
+     rc = wld_rad_nl80211_getInterfaceInfo(pRad, &ifaceInfo);
+     ASSERT_FALSE(rc < SWL_RC_OK, rc, ME, "Fail to get nl80211 rad iface info");
+     pRad->wiphy = ifaceInfo.wiphy;
+-    swl_str_copy(pRad->wiphyName, sizeof(pRad->wiphyName), pRad->Name);
++    swl_str_copy(pRad->wiphyName, sizeof(pRad->wiphyName), wiphyInfo.name);
+     pRad->wDevId = ifaceInfo.wDevId;
+     wifiGen_setRadEvtHandlers(pRad);
+ 
+Index: pwhm-v7.27.2/src/nl80211/wld_hostapd_ap_api.c
+===================================================================
+--- pwhm-v7.27.2.orig/src/nl80211/wld_hostapd_ap_api.c
++++ pwhm-v7.27.2/src/nl80211/wld_hostapd_ap_api.c
+@@ -1728,7 +1728,7 @@ swl_rc_ne wld_ap_hostapd_addBssConf(T_Ac
+     ASSERTI_FALSE(swl_str_isEmpty(confFilePath), SWL_RC_ERROR, ME, "%s: empty config file", pAP->alias);
+ 
+     SAH_TRACEZ_INFO(ME, "%s: adding bss config using %s", pAP->alias, confFilePath);
+-    swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pgIface, "OK", "ADD bss_config=%s:%s", pRad->wiphyName, confFilePath);
++    swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pgIface, "OK", "ADD bss_config=%s:%s", pRad->Name, confFilePath);
+     ASSERT_TRUE(swl_rc_isOk(rc), rc, ME, "%s: fail to add bss config", pAP->alias);
+ 
+     return rc;
+Index: pwhm-v7.27.2/src/nl80211/wld_rad_hostapd_api.c
+===================================================================
+--- pwhm-v7.27.2.orig/src/nl80211/wld_rad_hostapd_api.c
++++ pwhm-v7.27.2/src/nl80211/wld_rad_hostapd_api.c
+@@ -482,7 +482,7 @@ swl_rc_ne wld_rad_hostapd_addConf(T_Radi
+     ASSERT_NOT_NULL(pgIface, SWL_RC_ERROR, ME, "%s: hostapd has no global iface ready", pR->Name);
+     ASSERT_STR(pR->wiphyName, SWL_RC_ERROR, ME, "%s: Empty wPhy name", pR->Name);
+     swl_rc_ne rc;
+-    rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pgIface, "OK", "ADD bss_config=%s:%s", pR->wiphyName, pR->hostapd->cfgFile);
++    rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pgIface, "OK", "ADD bss_config=%s:%s", pR->Name, pR->hostapd->cfgFile);
+     //the call may timeout while being applied, but that only happens on success
+     if(rc == SWL_RC_NOT_AVAILABLE) {
+         rc = SWL_RC_CONTINUE;
