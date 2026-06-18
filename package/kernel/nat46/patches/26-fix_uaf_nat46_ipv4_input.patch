@@ -1,0 +1,49 @@
+Author: KRITHI D SHETTY <kdshetty@qti.qualcomm.com>
+Date:   Tue Feb 10 15:39:30 2026 +0530
+
+    nat46: Fix use-after-free in nat46_ipv4_input
+
+    The nat46_ipv4_input function initializes the 'hdr4' pointer to the
+    IPv4 header at the beginning of the function and calls
+    pskb_expand_head() to ensure sufficient headroom for the IPv6 header.
+    If pskb_expand_head() reallocates the skb data buffer, the memory
+    pointed to by 'hdr4' is freed.
+
+    However, the code subsequently accesses 'hdr4->ihl' to calculate the
+    size for skb_push() and the new IPv6 payload length. This results in
+    a use-after-free read, as detected by KFENCE.
+
+    Fix this by saving the value of 'hdr4->ihl' before calling pskb_expand_head()
+
+    Change-Id: I724cc834d868f76674a2aa9ee33fb5eadc8490c7
+    Signed-off-by: KRITHI D SHETTY <kdshetty@qti.qualcomm.com>
+---
+Index: nat46-2022.09.19~4c5beee2/nat46/modules/nat46-core.c
+===================================================================
+--- nat46-2022.09.19~4c5beee2.orig/nat46/modules/nat46-core.c
++++ nat46-2022.09.19~4c5beee2/nat46/modules/nat46-core.c
+@@ -2391,6 +2391,7 @@ int nat46_ipv4_input(struct sk_buff *old
+   uint16_t tot_len;
+   uint8_t protocol;
+   uint16_t frag_off, id;
++  int ihl = 0;
+ 
+   char v6saddr[16], v6daddr[16];
+ 
+@@ -2481,6 +2482,7 @@ int nat46_ipv4_input(struct sk_buff *old
+   ttl = hdr4->ttl;
+   frag_off = hdr4->frag_off;
+   id = hdr4->id;
++  ihl = hdr4->ihl;
+ 
+   /* Remove any debris in the socket control block */
+   memset(IP6CB(old_skb), 0, sizeof(struct inet6_skb_parm));
+@@ -2501,7 +2503,7 @@ int nat46_ipv4_input(struct sk_buff *old
+     }
+   }
+ 
+-  skb_push(old_skb, IPV6HDRSIZE - (hdr4->ihl << 2) + (add_frag_header?8:0)); /* push boundary by extra 20 bytes */
++  skb_push(old_skb, IPV6HDRSIZE - (ihl << 2) + (add_frag_header?8:0)); /* push boundary by extra 20 bytes */
+ 
+   skb_reset_network_header(old_skb);
+   skb_set_transport_header(old_skb, IPV6HDRSIZE + (add_frag_header?8:0) ); /* transport (TCP/UDP/ICMP/...) header starts after 40 bytes */
