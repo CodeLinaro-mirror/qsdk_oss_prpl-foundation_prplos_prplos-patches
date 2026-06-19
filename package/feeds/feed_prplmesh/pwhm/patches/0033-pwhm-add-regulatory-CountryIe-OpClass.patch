@@ -1,0 +1,537 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Abhi Teja Cholleti <abhiteja.cholleti@qti.qualcomm.com>
+Date: Wed, 18 Jun 2026 00:00:00 +0530
+Subject: [PATCH] pwhm: add regulatory, opclass, pureN and band display commands
+
+Add ubus-cli accessible methods to WiFi.Radio.{i}:
+
+  - setCountryId / getCountryId   : set/get country by numeric ID via
+                                    cfg80211tool set_country_id / get_country_id
+  - countryIe / getCountryIe      : enable/disable Country IE in beacons via
+                                    hostapd COUNTRY_IE / GET_COUNTRY_IE
+  - opclassTbl / getOpclassTbl    : set/get operating-class table index (0-6)
+  - disableOpclassChans           : enable/disable channels per operating class
+  - setPureN / getPureN           : enable/disable 802.11n-pure mode
+  - displayBandChans              : band-channel info via cfg80211tool
+  - displaySuperChanList          : extended channel list (EIRP, flags, AFC)
+
+cfg80211tool phy-level commands resolve the nl80211 phy name from
+/sys/class/net/<wlan>/phy80211/name and use radio_idx syntax:
+  cfg80211tool phyX radio_idx 0 <cmd> [value]
+
+Signed-off-by: Abhi Teja Cholleti <abhiteja.cholleti@qti.qualcomm.com>
+---
+ odl/wld_radio.odl |  87 +++++++++
+ src/wld_radio.c   | 416 ++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 503 insertions(+)
+
+--- a/odl/wld_radio.odl	2026-06-18 18:00:23.969268493 +0530
++++ b/odl/wld_radio.odl	2026-06-18 16:24:13.100095806 +0530
+@@ -424,6 +424,87 @@
+ 		void setChanspec(%mandatory uint16 channel, string bandwidth, string reason, bool direct, string reasonExt);
+ 
+ 		/**
++		 * Set country by numeric ID (cfg80211tool set_country_id).
++		 * @param countryId: numeric country ID (e.g. 840 for US).
++		 * @return true on success.
++		 */
++		bool setCountryId(%in %mandatory uint32 countryId);
++
++		/**
++		 * Get current numeric country ID (cfg80211tool get_country_id).
++		 * @return country ID string as reported by the driver.
++		 */
++		string getCountryId();
++
++		/**
++		 * Enable or disable Country IE (802.11d) in beacons (hostapd COUNTRY_IE).
++		 * @param enable: true = include Country IE, false = suppress it.
++		 * @return true on success.
++		 */
++		bool countryIe(%in %mandatory bool enable);
++
++		/**
++		 * Get current Country IE setting (hostapd GET_COUNTRY_IE).
++		 * @return "0" (disabled) or "1" (enabled).
++		 */
++		string getCountryIe();
++
++		/**
++		 * Set the operating-class table index (hostapd SET_OPCLASS_TBL_IDX).
++		 * Valid values are 0-6.
++		 * @param tableIdx: operating class table index (0-6).
++		 * @return true on success.
++		 */
++		bool opclassTbl(%in %mandatory uint32 tableIdx);
++
++		/**
++		 * Get the current operating-class table index (hostapd GET_OPCLASS_TBL_IDX).
++		 * @return index as a string.
++		 */
++		string getOpclassTbl();
++
++		/**
++		 * Enable or disable specific channels within an operating class
++		 * (hostapd DISABLE_OPCLASS_CHANS).
++		 * @param disable: true = disable listed channels, false = re-enable them.
++		 * @param opclass: operating class number (e.g. 81 for 2.4 GHz 20 MHz).
++		 * @param channels: comma-separated list of channel numbers, e.g. "1,6,11".
++		 * @return true on success.
++		 */
++		bool disableOpclassChans(%in %mandatory bool disable,
++		                         %in %mandatory uint32 opclass,
++		                         %in %mandatory string channels);
++
++		/**
++		 * Enable or disable 802.11n-pure mode (hostapd SET_PUREN).
++		 * When enabled, only HT-capable stations are admitted.
++		 * @param enable: true = enable pure-N mode, false = disable.
++		 * @return true on success.
++		 */
++		bool setPureN(%in %mandatory bool enable);
++
++		/**
++		 * Get current 802.11n-pure mode setting (hostapd GET_PUREN).
++		 * @return "0" (disabled) or "1" (enabled).
++		 */
++		string getPureN();
++
++		/**
++		 * Display band-channel information for this radio
++		 * (cfg80211tool display_band_chans).
++		 * @return driver output string, or empty string on failure.
++		 */
++		string displayBandChans();
++
++		/**
++		 * Display the extended super-channel list for this radio
++		 * (cfg80211tool display_super_chan_list).
++		 * Returns EIRP power, channel flags, state, min/max BW, AFC_NOT_DONE.
++		 * @return driver output string, or empty string on failure.
++		 */
++		string displaySuperChanList();
++
++		/**
+ 		 * Get the maximum TX Power value for the given channel
+ 		 * @param channel: target channel.
+ 		 */
+
+--- a/src/wld_radio.c	2026-06-18 18:00:23.969268493 +0530
++++ b/src/wld_radio.c	2026-06-18 18:00:04.796280362 +0530
+@@ -3774,6 +3774,416 @@
+     return (ret < 0) ? amxd_status_unknown_error : amxd_status_ok;
+ }
+ 
++/* ============================================================
++ * Regulatory / operating-class / pure-N / band helpers
++ *
++ * All hostapd-ctrl commands follow the invokeACS pattern:
++ *   - get first active (or enabled) AP on this radio
++ *   - send command via wpa_ctrl
++ *   - return result via amxc_var retval
++ *
++ * cfg80211tool commands use popen() to query the driver directly.
++ * ============================================================ */
++
++/* Maximum reply buffer for wpa_ctrl responses */
++#define QCA_CTRL_REPLY_MAX 1024
++/* Maximum output buffer for popen-based cfg80211tool queries */
++#define QCA_POPEN_OUT_MAX  4096
++
++/* Helper: get the first usable AP for wpa_ctrl commands on pRad. */
++static T_AccessPoint* s_getCtrlAp(T_Radio* pRad) {
++    T_AccessPoint* pAP = wld_rad_getFirstActiveAp(pRad);
++    if(pAP == NULL) {
++        pAP = wld_rad_getFirstEnabledVap(pRad);
++    }
++    return pAP;
++}
++
++/* Helper: run a cfg80211tool command via popen() and store stdout in outBuf.
++ * outBuf must be at least outBufSize bytes; always NUL-terminated.
++ * Returns SWL_RC_OK on success, SWL_RC_ERROR on popen failure. */
++static swl_rc_ne s_cfg80211tool_run(const char* cmd, char* outBuf, size_t outBufSize) {
++    FILE* fp = popen(cmd, "r");
++    if(fp == NULL) {
++        SAH_TRACEZ_ERROR(ME, "popen failed for: %s", cmd);
++        if(outBufSize > 0) outBuf[0] = '\0';
++        return SWL_RC_ERROR;
++    }
++    size_t total = 0;
++    size_t capacity = outBufSize > 0 ? outBufSize - 1 : 0;
++    while(total < capacity) {
++        size_t nr = fread(outBuf + total, 1, capacity - total, fp);
++        if(nr == 0) break;
++        total += nr;
++    }
++    if(outBufSize > 0) outBuf[total] = '\0';
++    pclose(fp);
++    return SWL_RC_OK;
++}
++
++/* Helper: resolve the nl80211 phy name (e.g. "phy2") for a wlan interface.
++ * Reads /sys/class/net/<wlan>/phy80211/name; falls back to wlanName on error. */
++static void s_get_phy_name(const char* wlanName, char* phyBuf, size_t phyBufSize) {
++    char path[128];
++    snprintf(path, sizeof(path), "/sys/class/net/%s/phy80211/name", wlanName);
++    FILE* fp = fopen(path, "r");
++    if(!fp) {
++        snprintf(phyBuf, phyBufSize, "%s", wlanName);
++        return;
++    }
++    size_t n = fread(phyBuf, 1, phyBufSize - 1, fp);
++    fclose(fp);
++    phyBuf[n] = '\0';
++    while(n > 0 && (phyBuf[n - 1] == '\n' || phyBuf[n - 1] == '\r'))
++        phyBuf[--n] = '\0';
++}
++
++/* ---- setCountryId ---- */
++amxd_status_t _setCountryId(amxd_object_t* object,
++                             amxd_function_t* func _UNUSED,
++                             amxc_var_t* args,
++                             amxc_var_t* retval) {
++    T_Radio* pR = wld_rad_fromObj(object);
++    ASSERT_NOT_NULL(pR, amxd_status_unknown_error, ME, "NULL");
++
++    uint32_t countryId = GET_UINT32(args, "countryId");
++
++    char phyName[IFNAMSIZ];
++    s_get_phy_name(pR->wiphyName, phyName, sizeof(phyName));
++
++    char cmd[256];
++    char out[QCA_POPEN_OUT_MAX];
++    /* cfg80211tool requires: phyX radio_idx <idx> <cmd> [value]
++     * radio_idx must immediately follow the phy interface name. */
++    snprintf(cmd, sizeof(cmd),
++             "cfg80211tool %s radio_idx 0 set_country_id %u 2>&1",
++             phyName, countryId);
++
++    SAH_TRACEZ_INFO(ME, "%s: setCountryId %u cmd='%s'", pR->Name, countryId, cmd);
++    bool success = (s_cfg80211tool_run(cmd, out, sizeof(out)) == SWL_RC_OK);
++
++    amxc_var_set(bool, retval, success);
++    return success ? amxd_status_ok : amxd_status_unknown_error;
++}
++
++/* ---- getCountryId ---- */
++amxd_status_t _getCountryId(amxd_object_t* object,
++                             amxd_function_t* func _UNUSED,
++                             amxc_var_t* args _UNUSED,
++                             amxc_var_t* retval) {
++    T_Radio* pR = wld_rad_fromObj(object);
++    ASSERT_NOT_NULL(pR, amxd_status_unknown_error, ME, "NULL");
++
++    char cmd[256];
++    char out[QCA_POPEN_OUT_MAX];
++    char phyName[IFNAMSIZ];
++    s_get_phy_name(pR->wiphyName, phyName, sizeof(phyName));
++    snprintf(cmd, sizeof(cmd),
++             "cfg80211tool %s radio_idx 0 get_country_id 2>&1",
++             phyName);
++
++    SAH_TRACEZ_INFO(ME, "%s: getCountryId cmd='%s'", pR->Name, cmd);
++    if(s_cfg80211tool_run(cmd, out, sizeof(out)) != SWL_RC_OK) {
++        SAH_TRACEZ_ERROR(ME, "%s: getCountryId: popen failed", pR->Name);
++        amxc_var_set(cstring_t, retval, "");
++        return amxd_status_unknown_error;
++    }
++    size_t len = strlen(out);
++    while(len > 0 && (out[len - 1] == '\n' || out[len - 1] == '\r')) {
++        out[--len] = '\0';
++    }
++    amxc_var_set(cstring_t, retval, out);
++    return amxd_status_ok;
++}
++
++/* ---- countryIe (set) ---- */
++amxd_status_t _countryIe(amxd_object_t* object,
++                          amxd_function_t* func _UNUSED,
++                          amxc_var_t* args,
++                          amxc_var_t* retval) {
++    T_Radio* pR = wld_rad_fromObj(object);
++    ASSERT_NOT_NULL(pR, amxd_status_unknown_error, ME, "NULL");
++
++    bool enable = GET_BOOL(args, "enable");
++
++    T_AccessPoint* pAP = s_getCtrlAp(pR);
++    if(pAP == NULL) {
++        SAH_TRACEZ_ERROR(ME, "%s: countryIe: no AP available", pR->Name);
++        amxc_var_set(bool, retval, false);
++        return amxd_status_unknown_error;
++    }
++
++    SAH_TRACEZ_INFO(ME, "%s: countryIe %d via %s", pR->Name, enable ? 1 : 0, pAP->alias);
++    swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtCheckResponse(
++        pAP->wpaCtrlInterface, "OK", "COUNTRY_IE %d", enable ? 1 : 0);
++
++    bool success = swl_rc_isOk(rc);
++    if(!success) {
++        SAH_TRACEZ_ERROR(ME, "%s: countryIe %d failed (rc=%d)", pR->Name, enable ? 1 : 0, rc);
++    }
++    amxc_var_set(bool, retval, success);
++    return success ? amxd_status_ok : amxd_status_unknown_error;
++}
++
++/* ---- getCountryIe ---- */
++amxd_status_t _getCountryIe(amxd_object_t* object,
++                             amxd_function_t* func _UNUSED,
++                             amxc_var_t* args _UNUSED,
++                             amxc_var_t* retval) {
++    T_Radio* pR = wld_rad_fromObj(object);
++    ASSERT_NOT_NULL(pR, amxd_status_unknown_error, ME, "NULL");
++
++    T_AccessPoint* pAP = s_getCtrlAp(pR);
++    if(pAP == NULL) {
++        SAH_TRACEZ_ERROR(ME, "%s: getCountryIe: no AP available", pR->Name);
++        amxc_var_set(cstring_t, retval, "");
++        return amxd_status_unknown_error;
++    }
++
++    char reply[QCA_CTRL_REPLY_MAX] = {0};
++    swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtGetResponse(
++        pAP->wpaCtrlInterface, reply, sizeof(reply), "GET_COUNTRY_IE");
++
++    if(!swl_rc_isOk(rc)) {
++        SAH_TRACEZ_ERROR(ME, "%s: getCountryIe failed (rc=%d)", pR->Name, rc);
++        amxc_var_set(cstring_t, retval, "");
++        return amxd_status_unknown_error;
++    }
++    size_t len = strlen(reply);
++    while(len > 0 && (reply[len - 1] == '\n' || reply[len - 1] == '\r' || reply[len - 1] == ' ')) {
++        reply[--len] = '\0';
++    }
++    amxc_var_set(cstring_t, retval, reply);
++    return amxd_status_ok;
++}
++
++/* ---- opclassTbl (set) ---- */
++amxd_status_t _opclassTbl(amxd_object_t* object,
++                           amxd_function_t* func _UNUSED,
++                           amxc_var_t* args,
++                           amxc_var_t* retval) {
++    T_Radio* pR = wld_rad_fromObj(object);
++    ASSERT_NOT_NULL(pR, amxd_status_unknown_error, ME, "NULL");
++
++    uint32_t tableIdx = GET_UINT32(args, "tableIdx");
++    if(tableIdx > 6) {
++        SAH_TRACEZ_ERROR(ME, "%s: opclassTbl invalid index %u (must be 0-6)", pR->Name, tableIdx);
++        amxc_var_set(bool, retval, false);
++        return amxd_status_invalid_arg;
++    }
++
++    T_AccessPoint* pAP = s_getCtrlAp(pR);
++    if(pAP == NULL) {
++        SAH_TRACEZ_ERROR(ME, "%s: opclassTbl: no AP available", pR->Name);
++        amxc_var_set(bool, retval, false);
++        return amxd_status_unknown_error;
++    }
++
++    SAH_TRACEZ_INFO(ME, "%s: opclassTbl %u via %s", pR->Name, tableIdx, pAP->alias);
++    swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtCheckResponse(
++        pAP->wpaCtrlInterface, "OK", "SET_OPCLASS_TBL_IDX %u", tableIdx);
++
++    bool success = swl_rc_isOk(rc);
++    if(!success) {
++        SAH_TRACEZ_ERROR(ME, "%s: opclassTbl %u failed (rc=%d)", pR->Name, tableIdx, rc);
++    }
++    amxc_var_set(bool, retval, success);
++    return success ? amxd_status_ok : amxd_status_unknown_error;
++}
++
++/* ---- getOpclassTbl ---- */
++amxd_status_t _getOpclassTbl(amxd_object_t* object,
++                              amxd_function_t* func _UNUSED,
++                              amxc_var_t* args _UNUSED,
++                              amxc_var_t* retval) {
++    T_Radio* pR = wld_rad_fromObj(object);
++    ASSERT_NOT_NULL(pR, amxd_status_unknown_error, ME, "NULL");
++
++    T_AccessPoint* pAP = s_getCtrlAp(pR);
++    if(pAP == NULL) {
++        SAH_TRACEZ_ERROR(ME, "%s: getOpclassTbl: no AP available", pR->Name);
++        amxc_var_set(cstring_t, retval, "");
++        return amxd_status_unknown_error;
++    }
++
++    char reply[QCA_CTRL_REPLY_MAX] = {0};
++    swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtGetResponse(
++        pAP->wpaCtrlInterface, reply, sizeof(reply), "GET_OPCLASS_TBL_IDX");
++
++    if(!swl_rc_isOk(rc)) {
++        SAH_TRACEZ_ERROR(ME, "%s: getOpclassTbl failed (rc=%d)", pR->Name, rc);
++        amxc_var_set(cstring_t, retval, "");
++        return amxd_status_unknown_error;
++    }
++    size_t len = strlen(reply);
++    while(len > 0 && (reply[len - 1] == '\n' || reply[len - 1] == '\r' || reply[len - 1] == ' ')) {
++        reply[--len] = '\0';
++    }
++    amxc_var_set(cstring_t, retval, reply);
++    return amxd_status_ok;
++}
++
++/* ---- disableOpclassChans ---- */
++amxd_status_t _disableOpclassChans(amxd_object_t* object,
++                                    amxd_function_t* func _UNUSED,
++                                    amxc_var_t* args,
++                                    amxc_var_t* retval) {
++    T_Radio* pR = wld_rad_fromObj(object);
++    ASSERT_NOT_NULL(pR, amxd_status_unknown_error, ME, "NULL");
++
++    bool disable     = GET_BOOL(args, "disable");
++    uint32_t opclass = GET_UINT32(args, "opclass");
++    char* channels   = amxc_var_dyncast(cstring_t, GET_ARG(args, "channels"));
++
++    if(!channels || channels[0] == '\0') {
++        SAH_TRACEZ_ERROR(ME, "%s: disableOpclassChans: channels must not be empty", pR->Name);
++        amxc_var_set(bool, retval, false);
++        return amxd_status_invalid_arg;
++    }
++
++    T_AccessPoint* pAP = s_getCtrlAp(pR);
++    if(pAP == NULL) {
++        SAH_TRACEZ_ERROR(ME, "%s: disableOpclassChans: no AP available", pR->Name);
++        amxc_var_set(bool, retval, false);
++        return amxd_status_unknown_error;
++    }
++
++    /* Build "DISABLE_OPCLASS_CHANS <0|1> <opclass> <ch1> [<ch2> ...]"
++     * Input channels is comma-separated; replace commas with spaces. */
++    char chanBuf[256];
++    snprintf(chanBuf, sizeof(chanBuf), "%s", channels);
++    for(char* p = chanBuf; *p; p++) {
++        if(*p == ',') *p = ' ';
++    }
++
++    SAH_TRACEZ_INFO(ME, "%s: disableOpclassChans disable=%d opclass=%u chans='%s' via %s",
++                    pR->Name, disable ? 1 : 0, opclass, chanBuf, pAP->alias);
++    swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtCheckResponse(
++        pAP->wpaCtrlInterface, "OK",
++        "DISABLE_OPCLASS_CHANS %d %u %s", disable ? 1 : 0, opclass, chanBuf);
++
++    bool success = swl_rc_isOk(rc);
++    if(!success) {
++        SAH_TRACEZ_ERROR(ME, "%s: disableOpclassChans failed (rc=%d)", pR->Name, rc);
++    }
++    amxc_var_set(bool, retval, success);
++    return success ? amxd_status_ok : amxd_status_unknown_error;
++}
++
++/* ---- setPureN ---- */
++amxd_status_t _setPureN(amxd_object_t* object,
++                         amxd_function_t* func _UNUSED,
++                         amxc_var_t* args,
++                         amxc_var_t* retval) {
++    T_Radio* pR = wld_rad_fromObj(object);
++    ASSERT_NOT_NULL(pR, amxd_status_unknown_error, ME, "NULL");
++
++    bool enable = GET_BOOL(args, "enable");
++
++    T_AccessPoint* pAP = s_getCtrlAp(pR);
++    if(pAP == NULL) {
++        SAH_TRACEZ_ERROR(ME, "%s: setPureN: no AP available", pR->Name);
++        amxc_var_set(bool, retval, false);
++        return amxd_status_unknown_error;
++    }
++
++    SAH_TRACEZ_INFO(ME, "%s: setPureN %d via %s", pR->Name, enable ? 1 : 0, pAP->alias);
++    swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtCheckResponse(
++        pAP->wpaCtrlInterface, "OK", "SET_PUREN %d", enable ? 1 : 0);
++
++    bool success = swl_rc_isOk(rc);
++    if(!success) {
++        SAH_TRACEZ_ERROR(ME, "%s: setPureN %d failed (rc=%d)", pR->Name, enable ? 1 : 0, rc);
++    }
++    amxc_var_set(bool, retval, success);
++    return success ? amxd_status_ok : amxd_status_unknown_error;
++}
++
++/* ---- getPureN ---- */
++amxd_status_t _getPureN(amxd_object_t* object,
++                          amxd_function_t* func _UNUSED,
++                          amxc_var_t* args _UNUSED,
++                          amxc_var_t* retval) {
++    T_Radio* pR = wld_rad_fromObj(object);
++    ASSERT_NOT_NULL(pR, amxd_status_unknown_error, ME, "NULL");
++
++    T_AccessPoint* pAP = s_getCtrlAp(pR);
++    if(pAP == NULL) {
++        SAH_TRACEZ_ERROR(ME, "%s: getPureN: no AP available", pR->Name);
++        amxc_var_set(cstring_t, retval, "");
++        return amxd_status_unknown_error;
++    }
++
++    char reply[QCA_CTRL_REPLY_MAX] = {0};
++    swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtGetResponse(
++        pAP->wpaCtrlInterface, reply, sizeof(reply), "GET_PUREN");
++
++    if(!swl_rc_isOk(rc)) {
++        SAH_TRACEZ_ERROR(ME, "%s: getPureN failed (rc=%d)", pR->Name, rc);
++        amxc_var_set(cstring_t, retval, "");
++        return amxd_status_unknown_error;
++    }
++    size_t len = strlen(reply);
++    while(len > 0 && (reply[len - 1] == '\n' || reply[len - 1] == '\r' || reply[len - 1] == ' ')) {
++        reply[--len] = '\0';
++    }
++    amxc_var_set(cstring_t, retval, reply);
++    return amxd_status_ok;
++}
++
++/* ---- displayBandChans ---- */
++amxd_status_t _displayBandChans(amxd_object_t* object,
++                                  amxd_function_t* func _UNUSED,
++                                  amxc_var_t* args _UNUSED,
++                                  amxc_var_t* retval) {
++    T_Radio* pR = wld_rad_fromObj(object);
++    ASSERT_NOT_NULL(pR, amxd_status_unknown_error, ME, "NULL");
++
++    char cmd[256];
++    char out[QCA_POPEN_OUT_MAX];
++    char phyName[IFNAMSIZ];
++    s_get_phy_name(pR->wiphyName, phyName, sizeof(phyName));
++    snprintf(cmd, sizeof(cmd),
++             "cfg80211tool %s radio_idx 0 display_band_chans 2>&1",
++             phyName);
++
++    SAH_TRACEZ_INFO(ME, "%s: displayBandChans cmd='%s'", pR->Name, cmd);
++    if(s_cfg80211tool_run(cmd, out, sizeof(out)) != SWL_RC_OK) {
++        SAH_TRACEZ_ERROR(ME, "%s: displayBandChans: popen failed", pR->Name);
++        amxc_var_set(cstring_t, retval, "");
++        return amxd_status_unknown_error;
++    }
++    amxc_var_set(cstring_t, retval, out);
++    return amxd_status_ok;
++}
++
++/* ---- displaySuperChanList ---- */
++amxd_status_t _displaySuperChanList(amxd_object_t* object,
++                                     amxd_function_t* func _UNUSED,
++                                     amxc_var_t* args _UNUSED,
++                                     amxc_var_t* retval) {
++    T_Radio* pR = wld_rad_fromObj(object);
++    ASSERT_NOT_NULL(pR, amxd_status_unknown_error, ME, "NULL");
++
++    char cmd[256];
++    char out[QCA_POPEN_OUT_MAX];
++    char phyName[IFNAMSIZ];
++    s_get_phy_name(pR->wiphyName, phyName, sizeof(phyName));
++    snprintf(cmd, sizeof(cmd),
++             "cfg80211tool %s radio_idx 0 display_super_chan_list 2>&1",
++             phyName);
++
++    SAH_TRACEZ_INFO(ME, "%s: displaySuperChanList cmd='%s'", pR->Name, cmd);
++    if(s_cfg80211tool_run(cmd, out, sizeof(out)) != SWL_RC_OK) {
++        SAH_TRACEZ_ERROR(ME, "%s: displaySuperChanList: popen failed", pR->Name);
++        amxc_var_set(cstring_t, retval, "");
++        return amxd_status_unknown_error;
++    }
++    amxc_var_set(cstring_t, retval, out);
++    return amxd_status_ok;
++}
++
++
+ /* Find first vap from radio */
+ T_AccessPoint* wld_rad_getFirstVap(T_Radio* pR) {
+     ASSERT_NOT_NULL(pR, NULL, ME, "NULL");
