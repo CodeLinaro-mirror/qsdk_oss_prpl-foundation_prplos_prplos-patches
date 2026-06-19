@@ -1,0 +1,46 @@
+From 3f8a2b1c4d5e6f7890abcdef1234567890abcdef Mon Sep 17 00:00:00 2001
+From: Harini Pavithra Elangovan <helangov@qti.qualcomm.com>
+Date: Wed, 18 Jun 2026 11:00:00 +0530
+Subject: [PATCH] pwhm: Fix WiFi.Radio.{i}.ExtensionChannel setter
+
+Signed-off-by: Harini Pavithra Elangovan <helangov@qti.qualcomm.com>
+---
+ src/wld_radio.c | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+), 5 deletions(-)
+
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -711,6 +711,15 @@ static void s_setObssCoexistenceEnable_pwf(void* priv _UNUSED, amxd_object_t* o
+-static void s_setExtensionChannel_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
+-    T_Radio* pR = wld_rad_fromObj(object);
+-    ASSERT_NOT_NULL(pR, , ME, "NULL");
+-    const char* valStr = amxc_var_constcast(cstring_t, newValue);
+-    SAH_TRACEZ_INFO(ME, "%s: set ExtensionChannel %s", pR->Name, valStr);
+-}
++static void s_setExtensionChannel_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++    T_Radio* pR = wld_rad_fromObj(object);
++    ASSERT_NOT_NULL(pR, , ME, "NULL");
++    const char* valStr = amxc_var_constcast(cstring_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set ExtensionChannel %s", pR->Name, valStr);
++    wld_channel_extensionPos_e extChan = swl_conv_charToEnum(valStr, Rad_SupCExt,
++                                                              SWL_ARRAY_SIZE(Rad_SupCExt),
++                                                              WLD_CHANNEL_EXTENTION_POS_AUTO);
++    ASSERTI_NOT_EQUALS(pR->extensionChannel, extChan, , ME, "%s: same ExtensionChannel %s",
++                       pR->Name, valStr);
++    pR->extensionChannel = extChan;
++    wld_rad_doSync(pR);
++    SAH_TRACEZ_OUT(ME);
++}
+@@ -2368,1 +2368,10 @@ static void syncData_OBJ2Radio(amxd_object_t* object, T_Radio* pR, int set) {
+         guardInt = NULL;
++        char* extChanStr = amxd_object_get_cstring_t(object, "ExtensionChannel", NULL);
++        if(extChanStr && !swl_str_nmatches(Rad_SupCExt[pR->extensionChannel], extChanStr,
++                                           strlen(Rad_SupCExt[pR->extensionChannel]))) {
++            pR->extensionChannel = swl_conv_charToEnum(extChanStr, Rad_SupCExt,
++                                                        SWL_ARRAY_SIZE(Rad_SupCExt),
++                                                        WLD_CHANNEL_EXTENTION_POS_AUTO);
++            commit = true;
++        }
++        free(extChanStr);
++        extChanStr = NULL;
