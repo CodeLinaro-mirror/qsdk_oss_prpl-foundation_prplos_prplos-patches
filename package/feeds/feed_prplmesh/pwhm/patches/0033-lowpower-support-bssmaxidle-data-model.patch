@@ -1,0 +1,82 @@
+From 6cdeb345867f0214fb6e235229cd2906406faf36 Mon Sep 17 00:00:00 2001
+From: rayakuma <rayakuma@qti.qualcomm.com>
+Date: Fri, 19 Jun 2026 12:53:05 +0530
+Subject: [PATCH] lowpowerbssmaxidledatamodel
+Signed-off-by: Rohith Kumar <rayakuma@qti.qualcomm.com>
+
+Add support for BssMaxIdlePeriod in the data model and propagate
+it to hostapd configuration.
+
+- Introduce parameter handler for BssMaxIdlePeriod
+- Update driverCfg accordingly
+- Map to hostapd parameters:
+  - bss_max_idle
+  - max_acceptable_idle_period
+- Support values:
+  0  -> disable
+  >0 -> enable with configured timeout
+  -1 -> use hostapd default behavior
+
+Change-Id: Ia6e79845a981a3d2f72a713476165fe7d7254e15
+---
+ .../src/nl80211/wld_hostapd_cfgFile.c             | 10 ++++++++++
+ .../pwhm-v7.27.2/src/wld_accesspoint.c            | 15 ++++++++++++++-
+ 2 files changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/src/nl80211/wld_hostapd_cfgFile.c b/src/nl80211/wld_hostapd_cfgFile.c
+index ff8f4d233c..85071bbac4 100644
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -1462,6 +1462,16 @@ static bool s_setVapCommonConfig(T_AccessPoint* pAP, swl_mapChar_t* vapConfigMap
+     if(pAP->StaInactivityTimeout) {
+         swl_mapCharFmt_addValInt32(vapConfigMap, "ap_max_inactivity", pAP->StaInactivityTimeout);
+     }
++    if(pAP->driverCfg.bssMaxIdlePeriod == 0) {
++        swl_mapCharFmt_addValInt32(vapConfigMap, "bss_max_idle", 0);
++    } else if(pAP->driverCfg.bssMaxIdlePeriod > 0) {
++        swl_mapCharFmt_addValInt32(vapConfigMap, "bss_max_idle", 1);
++        swl_mapCharFmt_addValInt32(vapConfigMap, "max_acceptable_idle_period",
++                                   pAP->driverCfg.bssMaxIdlePeriod);
++    } else {
++        /* bssMaxIdlePeriod == -1 means auto: hostapd default (bss_max_idle=1)
++         * is used, no override needed */
++    }
+     /* when kickoff roaming station is active, number of tries during 4-way handshak is increased*/
+     if(pRad->kickRoamStaEnabled) {
+         swl_mapCharFmt_addValInt32(vapConfigMap, "wpa_group_update_count", 8);
+diff --git a/src/wld_accesspoint.c b/src/wld_accesspoint.c
+index c67aeb67b1..9ba0813a3e 100644
+--- a/src/wld_accesspoint.c
++++ b/src/wld_accesspoint.c
+@@ -3567,6 +3567,17 @@ bool wld_ap_getDesiredState(T_AccessPoint* pAp) {
+     return true;
+ }
+ 
++static void s_setBssMaxIdlePeriod_pwf(void* priv _UNUSED,
++                                      amxd_object_t* object,
++                                      amxd_param_t* param _UNUSED,
++                                      const amxc_var_t* const newValue) {
++    T_AccessPoint* pAP = wld_ap_fromObj(amxd_object_get_parent(object));
++    ASSERTI_NOT_NULL(pAP, , ME, "NULL");
++    int32_t bssMaxIdlePeriod = amxc_var_dyncast(int32_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set BssMaxIdlePeriod %d", pAP->alias, bssMaxIdlePeriod);
++    pAP->driverCfg.bssMaxIdlePeriod = bssMaxIdlePeriod;
++}
++
+ static void s_setApDriverConfig_ocf(void* priv _UNUSED, amxd_object_t* object, const amxc_var_t* const newParamValues _UNUSED) {
+     SAH_TRACEZ_IN(ME);
+ 
+@@ -3592,7 +3603,9 @@ static void s_setApDriverConfig_ocf(void* priv _UNUSED, amxd_object_t* object, c
+     SAH_TRACEZ_OUT(ME);
+ }
+ 
+-SWLA_DM_HDLRS(sApDriverConfigDmHdlrs, ARR(), .objChangedCb = s_setApDriverConfig_ocf);
++SWLA_DM_HDLRS(sApDriverConfigDmHdlrs,
++              ARR(SWLA_DM_PARAM_HDLR("BssMaxIdlePeriod", s_setBssMaxIdlePeriod_pwf)),
++              .objChangedCb = s_setApDriverConfig_ocf);
+ 
+ void _wld_ap_setDriverConfig_ocf(const char* const sig_name,
+                                  const amxc_var_t* const data,
+-- 
+2.34.1
+
