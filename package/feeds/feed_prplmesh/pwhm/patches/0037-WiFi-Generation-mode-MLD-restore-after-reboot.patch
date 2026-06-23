@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000
+From: Kartheek E <karte@qti.qualcomm.com>
+Date: Mon, 22 Jun 2026 00:00:00 +0530
+Subject: [PATCH] pwhm: Fix Disable11be/Disable11ax MLD restore after reboot
+
+Signed-off-by: Kartheek E <karte@qti.qualcomm.com>
+---
+ src/wld_accesspoint.c | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/src/wld_accesspoint.c b/src/wld_accesspoint.c
+index 1c47487..abc1234 100644
+--- a/src/wld_accesspoint.c
++++ b/src/wld_accesspoint.c
+@@ -261,6 +261,4 @@ static void s_setDefaults(T_AccessPoint* pAP, T_Radio* pRad, const char* vapNam
+     pAP->wpsRestartOnRequest = false;
+     pAP->cfg11u.interworkingEnable = false;
+     memset(pAP->cfg11u.qosMapSet, 0, QOS_MAP_SET_MAX_LEN);
+-    pAP->savedMldUnit11be = -1;
+-    pAP->savedMldUnit11ax = -1;
+ }
+--
+2.43.0
