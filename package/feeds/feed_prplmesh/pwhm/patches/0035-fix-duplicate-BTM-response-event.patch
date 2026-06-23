@@ -1,0 +1,19 @@
+From a7f3c91d2e84b056f1234567890abcdef12345678 Mon Sep 17 00:00:00 2001
+From: Harini Pavithra Elangovan <helangov@qti.qualcomm.com>
+Date: Mon, 22 Jun 2026 09:00:00 +0530
+Subject: [PATCH] fix: prevent duplicate BSS-TM-RESP signal from mgmt frame callback
+
+Signed-off-by: Harini Pavithra Elangovan <helangov@qti.qualcomm.com>
+---
+ src/Plugin/wifiGen_eventHandlers.c | 2 --
+ 1 file changed, 0 insertions(+), 2 deletions(-)
+
+--- a/src/Plugin/wifiGen_eventHandlers.c
++++ b/src/Plugin/wifiGen_eventHandlers.c
+@@ -1313,6 +1313,4 @@
+     } else {
+         SAH_TRACEZ_INFO(ME, "%s BSS-TM-RESP %s status_code=%d", pAP->alias, mac.cMac, replyCode);
+     }
+-
+-    s_btmReplyEvt(pAP, pAP->alias, &mac, replyCode, &targetBssid);
+ }
