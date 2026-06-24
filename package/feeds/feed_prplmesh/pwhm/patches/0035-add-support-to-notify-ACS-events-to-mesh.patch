@@ -1,0 +1,175 @@
+From 9f61224e07fdbe5799e04a034848e7a7deb72162 Mon Sep 17 00:00:00 2001
+From: Atchaya R <ratchaya@qti.qualcomm.com>
+Date: Fri, 19 Jun 2026 17:07:59 +0530
+Subject: [PATCH] pwhm: add support to notify ACS STARTED, FAILED and COMPLETED
+ events to prplMesh
+
+Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
+---
+ include/wld/wld_wpaCtrl_events.h   |  6 ++-
+ src/Plugin/wifiGen_eventHandlers.c | 65 +++++++++++++++++++++++++++++-
+ src/nl80211/wld_wpaCtrl_events.c   | 19 ++++++++-
+ 3 files changed, 86 insertions(+), 4 deletions(-)
+
+diff --git a/include/wld/wld_wpaCtrl_events.h b/include/wld/wld_wpaCtrl_events.h
+index f6b4bb4..077bcdb 100644
+--- a/include/wld/wld_wpaCtrl_events.h
++++ b/include/wld/wld_wpaCtrl_events.h
+@@ -229,7 +229,9 @@ typedef void (* wld_wpaCtrl_dfsNewChannelCb_f)(void* userData, char* ifName, swl
+ typedef void (* wld_wpaCtrl_uplinkCsaCb_f)(void* userData, char* ifName, char* params);
+ typedef void (* wld_wpaCtrl_uplinkCsaTimeoutCb_f)(void* userData, char* ifName, char* params);
+ typedef void (* wld_wpaCtrl_awgnInterferenceDetectedCb_f)(void* userData, char* ifName, char* params);
+-typedef void (* wld_wpaCtrl_acsCompletedCb_f)(void* userData, char* ifName, swl_chanspec_t* chanSpec);
++typedef void (* wld_wpaCtrl_acsCompletedCb_f)(void* userData, char* ifName, swl_chanspec_t* chanSpec, char* params);
++typedef void (* wld_wpaCtrl_acsStartedCb_f)(void* userData, char* ifName, char* params);
++typedef void (* wld_wpaCtrl_acsFailedCb_f)(void* userData, char* ifName, char* params);
+ typedef void (* wld_wpaCtrl_mainApSetupCompletedCb_f)(void* userData, char* ifName);
+ typedef void (* wld_wpaCtrl_mainApDisabledCb_f)(void* userData, char* ifName);
+ typedef void (* wld_wpaCtrl_syncOnReadyCb_f)(void* userData, char* ifName, bool state);
+@@ -261,6 +263,8 @@ typedef struct {
+     wld_wpaCtrl_uplinkCsaTimeoutCb_f fUplinkCsaTimeoutCb;
+     wld_wpaCtrl_awgnInterferenceDetectedCb_f fAwgnInterferenceDetectedCb; // AWGN interference detected
+     wld_wpaCtrl_acsCompletedCb_f fAcsCompletedCb;                        // ACS completed (DCS-triggered)
++    wld_wpaCtrl_acsStartedCb_f fAcsStartedCb;                            // ACS started
++    wld_wpaCtrl_acsFailedCb_f fAcsFailedCb;                              // ACS failed
+     wld_wpaCtrl_mainApSetupCompletedCb_f fMainApSetupCompletedCb;
+     wld_wpaCtrl_mainApDisabledCb_f fMainApDisabledCb;
+ 
+diff --git a/src/Plugin/wifiGen_eventHandlers.c b/src/Plugin/wifiGen_eventHandlers.c
+index 8688f8d..2b16d55 100644
+--- a/src/Plugin/wifiGen_eventHandlers.c
++++ b/src/Plugin/wifiGen_eventHandlers.c
+@@ -665,7 +665,51 @@ static void s_awgnInterferenceDetectedCb(void* userData, char* ifName, char* par
+     }
+ }
+ 
+-static void s_acsCompletedCb(void* userData, char* ifName _UNUSED, swl_chanspec_t* chanSpec) {
++static void s_acsStartedCb(void* userData, char* ifName, char* params) {
++    /*
++     * ACS-STARTED event: hostapd has started automatic channel selection.
++     * Notify prplmesh and other bus subscribers via AMX wpaCtrlEvents signal
++     * on the Radio object (same pattern as INTERFERENCE-DETECTED/AWGN).
++     */
++    SAH_TRACEZ_WARNING(ME, "%s: ACS started: %s", ifName, params ? params : "");
++    T_Radio* pRad = (T_Radio*) userData;
++    ASSERT_NOT_NULL(pRad, , ME, "NULL");
++
++    char msgData[256] = {0};
++    snprintf(msgData, sizeof(msgData), "ACS-STARTED %s", params ? params : "");
++    amxc_var_t eventData;
++    amxc_var_init(&eventData);
++    amxc_var_set_type(&eventData, AMXC_VAR_ID_HTABLE);
++    amxc_var_add_key(cstring_t, &eventData, "ifName", ifName);
++    amxc_var_add_key(cstring_t, &eventData, "eventData", msgData);
++    SAH_TRACEZ_ERROR(ME, "%s: notify wpaCtrlEvents ACS-STARTED eventData=%s", pRad->Name, msgData);
++    amxd_object_trigger_signal(pRad->pBus, "wpaCtrlEvents", &eventData);
++    amxc_var_clean(&eventData);
++}
++
++static void s_acsFailedCb(void* userData, char* ifName, char* params) {
++    /*
++     * ACS-FAILED event: hostapd failed to complete automatic channel selection.
++     * Notify prplmesh and other bus subscribers via AMX wpaCtrlEvents signal
++     * on the Radio object (same pattern as INTERFERENCE-DETECTED/AWGN).
++     */
++    SAH_TRACEZ_WARNING(ME, "%s: ACS failed: %s", ifName, params ? params : "");
++    T_Radio* pRad = (T_Radio*) userData;
++    ASSERT_NOT_NULL(pRad, , ME, "NULL");
++
++    char msgData[256] = {0};
++    snprintf(msgData, sizeof(msgData), "ACS-FAILED %s", params ? params : "");
++    amxc_var_t eventData;
++    amxc_var_init(&eventData);
++    amxc_var_set_type(&eventData, AMXC_VAR_ID_HTABLE);
++    amxc_var_add_key(cstring_t, &eventData, "ifName", ifName);
++    amxc_var_add_key(cstring_t, &eventData, "eventData", msgData);
++    SAH_TRACEZ_ERROR(ME, "%s: notify wpaCtrlEvents ACS-FAILED eventData=%s", pRad->Name, msgData);
++    amxd_object_trigger_signal(pRad->pBus, "wpaCtrlEvents", &eventData);
++    amxc_var_clean(&eventData);
++}
++
++static void s_acsCompletedCb(void* userData, char* ifName _UNUSED, swl_chanspec_t* chanSpec, char* params) {
+     /*
+      * ACS-COMPLETED event: hostapd has finished automatic channel selection.
+      *
+@@ -682,6 +726,23 @@ static void s_acsCompletedCb(void* userData, char* ifName _UNUSED, swl_chanspec_
+      */
+     T_Radio* pRad = (T_Radio*) userData;
+     ASSERT_NOT_NULL(pRad, , ME, "NULL");
++
++    /*
++     * Notify prplmesh and other bus subscribers via AMX wpaCtrlEvents signal
++     * on the Radio object (same pattern as INTERFERENCE-DETECTED/AWGN).
++     * Use the raw params string to preserve the exact hostapd format: freq=X channel=Y
++     */
++    char msgData[256] = {0};
++    snprintf(msgData, sizeof(msgData), "ACS-COMPLETED %s", params ? params : "");
++    amxc_var_t eventData;
++    amxc_var_init(&eventData);
++    amxc_var_set_type(&eventData, AMXC_VAR_ID_HTABLE);
++    amxc_var_add_key(cstring_t, &eventData, "ifName", pRad->Name);
++    amxc_var_add_key(cstring_t, &eventData, "eventData", msgData);
++    SAH_TRACEZ_ERROR(ME, "%s: notify wpaCtrlEvents ACS-COMPLETED eventData=%s", pRad->Name, msgData);
++    amxd_object_trigger_signal(pRad->pBus, "wpaCtrlEvents", &eventData);
++    amxc_var_clean(&eventData);
++
+     bool reconnectAllRads = s_acsDisconnectAllRads;
+     s_acsDisconnectAllRads = false;
+     SAH_TRACEZ_WARNING(ME, "%s: ACS completed on channel=%d, sending RECONNECT to %s wpa_supplicant endpoints",
+@@ -783,6 +844,8 @@ static swl_rc_ne s_setWpaCtrlRadEvtHandlers(wld_wpaCtrlMngr_t* wpaCtrlMngr, T_Ra
+     SET_HDLR(wpaCtrlRadEvthandlers.fUplinkCsaTimeoutCb, s_uplinkCsaTimeoutCb);
+     SET_HDLR(wpaCtrlRadEvthandlers.fAwgnInterferenceDetectedCb, s_awgnInterferenceDetectedCb);
+     SET_HDLR(wpaCtrlRadEvthandlers.fAcsCompletedCb, s_acsCompletedCb);
++    SET_HDLR(wpaCtrlRadEvthandlers.fAcsStartedCb, s_acsStartedCb);
++    SET_HDLR(wpaCtrlRadEvthandlers.fAcsFailedCb, s_acsFailedCb);
+     wld_wpaCtrlMngr_setEvtHandlers(wpaCtrlMngr, pRad, &wpaCtrlRadEvthandlers);
+     return SWL_RC_OK;
+ }
+diff --git a/src/nl80211/wld_wpaCtrl_events.c b/src/nl80211/wld_wpaCtrl_events.c
+index 7cc01fe..eb46daa 100644
+--- a/src/nl80211/wld_wpaCtrl_events.c
++++ b/src/nl80211/wld_wpaCtrl_events.c
+@@ -555,8 +555,9 @@ static void s_acsCompletedEvt(wld_wpaCtrlInterface_t* pInterface, char* event _U
+     /* Use fChanSwitchCb to notify the radio layer of the ACS-selected channel,
+      * reusing the existing channel-change callback infrastructure. */
+     CALL_MGR_I(pInterface, fChanSwitchCb, &chanSpec);
+-    /* Notify DCS handler so it can reconnect wpa_supplicant after ACS */
+-    CALL_MGR_I(pInterface, fAcsCompletedCb, &chanSpec);
++    /* Notify DCS handler so it can reconnect wpa_supplicant after ACS,
++     * passing raw params so the full hostapd format (freq=X channel=Y) is preserved. */
++    CALL_MGR_I(pInterface, fAcsCompletedCb, &chanSpec, params);
+ }
+ 
+ static void s_apEnabledEvt(wld_wpaCtrlInterface_t* pInterface, char* event, char* params _UNUSED) {
+@@ -664,6 +665,18 @@ static void s_radDfsNewChannelEvt(wld_wpaCtrlInterface_t* pInterface, char* even
+     CALL_MGR_I(pInterface, fDfsNewChannelCb, &chanSpec);
+ }
+ 
++static void s_acsStartedEvt(wld_wpaCtrlInterface_t* pInterface, char* event _UNUSED, char* params) {
++    // Example: ACS-STARTED
++    SAH_TRACEZ_INFO(ME, "%s: ACS started (%s)", pInterface->name, params ? params : "");
++    CALL_MGR_I(pInterface, fAcsStartedCb, params);
++}
++
++static void s_acsFailedEvt(wld_wpaCtrlInterface_t* pInterface, char* event _UNUSED, char* params) {
++    // Example: ACS-FAILED
++    SAH_TRACEZ_WARNING(ME, "%s: ACS failed (%s)", pInterface->name, params ? params : "");
++    CALL_MGR_I(pInterface, fAcsFailedCb, params);
++}
++
+ static void s_awgnInterferenceDetectedEvt(wld_wpaCtrlInterface_t* pInterface, char* event, char* params) {
+     // Example: INTERFERENCE-DETECTED type=AWGN freq=6135 chan_width=5 cf1=6105 cf2=0 bitmap=0x01
+     // Example: INTERFERENCE-DETECTED type=WLAN freq=5805 chan_width=3 cf1=5775 cf2=0 bitmap=0x00000000
+@@ -904,7 +917,9 @@ SWL_TABLE(sWpaCtrlEvents,
+               {"CTRL-EVENT-CHANNEL-SWITCH", &s_chanSwitchEvtCb},
+               {"AP-CSA-FINISHED", &s_apCsaFinishedEvtCb},
+               {"AP-MGMT-FRAME-RECEIVED", &s_mgtFrameEvt},
++              {"ACS-STARTED", &s_acsStartedEvt},
+               {"ACS-COMPLETED", &s_acsCompletedEvt},
++              {"ACS-FAILED", &s_acsFailedEvt},
+               {"AP-ENABLED", &s_apEnabledEvt},
+               {"AP-DISABLED", &s_apDisabledEvt},
+               {"INTERFACE-ENABLED", &s_apIfaceEnabledEvt},
+-- 
+2.34.1
+
