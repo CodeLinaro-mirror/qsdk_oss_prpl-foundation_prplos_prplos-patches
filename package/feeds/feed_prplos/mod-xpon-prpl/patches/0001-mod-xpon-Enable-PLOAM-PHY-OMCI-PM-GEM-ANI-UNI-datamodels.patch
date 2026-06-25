@@ -92,12 +92,13 @@ index 41c7632..c831079 100644
  /**
   * Array with info about objects in the XPON DM ad the prpl xpon_onu DM.
   *
-@@ -291,44 +309,62 @@ static const object_info_t OBJECT_INFO[oid_nbr] = {
+@@ -291,44 +309,64 @@ static const object_info_t OBJECT_INFO[oid_nbr] = {
          .n_params = ARRAY_SIZE(TC_ALARMS_PARAMS)
      },
      {
 -        .id = oid_ani_tc_pm_omci,
 +        .id = obj_id_ani_stats,
++        .prpl_name = "stats",
 +        .bbf_path = "XPON.ONU.x.ANI.x.Stats",
 +        .prpl_path = "xpon_onu.x.ani.x.stats",
 +        .bbf_key_name = NULL,
@@ -107,6 +108,7 @@ index 41c7632..c831079 100644
 +    },
 +    {
 +        .id = obj_id_eth_stats,
++        .prpl_name = "stats",
 +        .bbf_path = "XPON.ONU.x.EthernetUNI.x.Stats",
 +        .prpl_path = "xpon_onu.x.ethernet_uni.x.stats",
 +        .bbf_key_name = NULL,

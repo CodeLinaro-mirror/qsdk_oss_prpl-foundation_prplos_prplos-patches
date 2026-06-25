@@ -1,0 +1,380 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+Date: Mon, 9 Jun 2026 00:00:00 +0000
+Subject: [PATCH] pwhm: fix WiFi.Reset() for complete factory reset including
+ user-created VAPs
+
+This patch implements complete factory reset: all APs (including
+user-created guest VAPs), EndPoints, and parameter values are restored
+to factory defaults when WiFi.Reset() is called.
+
+--- Feature: delete user-created VAPs before radio stop ---
+
+User-created VAPs (added via addVAPIntf after startup) must be removed
+during factory reset. They persist in the DM with Enable=false after
+the existing reset logic, which is not a complete factory reset.
+
+Implementation: record T_Radio.nrDefaultAps at the end of
+wld_persist_onStart() after the defaults ODL is first loaded. This
+gives the baseline AP count per radio. During _Reset(), iterate each
+radio and delete any APs beyond this baseline count.
+
+Critically, this deletion happens BEFORE wld_rad_doRadioReset(). While
+the radio is still up, s_deinitAP() can call mfn_wrad_delvapif() to
+properly tear down the kernel VAP interface. After radio stop, the
+kernel interfaces are already gone and delvapif would be a no-op,
+leaving stale DM/C-struct state.
+
+Each extra AP is deleted together with its linked SSID instance (same
+pattern as _delVAPIntf).
+
+--- Bug 1: ODL re-parse aborts for ALL objects in the tree ---
+
+amxd_object_add_action_cb() and amxd_param_add_action_cb() both return
+amxd_status_unknown_error when the same (fn, priv=NULL) pair is already
+registered. Both object->cb_fns and param->cb_fns are drained directly
+via amxc_llist_for_each since both remove_action_cb APIs have
+when_null(fn, exit) guards making them no-ops for fn=NULL.
+
+--- Bug 2: EP-linked SSIDs remain enabled after reset ---
+
+pEP->enable = 0 does not update the DM Enable parameter. Fix: write
+Enable=false via transaction for each EndPoint and its linked SSID.
+
+--- Bug 3: EndPoint "Fail to create instance" after reset ---
+
+The defaults ODL fires _wld_ep_addInstance_oaf which only supports
+fresh creation. Fix: delete all EndPoint instances before ODL reload.
+EP-linked SSIDs are preserved (not re-created by static ODL parser).
+
+--- Bug 4: signal drain loop hangs indefinitely ---
+
+Fix: bound the drain loop to 1000 iterations.
+
+--- Bug 5: factory reset not durable across reboot ---
+
+Fix: add wld_persist_deleteSavedConf() and call it from _Reset().
+
+Signed-off-by: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+---
+ include/wld/Features/wld_persist.h     |  1 +
+ include/wld/wld.h                      |  1 +
+ src/Features/persist/wld_persist_off.c | 14 +++++++++++
+ src/Features/persist/wld_persist_on.c  | 26 +++++++++++++++++
+ src/wld.c                              | 126 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 168 insertions(+)
+
+diff --git a/include/wld/Features/wld_persist.h b/include/wld/Features/wld_persist.h
+--- a/include/wld/Features/wld_persist.h
++++ b/include/wld/Features/wld_persist.h
+@@ -69,5 +69,6 @@
+ void wld_persist_onRadioCreation(T_Radio* pRad);
+ bool wld_persist_writeApAtCreation();
+ bool wld_persist_isRadInitConfigPending(T_Radio* pRad);
++void wld_persist_deleteSavedConf(void);
+
+ #endif /* SRC_INCLUDE_PRIV_FEATURES_WLD_PERSIST_H_ */
+diff --git a/include/wld/wld.h b/include/wld/wld.h
+--- a/include/wld/wld.h
++++ b/include/wld/wld.h
+@@ -1652,5 +1652,6 @@ typedef struct {
+     int maxStations;                                                        /* config the MAX # of stations this radio can handle */
+     uint32_t maxNrHwBss;                                                    /* The max nr of Bss that radio can create (determined by hardware) */
+     uint32_t maxNrHwSta;                                                    /* The max nr of stations that radio can create (determined by hardware) */
++    uint32_t nrDefaultAps;                                                  /* Nr of APs loaded from defaults ODL at startup (before any user addVAPIntf) */
+ 
+     amxc_llist_t llAP;                                                      /* VAP linked list on this radio (used when commit is used)! */
+diff --git a/src/Features/persist/wld_persist_off.c b/src/Features/persist/wld_persist_off.c
+--- a/src/Features/persist/wld_persist_off.c
++++ b/src/Features/persist/wld_persist_off.c
+@@ -99,6 +99,10 @@
+                          amxo_parser_get_message(parser));
+         return false;
+     }
++    T_Radio* pRad = NULL;
++    wld_for_eachRad(pRad) {
++        pRad->nrDefaultAps = (uint32_t) amxc_llist_size(&pRad->llAP);
++    }
+     SAH_TRACEZ_OUT(ME);
+     return true;
+ }
+@@ -142,3 +146,7 @@
+     return swl_timespec_diffToMillisec(&rad->autoCommitData.lastCommitCallTime, &time) < WLD_PERSIST_CONFIG_PENDING_TIMEOUT_MS;
+
+ }
++
++void wld_persist_deleteSavedConf(void) {
++    /* No persistent storage in off mode -- nothing to delete. */
++}
+diff --git a/src/Features/persist/wld_persist_on.c b/src/Features/persist/wld_persist_on.c
+--- a/src/Features/persist/wld_persist_on.c
++++ b/src/Features/persist/wld_persist_on.c
+@@ -87,6 +87,22 @@
+     return true;
+ }
+
++void wld_persist_deleteSavedConf(void) {
++    amxc_string_t confPath;
++    amxc_string_init(&confPath, 0);
++    if(s_getSavedConfPath(&confPath)) {
++        const char* path = amxc_string_get(&confPath, 0);
++        if(swl_fileUtils_existsFile(path)) {
++            if(remove(path) != 0) {
++                SAH_TRACEZ_WARNING(ME, "Failed to delete saved conf %s: %s", path, strerror(errno));
++            } else {
++                SAH_TRACEZ_WARNING(ME, "Deleted saved conf %s for factory reset", path);
++            }
++        }
++    }
++    amxc_string_clean(&confPath);
++}
++
+ bool wld_persist_onStart() {
+     SAH_TRACEZ_IN(ME);
+     // Defaults or saved odl will be loaded here:
+@@ -113,6 +129,16 @@
+                          amxo_parser_get_message(parser));
+         return false;
+     }
++    /*
++     * Record the default AP count per radio now that the defaults (or saved
++     * conf) have been fully loaded. This snapshot is used by _Reset() to
++     * identify user-created APs (those added beyond this baseline count)
++     * and delete them to achieve a true factory reset.
++     */
++    T_Radio* pRad = NULL;
++    wld_for_eachRad(pRad) {
++        pRad->nrDefaultAps = (uint32_t) amxc_llist_size(&pRad->llAP);
++    }
+     SAH_TRACEZ_OUT(ME);
+     return true;
+ }
+diff --git a/src/wld.c b/src/wld.c
+--- a/src/wld.c
++++ b/src/wld.c
+@@ -977,13 +977,126 @@ swl_timeSpecMono_t* wld_getInitTime() {
+     return &initTime;
+ }
+
++static void s_clearObjectActionCbs(amxd_object_t* object) {
++    if(object == NULL) {
++        return;
++    }
++
++    amxd_object_type_t type = amxd_object_get_type(object);
++
++    /*
++     * Clear callbacks only on non-instance objects.
++     * Callbacks are registered on the template's cb_fns, not on instances.
++     *
++     * NOTE: amxd_object_remove_action_cb(object, reason, NULL) has a
++     * when_null(fn, exit) guard -- it is a no-op when fn=NULL. We must
++     * drain the cb_fns list directly to actually free the entries.
++     */
++    if(type != amxd_object_instance) {
++        /* Clear object-level action callbacks */
++        amxc_llist_for_each(it, &object->cb_fns) {
++            amxd_dm_cb_t* cb = amxc_container_of(it, amxd_dm_cb_t, it);
++            amxc_llist_it_take(it);
++            free(cb);
++        }
++        /* Clear parameter-level action callbacks on each parameter */
++        amxd_object_for_each(parameter, pit, object) {
++            amxd_param_t* param = amxc_container_of(pit, amxd_param_t, it);
++            amxc_llist_for_each(cit, &param->cb_fns) {
++                amxd_dm_cb_t* cb = amxc_container_of(cit, amxd_dm_cb_t, it);
++                amxc_llist_it_take(cit);
++                free(cb);
++            }
++        }
++    }
++
++    /* Recurse into child singleton/template objects */
++    amxd_object_for_each(child, it, object) {
++        amxd_object_t* child = amxc_container_of(it, amxd_object_t, it);
++        s_clearObjectActionCbs(child);
++    }
++
++    /* For template objects, also recurse into each instance's children */
++    if(type == amxd_object_template) {
++        amxd_object_for_each(instance, it2, object) {
++            amxd_object_t* inst = amxc_container_of(it2, amxd_object_t, it);
++            amxd_object_for_each(child, it3, inst) {
++                amxd_object_t* inst_child = amxc_container_of(it3, amxd_object_t, it);
++                s_clearObjectActionCbs(inst_child);
++            }
++        }
++    }
++}
++
++static void s_deleteAllInstances(amxd_object_t* tmpl) {
++    if(tmpl == NULL) {
++        return;
++    }
++    amxd_trans_t trans;
++    amxd_trans_init(&trans);
++    amxd_object_for_each(instance, it, tmpl) {
++        amxd_object_t* inst = amxc_container_of(it, amxd_object_t, it);
++        amxd_trans_select_object(&trans, tmpl);
++        amxd_trans_del_inst(&trans, amxd_object_get_index(inst), NULL);
++    }
++    amxd_trans_apply(&trans, get_wld_plugin_dm());
++    amxd_trans_clean(&trans);
++}
++
+ amxd_status_t _Reset(amxd_object_t* obj _UNUSED,
+                      amxd_function_t* func _UNUSED,
+                      amxc_var_t* args _UNUSED,
+                      amxc_var_t* retval _UNUSED) {
+
++    /*
++     * Delete user-created VAPs (APs added beyond the default set) BEFORE
++     * stopping the radios, so the kernel VAP interfaces are still up and
++     * mfn_wrad_delvapif can properly tear them down. After radio stop, the
++     * kernel interfaces are gone and delvapif would be a no-op.
++     *
++     * nrDefaultAps is recorded at startup (wld_persist_onStart) after the
++     * defaults ODL is first loaded. Any APs added after that point (via
++     * addVAPIntf) are user-created. We delete them in reverse order so that
++     * llAP list iteration remains stable.
++     */
+     T_Radio* tmpRad = NULL;
+     wld_for_eachRad(tmpRad) {
++        if(tmpRad->nrDefaultAps == 0) {
++            continue;
++        }
++        amxd_object_t* apTmpl = amxd_object_findf(get_wld_object(), "AccessPoint");
++        amxd_object_t* ssidTmpl = amxd_object_findf(get_wld_object(), "SSID");
++        if(apTmpl == NULL || ssidTmpl == NULL) {
++            continue;
++        }
++        while(amxc_llist_size(&tmpRad->llAP) > tmpRad->nrDefaultAps) {
++            /* Take the last (most recently added) AP in the list */
++            amxc_llist_it_t* last = amxc_llist_get_last(&tmpRad->llAP);
++            if(last == NULL) {
++                break;
++            }
++            T_AccessPoint* pExtraAP = amxc_container_of(last, T_AccessPoint, it);
++            const char* apName = pExtraAP->name;
++            SAH_TRACEZ_WARNING(ME, "%s: removing user-created VAP %s for factory reset",
++                               tmpRad->Name, apName);
++            amxd_trans_t del_trans;
++            amxd_trans_init(&del_trans);
++            amxd_object_t* apInst = amxd_object_findf(apTmpl, "%s", apName);
++            if(apInst != NULL) {
++                amxd_trans_select_object(&del_trans, apTmpl);
++                amxd_trans_del_inst(&del_trans, amxd_object_get_index(apInst), NULL);
++            }
++            amxd_object_t* ssidInst = amxd_object_findf(ssidTmpl, "%s", apName);
++            if(ssidInst != NULL) {
++                amxd_trans_select_object(&del_trans, ssidTmpl);
++                amxd_trans_del_inst(&del_trans, amxd_object_get_index(ssidInst), NULL);
++            }
++            amxd_trans_apply(&del_trans, get_wld_plugin_dm());
++            amxd_trans_clean(&del_trans);
++        }
++    }
++
++    wld_for_eachRad(tmpRad) {
+         SAH_TRACEZ_WARNING(ME, "%s: stop radio for reset", tmpRad->Name);
+         wld_rad_doRadioReset(tmpRad);
+
+@@ -997,6 +1110,25 @@ amxd_status_t _Reset(amxd_object_t* obj _UNUSED,
+             if(pEP->pSSID) {
+                 pEP->pSSID->enable = 0;
+             }
++            /*
++             * Also zero the DM Enable parameters directly so SSIDs linked to
++             * endpoints (SSID.2/4/6) are disabled in the data model. The C-level
++             * flags above affect FSM behaviour but not the DM values seen over
++             * ubus. Without this, if the ODL re-parse partially fails, the DM
++             * still reflects the pre-reset enabled state.
++             */
++            if(pEP->pBus != NULL) {
++                amxd_trans_t ep_trans;
++                amxd_trans_init(&ep_trans);
++                amxd_trans_select_object(&ep_trans, pEP->pBus);
++                amxd_trans_set_bool(&ep_trans, "Enable", false);
++                if(pEP->pSSID && pEP->pSSID->pBus) {
++                    amxd_trans_select_object(&ep_trans, pEP->pSSID->pBus);
++                    amxd_trans_set_bool(&ep_trans, "Enable", false);
++                }
++                amxd_trans_apply(&ep_trans, get_wld_plugin_dm());
++                amxd_trans_clean(&ep_trans);
++            }
+         }
+         T_AccessPoint* pAP = NULL;
+         wld_rad_forEachAp(pAP, tmpRad) {
+@@ -1005,17 +1137,69 @@ amxd_status_t _Reset(amxd_object_t* obj _UNUSED,
+                 pAP->pSSID->enable = 0;
+             }
+         }
++
++        /*
++         * Remove EventCounter instances so the ODL parser can re-create
++         * them cleanly. Leaving them causes duplicate-key transaction
++         * failures in wld_rad_init_counters() after the ODL reload.
++         */
++        s_deleteAllInstances(amxd_object_findf(tmpRad->pBus, "EventCounter"));
+     }
+
++    /*
++     * Delete EndPoint DM instances before reloading defaults. The defaults
++     * ODL uses "instance add (alias)" which triggers _wld_ep_addInstance_oaf
++     * (an add-inst action callback). This callback only supports fresh
++     * creation -- it fails with "Fail to create instance" when the instance
++     * already exists, even with populate-behavior.duplicate-instance=update.
++     * Deleting first lets the defaults ODL re-create them cleanly.
++     *
++     * The EP-linked SSID instances (ep2g0/ep5g0/ep6g0) are NOT deleted: they
++     * are standalone SSID objects that _wld_ep_addInstance_oaf links to after
++     * creation, and they are not re-created by the static ODL parser.
++     */
++    s_deleteAllInstances(amxd_object_findf(get_wld_object(), "EndPoint"));
++
++    /*
++     * Walk the entire WiFi object tree and remove all registered action
++     * callbacks before re-parsing the definition ODL.
++     *
++     * amxd_object_add_action_cb() returns amxd_status_unknown_error when the
++     * exact same (fn, priv=NULL) pair is already registered: it finds the
++     * existing entry, sees cb->priv == NULL == priv, jumps to exit without
++     * ever setting status = amxd_status_ok, and returns an error. The ODL
++     * parser treats any non-ok return from set_object_action as fatal, logs
++     * "Invalid object (action id = N)", and aborts the include mid-file.
++     *
++     * Every object in every included ODL (wld_definitions.odl,
++     * wld_radio.odl, wld_accesspoint.odl, wld_ssid.odl, wld_endpoint.odl,
++     * wld_mld.odl) registers callbacks this way. Clearing the entire tree
++     * before re-parsing lets every registration succeed cleanly.
++     */
++    s_clearObjectActionCbs(get_wld_object());
++
++    /*
++     * Delete the persisted ODL file so the next startup also gets factory
++     * defaults. Without this, wld_persist_onStart() would find the saved
++     * file on disk and reload the pre-reset state, making the reset
++     * non-durable across reboots.
++     */
++    wld_persist_deleteSavedConf();
++
+     amxd_object_t* rootObj = amxd_dm_get_root(get_wld_plugin_dm());
+     amxo_parser_t* parser = get_wld_plugin_parser();
+     amxo_parser_parse_string(parser, "include '${definition_file}';", rootObj);
+     amxo_parser_parse_string(parser, "include '${odl.dm-defaults}';", rootObj);
+-    /**
+-     * Wait for all the definition and default parameters to be processed
+-     * before continuing with internal syncing.
++    /*
++     * Drain pending signals emitted during the ODL re-parse.
++     * Limit iterations to avoid an infinite loop: loading defaults triggers
++     * "on event" handlers which may emit more signals. A bounded drain
++     * ensures all queued signals are dispatched without risking a hang if
++     * handlers keep emitting new ones.
+      */
+-    while(amxp_signal_read() == 0) {
++    int drain_count = 0;
++    while((drain_count < 1000) && (amxp_signal_read() == 0)) {
++        drain_count++;
+     }
+     wld_vendorModuleMgr_loadDefaultsAll();
