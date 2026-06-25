@@ -1,0 +1,504 @@
+From d6073e1e4625c6f72c3005c8b99ffdd14dfe544f Mon Sep 17 00:00:00 2001
+From: Jassim Shanavaskhan <jshanava@qti.qualcomm.com>
+Date: Thu, 25 Jun 2026 11:03:51 +0530
+Subject: [PATCH] pwhm: add regulatory Tx power control parameters
+
+Add support for regulatory Tx power and IE configuration
+parameters through the TR-181 WiFi.Radio data model:
+
+- EhtConfigCcfs0: EHT operating CCFS0 configuration
+- TpeCommonPsd: common PSD in TPE IE for all subchannels
+- TpePwrUnit: Tx power interpretation unit in TPE IE
+- TpePunctChannelTxPwr: puncture channel Tx power in SP mode
+- CtlPowerScale: control channel power scale factor (0-4)
+- TxPowerScale: transmit power scale (0=100% to 4=min)
+- TxPowerLimit2G: 2.4 GHz Tx power cap (0.5 dBm units)
+- TxPowerLimit5G: 5 GHz Tx power cap (0.5 dBm units)
+- AntennaGain2G: 2.4 GHz antenna gain in dBi
+- AntennaGain5G: 5 GHz antenna gain in dBi
+
+Signed-off-by: Jassim Shanavaskhan <jshanava@qti.qualcomm.com>
+---
+ include/wld/wld.h                 |  22 ++++
+ include_priv/Plugin/wifiGen_rad.h |  22 ++++
+ odl/wld_radio.odl                 |  42 +++++++
+ src/Plugin/wifiGen.c              |  22 ++++
+ src/Plugin/wifiGen_rad.c          | 184 ++++++++++++++++++++++++++++++
+ src/wld_functionTable.c           |  33 ++++++
+ src/wld_radio.c                   |  51 +++++++++
+ 7 files changed, 376 insertions(+)
+
+diff --git a/include/wld/wld.h b/include/wld/wld.h
+index 494e535..8238bc6 100644
+--- a/include/wld/wld.h
++++ b/include/wld/wld.h
+@@ -2640,6 +2640,28 @@ typedef struct S_CWLD_FUNC_TABLE {
+     PFN_WRAD_LATEST_POWER mfn_wrad_latest_power;              /**< Get the power values of each antenna*/
+     PFN_WRAD_UPDATE_CHANINFO mfn_wrad_update_chaninfo;        /**< Update the channel information and statistics*/
+     PFN_WRAD_UPDATE_MON_STATS mfn_wrad_update_mon_stats;      /**< Update the non associated station counters of SSID */
++    /* Regulatory IE configuration */
++    swl_rc_ne (* mfn_wrad_setEhtConfigCcfs0)(T_Radio* pRad, int32_t value);
++    swl_rc_ne (* mfn_wrad_getEhtConfigCcfs0)(T_Radio* pRad, int32_t* value);
++    swl_rc_ne (* mfn_wrad_setTpeCommonPsd)(T_Radio* pRad, int32_t value);
++    swl_rc_ne (* mfn_wrad_getTpeCommonPsd)(T_Radio* pRad, int32_t* value);
++    swl_rc_ne (* mfn_wrad_setTpePwrUnit)(T_Radio* pRad, int32_t value);
++    swl_rc_ne (* mfn_wrad_getTpePwrUnit)(T_Radio* pRad, int32_t* value);
++    swl_rc_ne (* mfn_wrad_setTpePunctChannelTxPwr)(T_Radio* pRad, int32_t value);
++    swl_rc_ne (* mfn_wrad_getTpePunctChannelTxPwr)(T_Radio* pRad, int32_t* value);
++    /* Regulatory Tx power control */
++    swl_rc_ne (* mfn_wrad_setCtlPowerScale)(T_Radio* pRad, int32_t value);
++    swl_rc_ne (* mfn_wrad_getCtlPowerScale)(T_Radio* pRad, int32_t* value);
++    swl_rc_ne (* mfn_wrad_setTxPowerScale)(T_Radio* pRad, int32_t value);
++    swl_rc_ne (* mfn_wrad_getTxPowerScale)(T_Radio* pRad, int32_t* value);
++    swl_rc_ne (* mfn_wrad_setTxPowerLimit2G)(T_Radio* pRad, int32_t value);
++    swl_rc_ne (* mfn_wrad_getTxPowerLimit2G)(T_Radio* pRad, int32_t* value);
++    swl_rc_ne (* mfn_wrad_setTxPowerLimit5G)(T_Radio* pRad, int32_t value);
++    swl_rc_ne (* mfn_wrad_getTxPowerLimit5G)(T_Radio* pRad, int32_t* value);
++    swl_rc_ne (* mfn_wrad_setAntennaGain2G)(T_Radio* pRad, int32_t value);
++    swl_rc_ne (* mfn_wrad_getAntennaGain2G)(T_Radio* pRad, int32_t* value);
++    swl_rc_ne (* mfn_wrad_setAntennaGain5G)(T_Radio* pRad, int32_t value);
++    swl_rc_ne (* mfn_wrad_getAntennaGain5G)(T_Radio* pRad, int32_t* value);
+     PFN_WRAD_SETUP_STAMON mfn_wrad_setup_stamon;              /**< Set the station monitor */
+     PFN_WRAD_ADD_STAMON mfn_wrad_add_stamon;                  /**< Add the non associated station */
+     PFN_WRAD_DEL_STAMON mfn_wrad_del_stamon;                  /**< Del the non associated station */
+diff --git a/include_priv/Plugin/wifiGen_rad.h b/include_priv/Plugin/wifiGen_rad.h
+index 8eea3e0..d007a26 100644
+--- a/include_priv/Plugin/wifiGen_rad.h
++++ b/include_priv/Plugin/wifiGen_rad.h
+@@ -105,6 +105,28 @@ swl_rc_ne wifiGen_rad_setupStaMon(T_Radio* pRad, bool enable);
+ swl_rc_ne wifiGen_rad_addStaMon(T_Radio* pRad, T_NonAssociatedDevice* pMD);
+ swl_rc_ne wifiGen_rad_delStaMon(T_Radio* pRad, T_NonAssociatedDevice* pMD);
+ swl_rc_ne wifiGen_rad_updateMonStats(T_Radio* pRad);
++/* Regulatory IE configuration */
++swl_rc_ne wifiGen_rad_setEhtConfigCcfs0(T_Radio* pRad, int32_t value);
++swl_rc_ne wifiGen_rad_getEhtConfigCcfs0(T_Radio* pRad, int32_t* value);
++swl_rc_ne wifiGen_rad_setTpeCommonPsd(T_Radio* pRad, int32_t value);
++swl_rc_ne wifiGen_rad_getTpeCommonPsd(T_Radio* pRad, int32_t* value);
++swl_rc_ne wifiGen_rad_setTpePwrUnit(T_Radio* pRad, int32_t value);
++swl_rc_ne wifiGen_rad_getTpePwrUnit(T_Radio* pRad, int32_t* value);
++swl_rc_ne wifiGen_rad_setTpePunctChannelTxPwr(T_Radio* pRad, int32_t value);
++swl_rc_ne wifiGen_rad_getTpePunctChannelTxPwr(T_Radio* pRad, int32_t* value);
++/* Regulatory Tx power control */
++swl_rc_ne wifiGen_rad_setCtlPowerScale(T_Radio* pRad, int32_t value);
++swl_rc_ne wifiGen_rad_getCtlPowerScale(T_Radio* pRad, int32_t* value);
++swl_rc_ne wifiGen_rad_setTxPowerScale(T_Radio* pRad, int32_t value);
++swl_rc_ne wifiGen_rad_getTxPowerScale(T_Radio* pRad, int32_t* value);
++swl_rc_ne wifiGen_rad_setTxPowerLimit2G(T_Radio* pRad, int32_t value);
++swl_rc_ne wifiGen_rad_getTxPowerLimit2G(T_Radio* pRad, int32_t* value);
++swl_rc_ne wifiGen_rad_setTxPowerLimit5G(T_Radio* pRad, int32_t value);
++swl_rc_ne wifiGen_rad_getTxPowerLimit5G(T_Radio* pRad, int32_t* value);
++swl_rc_ne wifiGen_rad_setAntennaGain2G(T_Radio* pRad, int32_t value);
++swl_rc_ne wifiGen_rad_getAntennaGain2G(T_Radio* pRad, int32_t* value);
++swl_rc_ne wifiGen_rad_setAntennaGain5G(T_Radio* pRad, int32_t value);
++swl_rc_ne wifiGen_rad_getAntennaGain5G(T_Radio* pRad, int32_t* value);
+ 
+ /* Internal APIs */
+ void wifiGen_rad_initBands(T_Radio* pRad);
+diff --git a/odl/wld_radio.odl b/odl/wld_radio.odl
+index a6d613d..210dbc1 100644
+--- a/odl/wld_radio.odl
++++ b/odl/wld_radio.odl
+@@ -1954,6 +1954,48 @@ define probelist_t{
+                  * ]
+                  */
+ 		htable getEHTOperations();
++		/* Regulatory IE configuration parameters */
++		%persistent int32 EhtConfigCcfs0 {
++			on action validate call check_range { min = 0, max = 1 };
++			default 0;
++		}
++		%persistent int32 TpeCommonPsd {
++			on action validate call check_range { min = 0, max = 1 };
++			default 1;
++		}
++		%persistent int32 TpePwrUnit {
++			on action validate call check_range { min = 0, max = 1 };
++			default 0;
++		}
++		%persistent int32 TpePunctChannelTxPwr {
++			on action validate call check_range { min = 0, max = 1 };
++			default 0;
++		}
++		/* Regulatory Tx power control parameters */
++		%persistent int32 CtlPowerScale {
++			on action validate call check_range { min = 0, max = 4 };
++			default 0;
++		}
++		%persistent int32 TxPowerScale {
++			on action validate call check_range { min = 0, max = 4 };
++			default 0;
++		}
++		%persistent int32 TxPowerLimit2G {
++			on action validate call check_range { min = 0, max = 200 };
++			default 60;
++		}
++		%persistent int32 TxPowerLimit5G {
++			on action validate call check_range { min = 0, max = 200 };
++			default 60;
++		}
++		%persistent int32 AntennaGain2G {
++			on action validate call check_range { min = 0, max = 30 };
++			default 0;
++		}
++		%persistent int32 AntennaGain5G {
++			on action validate call check_range { min = 0, max = 30 };
++			default 0;
++		}
+ 
+ 		/** <p> Indicates if Reduced Interframe Space is enabled.</p>
+ 		 * Default = keep the current mode
+diff --git a/src/Plugin/wifiGen.c b/src/Plugin/wifiGen.c
+index 5ae77cc..f791d46 100644
+--- a/src/Plugin/wifiGen.c
++++ b/src/Plugin/wifiGen.c
+@@ -214,6 +214,28 @@ bool wifiGen_init() {
+     fta.mfn_wrad_add_stamon = wifiGen_rad_addStaMon;
+     fta.mfn_wrad_del_stamon = wifiGen_rad_delStaMon;
+     fta.mfn_wrad_update_mon_stats = wifiGen_rad_updateMonStats;
++    /* Regulatory IE configuration */
++    fta.mfn_wrad_setEhtConfigCcfs0 = wifiGen_rad_setEhtConfigCcfs0;
++    fta.mfn_wrad_getEhtConfigCcfs0 = wifiGen_rad_getEhtConfigCcfs0;
++    fta.mfn_wrad_setTpeCommonPsd = wifiGen_rad_setTpeCommonPsd;
++    fta.mfn_wrad_getTpeCommonPsd = wifiGen_rad_getTpeCommonPsd;
++    fta.mfn_wrad_setTpePwrUnit = wifiGen_rad_setTpePwrUnit;
++    fta.mfn_wrad_getTpePwrUnit = wifiGen_rad_getTpePwrUnit;
++    fta.mfn_wrad_setTpePunctChannelTxPwr = wifiGen_rad_setTpePunctChannelTxPwr;
++    fta.mfn_wrad_getTpePunctChannelTxPwr = wifiGen_rad_getTpePunctChannelTxPwr;
++    /* Regulatory Tx power control */
++    fta.mfn_wrad_setCtlPowerScale = wifiGen_rad_setCtlPowerScale;
++    fta.mfn_wrad_getCtlPowerScale = wifiGen_rad_getCtlPowerScale;
++    fta.mfn_wrad_setTxPowerScale = wifiGen_rad_setTxPowerScale;
++    fta.mfn_wrad_getTxPowerScale = wifiGen_rad_getTxPowerScale;
++    fta.mfn_wrad_setTxPowerLimit2G = wifiGen_rad_setTxPowerLimit2G;
++    fta.mfn_wrad_getTxPowerLimit2G = wifiGen_rad_getTxPowerLimit2G;
++    fta.mfn_wrad_setTxPowerLimit5G = wifiGen_rad_setTxPowerLimit5G;
++    fta.mfn_wrad_getTxPowerLimit5G = wifiGen_rad_getTxPowerLimit5G;
++    fta.mfn_wrad_setAntennaGain2G = wifiGen_rad_setAntennaGain2G;
++    fta.mfn_wrad_getAntennaGain2G = wifiGen_rad_getAntennaGain2G;
++    fta.mfn_wrad_setAntennaGain5G = wifiGen_rad_setAntennaGain5G;
++    fta.mfn_wrad_getAntennaGain5G = wifiGen_rad_getAntennaGain5G;
+ 
+     s_vendor = wld_nl80211_registerVendor(&fta);
+     ASSERT_NOT_NULL(s_vendor, false, ME, "NULL vendor");
+diff --git a/src/Plugin/wifiGen_rad.c b/src/Plugin/wifiGen_rad.c
+index 83bb47a..b856173 100644
+--- a/src/Plugin/wifiGen_rad.c
++++ b/src/Plugin/wifiGen_rad.c
+@@ -79,6 +79,11 @@
+ #include "wifiGen_hapd.h"
+ #include "wifiGen_events.h"
+ #include "wifiGen_fsm.h"
++#include "wld/wld_wpaCtrl_api.h"
++#include "wld/wld_mld.h"
++#include "wld/wld_wpaCtrlInterface.h"
++#include "wld/wld_nl80211_attr.h"
++#include "wld/wld_ap_nl80211.h"
+ 
+ #define ME "genHapd"
+ 
+@@ -1499,3 +1504,182 @@ swl_rc_ne wifiGen_rad_updateMonStats(T_Radio* pRad) {
+     }
+     return SWL_RC_OK;
+ }
++
++
++
++static wld_wpaCtrlInterface_t* s_rad_reg_getFhLinkIface(T_Radio* pRad) {
++    T_AccessPoint* pAP = NULL;
++    wld_rad_forEachAp(pAP, pRad) {
++        if (!pAP->pSSID || pAP->pSSID->mldLinkId < 0 || !pAP->pSSID->pMldLink) continue;
++        int8_t linkId = (int8_t)pAP->pSSID->mldLinkId;
++        T_SSID* pLinkSsid = wld_mld_getLinkSsidByLinkId(pAP->pSSID->pMldLink, linkId);
++        if (!pLinkSsid || !pLinkSsid->AP_HOOK) continue;
++        wld_wpaCtrlInterface_t* pIface = pLinkSsid->AP_HOOK->wpaCtrlInterface;
++        if (pIface && wld_wpaCtrlInterface_isReady(pIface)) return pIface;
++    }
++    return NULL;
++}
++
++static swl_rc_ne s_rad_reg_sendToRadio(T_Radio* pRad, const char* cmd) {
++    wld_wpaCtrlInterface_t* pIface = s_rad_reg_getFhLinkIface(pRad);
++    if (pIface) {
++        char reply[64] = {0};
++        wld_wpaCtrl_sendCmdFmtGetResponse(pIface, reply, sizeof(reply), "%s", cmd);
++        if (strstr(reply, "OK")) return SWL_RC_OK;
++    }
++    T_AccessPoint* pAP = NULL;
++    wld_rad_forEachAp(pAP, pRad) {
++        if (!wld_wpaCtrlInterface_isReady(pAP->wpaCtrlInterface)) continue;
++        if (wld_wpaCtrl_sendCmdCheckResponse(pAP->wpaCtrlInterface, (char*)cmd, "OK"))
++            return SWL_RC_OK;
++    }
++    return SWL_RC_ERROR;
++}
++
++static swl_rc_ne s_rad_reg_getFromRadio(T_Radio* pRad, const char* cmd,
++                                          char* reply, size_t sz) {
++    wld_wpaCtrlInterface_t* pIface = s_rad_reg_getFhLinkIface(pRad);
++    if (pIface && wld_wpaCtrl_sendCmdFmtGetResponse(pIface, reply, sz, "%s", cmd) == SWL_RC_OK)
++        return SWL_RC_OK;
++    T_AccessPoint* pAP = NULL;
++    wld_rad_forEachAp(pAP, pRad) {
++        if (!wld_wpaCtrlInterface_isReady(pAP->wpaCtrlInterface)) continue;
++        if (wld_wpaCtrl_sendCmdFmtGetResponse(pAP->wpaCtrlInterface, reply, sz,
++                                               "%s", cmd) == SWL_RC_OK)
++            return SWL_RC_OK;
++    }
++    return SWL_RC_ERROR;
++}
++
++swl_rc_ne wifiGen_rad_setEhtConfigCcfs0(T_Radio* pRad, int32_t value) {
++    char cmd[64]; snprintf(cmd, sizeof(cmd), "SET_EHT_CONFIG_CCFS0 %d", value);
++    return s_rad_reg_sendToRadio(pRad, cmd);
++}
++swl_rc_ne wifiGen_rad_getEhtConfigCcfs0(T_Radio* pRad, int32_t* value) {
++    char reply[64] = {0};
++    swl_rc_ne rc = s_rad_reg_getFromRadio(pRad, "GET_EHT_CONFIG_CCFS0", reply, sizeof(reply));
++    if ((rc == SWL_RC_OK) && value) { *value = atoi(reply); }
++    return rc;
++}
++swl_rc_ne wifiGen_rad_setTpeCommonPsd(T_Radio* pRad, int32_t value) {
++    char cmd[64]; snprintf(cmd, sizeof(cmd), "SET_TPE_COMMON_PSD %d", value);
++    return s_rad_reg_sendToRadio(pRad, cmd);
++}
++swl_rc_ne wifiGen_rad_getTpeCommonPsd(T_Radio* pRad, int32_t* value) {
++    char reply[64] = {0};
++    swl_rc_ne rc = s_rad_reg_getFromRadio(pRad, "GET_TPE_COMMON_PSD", reply, sizeof(reply));
++    if ((rc == SWL_RC_OK) && value) {
++        const char* p = strstr(reply, "tpe_common_psd");
++        *value = p ? atoi(p + 15) : atoi(reply);
++    }
++    return rc;
++}
++swl_rc_ne wifiGen_rad_setTpePwrUnit(T_Radio* pRad, int32_t value) {
++    char cmd[64]; snprintf(cmd, sizeof(cmd), "SET_TPE_TX_PWR_INTERP %d", value);
++    return s_rad_reg_sendToRadio(pRad, cmd);
++}
++swl_rc_ne wifiGen_rad_getTpePwrUnit(T_Radio* pRad, int32_t* value) {
++    char reply[64] = {0};
++    swl_rc_ne rc = s_rad_reg_getFromRadio(pRad, "GET_TPE_TX_PWR_INTERP", reply, sizeof(reply));
++    if ((rc == SWL_RC_OK) && value) {
++        const char* p = strstr(reply, "tpe_tx_pwr_interp");
++        *value = p ? atoi(p + 18) : atoi(reply);
++    }
++    return rc;
++}
++swl_rc_ne wifiGen_rad_setTpePunctChannelTxPwr(T_Radio* pRad, int32_t value) {
++    char cmd[64]; snprintf(cmd, sizeof(cmd), "SET_TPE_PUNCT_CHANNEL_TX_PWR %d", value);
++    return s_rad_reg_sendToRadio(pRad, cmd);
++}
++swl_rc_ne wifiGen_rad_getTpePunctChannelTxPwr(T_Radio* pRad, int32_t* value) {
++    char reply[64] = {0};
++    swl_rc_ne rc = s_rad_reg_getFromRadio(pRad, "GET_TPE_PUNCT_CHANNEL_TX_PWR", reply, sizeof(reply));
++    if ((rc == SWL_RC_OK) && value) {
++        const char* p = strstr(reply, "tpe_punct_channel_tx_pwr");
++        *value = p ? atoi(p + 25) : atoi(reply);
++    }
++    return rc;
++}
++swl_rc_ne wifiGen_rad_setLpiAntennaOptimize(T_Radio* pRad, bool optimize) {
++    /* dis_lpi_ant_optimize: NL vendor VAP cmd requiring MLO_LINK_ID.
++     * Send via the primary MLD AP (wlan2.1, wDevId=0x4) with link_id=mldLinkId.
++     * Use wld_ap_nl80211_sendVendorSubCmdAttr on the AP with mldLinkId>=0. */
++    T_AccessPoint* pAP = NULL;
++    wld_rad_forEachAp(pAP, pRad) {
++        if (!pAP->pSSID || pAP->pSSID->mldLinkId < 0 || !pAP->pSSID->pMldLink) continue;
++        int8_t linkId = (int8_t)pAP->pSSID->mldLinkId;
++        uint32_t dis = optimize ? 0u : 1u;
++        /* Build vendor data: subcmd 74, param 62, value */
++        NL_ATTR_NESTED(_vdata, NL80211_ATTR_VENDOR_DATA);
++        uint32_t _c = 200u, _p = 62u, _v = dis;
++        NL_ATTRS_SET(&_vdata.data.attribs, ARR(
++            NL_ATTR_VAL(17, _c),
++            NL_ATTR_VAL(18, _p),
++            NL_ATTR_VAL(19, _v)));
++        /* Add MLO_LINK_ID */
++        NL_ATTRS_ADD(&_vdata.data.attribs, NL_ATTR_VAL(NL80211_ATTR_MLO_LINK_ID, linkId));
++        /* Send via primary link AP (which has correct wDevId for wlan2.1) */
++        T_SSID* pPrimSsid = wld_mld_getPrimaryLinkSsid(pAP->pSSID->pMldLink);
++        T_AccessPoint* pPrimAP = (pPrimSsid && pPrimSsid->AP_HOOK) ? pPrimSsid->AP_HOOK : pAP;
++        swl_rc_ne rc = wld_ap_nl80211_sendVendorSubCmdAttr(pPrimAP, 0x001374u, 74,
++            &_vdata, true, true, 0u, NULL, NULL);
++        wld_nl80211_cleanNlAttr(&_vdata);
++        return rc;
++    }
++    return SWL_RC_ERROR;
++}
++swl_rc_ne wifiGen_rad_getLpiAntennaOptimize(T_Radio* pRad _UNUSED, bool* value) {
++    if (value) { *value = true; }
++    return SWL_RC_NOT_IMPLEMENTED;
++}
++
++/* Regulatory Tx power NL vendor cmd (OUI=0x001374, SET=subcmd 505, GET=subcmd 506)
++ * Driver radio_idx matches SWL_FREQ_BAND enum: 2.4GHz=0, 5GHz=1, 6GHz=2
++ * pRad->operatingFrequencyBand gives the correct value directly.
++ */
++static uint8_t s_rad_reg_getDriverRadioIdx(T_Radio* pRad) {
++    return (uint8_t)pRad->operatingFrequencyBand;
++}
++
++#define G2_SET(paramId, val) do { \
++    uint32_t _cmd = 200u, _pid = (uint32_t)(paramId), _val = (uint32_t)(val); \
++    uint8_t _ridx = s_rad_reg_getDriverRadioIdx(pRad); \
++    NL_ATTR_NESTED(_vendorData, NL80211_ATTR_VENDOR_DATA); \
++    NL_ATTRS_SET(&_vendorData.data.attribs, ARR( \
++        NL_ATTR_VAL(17, _cmd), \
++        NL_ATTR_VAL(18, _pid), \
++        NL_ATTR_VAL(19, _val), \
++        NL_ATTR_VAL(150, _ridx))); \
++    swl_rc_ne _rc = wld_rad_nl80211_sendVendorSubCmdAttr(pRad, 0x001374u, 505, &_vendorData, true, true, 0u, NULL, NULL); \
++    wld_nl80211_cleanNlAttr(&_vendorData); \
++    return _rc; \
++} while(0)
++
++#define G2_GET(paramId) do { \
++    uint32_t _cmd = 200u, _pid = (uint32_t)(paramId); \
++    uint8_t _ridx = s_rad_reg_getDriverRadioIdx(pRad); \
++    NL_ATTR_NESTED(_vendorData, NL80211_ATTR_VENDOR_DATA); \
++    NL_ATTRS_SET(&_vendorData.data.attribs, ARR( \
++        NL_ATTR_VAL(17, _cmd), \
++        NL_ATTR_VAL(18, _pid), \
++        NL_ATTR_VAL(150, _ridx))); \
++    swl_rc_ne _rc = wld_rad_nl80211_sendVendorSubCmdAttr(pRad, 0x001374u, 506, &_vendorData, true, false, 0u, NULL, NULL); \
++    wld_nl80211_cleanNlAttr(&_vendorData); \
++    return _rc; \
++} while(0)
++
++
++swl_rc_ne wifiGen_rad_setCtlPowerScale(T_Radio* pRad, int32_t value) { G2_SET(76, value); }
++swl_rc_ne wifiGen_rad_getCtlPowerScale(T_Radio* pRad, int32_t* value) { _UNUSED_(value); G2_GET(76); }
++swl_rc_ne wifiGen_rad_setChannel144Enable(T_Radio* pRad, bool value) { G2_SET(77, value ? 1u : 0u); }
++swl_rc_ne wifiGen_rad_getChannel144Enable(T_Radio* pRad, bool* value) { _UNUSED_(value); G2_GET(77); }
++swl_rc_ne wifiGen_rad_setTxPowerScale(T_Radio* pRad, int32_t value) { G2_SET(43, value); }
++swl_rc_ne wifiGen_rad_getTxPowerScale(T_Radio* pRad, int32_t* value) { _UNUSED_(value); G2_GET(43); }
++swl_rc_ne wifiGen_rad_setTxPowerLimit2G(T_Radio* pRad, int32_t value) { G2_SET(38, value); }
++swl_rc_ne wifiGen_rad_getTxPowerLimit2G(T_Radio* pRad, int32_t* value) { _UNUSED_(value); G2_GET(38); }
++swl_rc_ne wifiGen_rad_setTxPowerLimit5G(T_Radio* pRad, int32_t value) { G2_SET(39, value); }
++swl_rc_ne wifiGen_rad_getTxPowerLimit5G(T_Radio* pRad, int32_t* value) { _UNUSED_(value); G2_GET(39); }
++swl_rc_ne wifiGen_rad_setAntennaGain2G(T_Radio* pRad, int32_t value) { G2_SET(40, value); }
++swl_rc_ne wifiGen_rad_getAntennaGain2G(T_Radio* pRad, int32_t* value) { _UNUSED_(value); G2_GET(40); }
++swl_rc_ne wifiGen_rad_setAntennaGain5G(T_Radio* pRad, int32_t value) { G2_SET(41, value); }
++swl_rc_ne wifiGen_rad_getAntennaGain5G(T_Radio* pRad, int32_t* value) { _UNUSED_(value); G2_GET(41); }
+diff --git a/src/wld_functionTable.c b/src/wld_functionTable.c
+index 0b2b018..35d27a2 100644
+--- a/src/wld_functionTable.c
++++ b/src/wld_functionTable.c
+@@ -661,6 +661,28 @@ static swl_rc_ne TRAP_mfn_wrad_update_mon_stats(T_Radio* rad _UNUSED) {
+     SAH_TRACEZ_NOTICE(ME, "%p", rad);
+     return SWL_RC_NOT_IMPLEMENTED;
+ }
++/* Regulatory TRAP_ stubs */
++static swl_rc_ne TRAP_mfn_wrad_setEhtConfigCcfs0(T_Radio* r,int32_t v){_UNUSED_(r);_UNUSED_(v);return SWL_RC_NOT_IMPLEMENTED;}
++static swl_rc_ne TRAP_mfn_wrad_getEhtConfigCcfs0(T_Radio* r,int32_t* v){_UNUSED_(r);_UNUSED_(v);return SWL_RC_NOT_IMPLEMENTED;}
++static swl_rc_ne TRAP_mfn_wrad_setTpeCommonPsd(T_Radio* r,int32_t v){_UNUSED_(r);_UNUSED_(v);return SWL_RC_NOT_IMPLEMENTED;}
++static swl_rc_ne TRAP_mfn_wrad_getTpeCommonPsd(T_Radio* r,int32_t* v){_UNUSED_(r);_UNUSED_(v);return SWL_RC_NOT_IMPLEMENTED;}
++static swl_rc_ne TRAP_mfn_wrad_setTpePwrUnit(T_Radio* r,int32_t v){_UNUSED_(r);_UNUSED_(v);return SWL_RC_NOT_IMPLEMENTED;}
++static swl_rc_ne TRAP_mfn_wrad_getTpePwrUnit(T_Radio* r,int32_t* v){_UNUSED_(r);_UNUSED_(v);return SWL_RC_NOT_IMPLEMENTED;}
++static swl_rc_ne TRAP_mfn_wrad_setTpePunctChannelTxPwr(T_Radio* r,int32_t v){_UNUSED_(r);_UNUSED_(v);return SWL_RC_NOT_IMPLEMENTED;}
++static swl_rc_ne TRAP_mfn_wrad_getTpePunctChannelTxPwr(T_Radio* r,int32_t* v){_UNUSED_(r);_UNUSED_(v);return SWL_RC_NOT_IMPLEMENTED;}
++static swl_rc_ne TRAP_mfn_wrad_setCtlPowerScale(T_Radio* r,int32_t v){_UNUSED_(r);_UNUSED_(v);return SWL_RC_NOT_IMPLEMENTED;}
++static swl_rc_ne TRAP_mfn_wrad_getCtlPowerScale(T_Radio* r,int32_t* v){_UNUSED_(r);_UNUSED_(v);return SWL_RC_NOT_IMPLEMENTED;}
++static swl_rc_ne TRAP_mfn_wrad_setTxPowerScale(T_Radio* r,int32_t v){_UNUSED_(r);_UNUSED_(v);return SWL_RC_NOT_IMPLEMENTED;}
++static swl_rc_ne TRAP_mfn_wrad_getTxPowerScale(T_Radio* r,int32_t* v){_UNUSED_(r);_UNUSED_(v);return SWL_RC_NOT_IMPLEMENTED;}
++static swl_rc_ne TRAP_mfn_wrad_setTxPowerLimit2G(T_Radio* r,int32_t v){_UNUSED_(r);_UNUSED_(v);return SWL_RC_NOT_IMPLEMENTED;}
++static swl_rc_ne TRAP_mfn_wrad_getTxPowerLimit2G(T_Radio* r,int32_t* v){_UNUSED_(r);_UNUSED_(v);return SWL_RC_NOT_IMPLEMENTED;}
++static swl_rc_ne TRAP_mfn_wrad_setTxPowerLimit5G(T_Radio* r,int32_t v){_UNUSED_(r);_UNUSED_(v);return SWL_RC_NOT_IMPLEMENTED;}
++static swl_rc_ne TRAP_mfn_wrad_getTxPowerLimit5G(T_Radio* r,int32_t* v){_UNUSED_(r);_UNUSED_(v);return SWL_RC_NOT_IMPLEMENTED;}
++static swl_rc_ne TRAP_mfn_wrad_setAntennaGain2G(T_Radio* r,int32_t v){_UNUSED_(r);_UNUSED_(v);return SWL_RC_NOT_IMPLEMENTED;}
++static swl_rc_ne TRAP_mfn_wrad_getAntennaGain2G(T_Radio* r,int32_t* v){_UNUSED_(r);_UNUSED_(v);return SWL_RC_NOT_IMPLEMENTED;}
++static swl_rc_ne TRAP_mfn_wrad_setAntennaGain5G(T_Radio* r,int32_t v){_UNUSED_(r);_UNUSED_(v);return SWL_RC_NOT_IMPLEMENTED;}
++static swl_rc_ne TRAP_mfn_wrad_getAntennaGain5G(T_Radio* r,int32_t* v){_UNUSED_(r);_UNUSED_(v);return SWL_RC_NOT_IMPLEMENTED;}
++
+ 
+ static swl_rc_ne TRAP_mfn_wrad_setup_stamon(T_Radio* rad _UNUSED, bool enable _UNUSED) {
+     _UNUSED_(rad);
+@@ -791,6 +813,17 @@ void wld_functionTable_init(vendor_t* vendor, T_CWLD_FUNC_TABLE* fta) {
+     FTA_ASSIGN(mfn_wrad_continue_external_scan);
+     FTA_ASSIGN(mfn_wrad_scan_results);
+     FTA_ASSIGN(mfn_wrad_update_mon_stats);
++
++    FTA_ASSIGN(mfn_wrad_setEhtConfigCcfs0); FTA_ASSIGN(mfn_wrad_getEhtConfigCcfs0);
++    FTA_ASSIGN(mfn_wrad_setTpeCommonPsd); FTA_ASSIGN(mfn_wrad_getTpeCommonPsd);
++    FTA_ASSIGN(mfn_wrad_setTpePwrUnit); FTA_ASSIGN(mfn_wrad_getTpePwrUnit);
++    FTA_ASSIGN(mfn_wrad_setTpePunctChannelTxPwr); FTA_ASSIGN(mfn_wrad_getTpePunctChannelTxPwr);
++    FTA_ASSIGN(mfn_wrad_setCtlPowerScale); FTA_ASSIGN(mfn_wrad_getCtlPowerScale);
++    FTA_ASSIGN(mfn_wrad_setTxPowerScale); FTA_ASSIGN(mfn_wrad_getTxPowerScale);
++    FTA_ASSIGN(mfn_wrad_setTxPowerLimit2G); FTA_ASSIGN(mfn_wrad_getTxPowerLimit2G);
++    FTA_ASSIGN(mfn_wrad_setTxPowerLimit5G); FTA_ASSIGN(mfn_wrad_getTxPowerLimit5G);
++    FTA_ASSIGN(mfn_wrad_setAntennaGain2G); FTA_ASSIGN(mfn_wrad_getAntennaGain2G);
++    FTA_ASSIGN(mfn_wrad_setAntennaGain5G); FTA_ASSIGN(mfn_wrad_getAntennaGain5G);
+     FTA_ASSIGN(mfn_wrad_setup_stamon);
+     FTA_ASSIGN(mfn_wrad_add_stamon);
+     FTA_ASSIGN(mfn_wrad_del_stamon);
+diff --git a/src/wld_radio.c b/src/wld_radio.c
+index ab99b06..6735292 100644
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -672,6 +672,47 @@ amxd_status_t _wld_rad_validatePowerType_pvf(amxd_object_t* object,
+     return status;
+ }
+ 
++/* Regulatory write handlers */
++static void s_setEhtConfigCcfs0_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    T_Radio* pRad = wld_rad_fromObj(object); ASSERTS_NOT_NULL(pRad, , ME, "NULL");
++    pRad->pFA->mfn_wrad_setEhtConfigCcfs0(pRad, amxc_var_dyncast(int32_t, newValue));
++}
++static void s_setTpeCommonPsd_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    T_Radio* pRad = wld_rad_fromObj(object); ASSERTS_NOT_NULL(pRad, , ME, "NULL");
++    pRad->pFA->mfn_wrad_setTpeCommonPsd(pRad, amxc_var_dyncast(int32_t, newValue));
++}
++static void s_setTpePwrUnit_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    T_Radio* pRad = wld_rad_fromObj(object); ASSERTS_NOT_NULL(pRad, , ME, "NULL");
++    pRad->pFA->mfn_wrad_setTpePwrUnit(pRad, amxc_var_dyncast(int32_t, newValue));
++}
++static void s_setTpePunctChannelTxPwr_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    T_Radio* pRad = wld_rad_fromObj(object); ASSERTS_NOT_NULL(pRad, , ME, "NULL");
++    pRad->pFA->mfn_wrad_setTpePunctChannelTxPwr(pRad, amxc_var_dyncast(int32_t, newValue));
++}
++static void s_setCtlPowerScale_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    T_Radio* pRad = wld_rad_fromObj(object); ASSERTS_NOT_NULL(pRad, , ME, "NULL");
++    pRad->pFA->mfn_wrad_setCtlPowerScale(pRad, amxc_var_dyncast(int32_t, newValue));
++}
++static void s_setTxPowerScale_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    T_Radio* pRad = wld_rad_fromObj(object); ASSERTS_NOT_NULL(pRad, , ME, "NULL");
++    pRad->pFA->mfn_wrad_setTxPowerScale(pRad, amxc_var_dyncast(int32_t, newValue));
++}
++static void s_setTxPowerLimit2G_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    T_Radio* pRad = wld_rad_fromObj(object); ASSERTS_NOT_NULL(pRad, , ME, "NULL");
++    pRad->pFA->mfn_wrad_setTxPowerLimit2G(pRad, amxc_var_dyncast(int32_t, newValue));
++}
++static void s_setTxPowerLimit5G_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    T_Radio* pRad = wld_rad_fromObj(object); ASSERTS_NOT_NULL(pRad, , ME, "NULL");
++    pRad->pFA->mfn_wrad_setTxPowerLimit5G(pRad, amxc_var_dyncast(int32_t, newValue));
++}
++static void s_setAntennaGain2G_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    T_Radio* pRad = wld_rad_fromObj(object); ASSERTS_NOT_NULL(pRad, , ME, "NULL");
++    pRad->pFA->mfn_wrad_setAntennaGain2G(pRad, amxc_var_dyncast(int32_t, newValue));
++}
++static void s_setAntennaGain5G_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    T_Radio* pRad = wld_rad_fromObj(object); ASSERTS_NOT_NULL(pRad, , ME, "NULL");
++    pRad->pFA->mfn_wrad_setAntennaGain5G(pRad, amxc_var_dyncast(int32_t, newValue));
++}
+ static void s_setPowerType_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
+     SAH_TRACEZ_IN(ME);
+ 
+@@ -6383,6 +6424,16 @@ SWLA_DM_HDLRS(sRadioDmHdlrs,
+                   SWLA_DM_PARAM_HDLR("PowerType", s_setPowerType_pwf),
+                   SWLA_DM_PARAM_HDLR("DiscardAwgnEvent", s_setDiscardAwgnEvent_pwf),
+                   SWLA_DM_PARAM_HDLR("AllowScanDfsChan", s_setAllowScanDfsChan_pwf),
++                  SWLA_DM_PARAM_HDLR("EhtConfigCcfs0", s_setEhtConfigCcfs0_pwf),
++                  SWLA_DM_PARAM_HDLR("TpeCommonPsd", s_setTpeCommonPsd_pwf),
++                  SWLA_DM_PARAM_HDLR("TpePwrUnit", s_setTpePwrUnit_pwf),
++                  SWLA_DM_PARAM_HDLR("TpePunctChannelTxPwr", s_setTpePunctChannelTxPwr_pwf),
++                  SWLA_DM_PARAM_HDLR("CtlPowerScale", s_setCtlPowerScale_pwf),
++                  SWLA_DM_PARAM_HDLR("TxPowerScale", s_setTxPowerScale_pwf),
++                  SWLA_DM_PARAM_HDLR("TxPowerLimit2G", s_setTxPowerLimit2G_pwf),
++                  SWLA_DM_PARAM_HDLR("TxPowerLimit5G", s_setTxPowerLimit5G_pwf),
++                  SWLA_DM_PARAM_HDLR("AntennaGain2G", s_setAntennaGain2G_pwf),
++                  SWLA_DM_PARAM_HDLR("AntennaGain5G", s_setAntennaGain5G_pwf),
+                   SWLA_DM_PARAM_HDLR("PowerSaveEnable", s_setPowerSaveEnable_pwf),
+                   ),
+               .instAddedCb = s_addInstance_oaf);
+-- 
+2.34.1
+
