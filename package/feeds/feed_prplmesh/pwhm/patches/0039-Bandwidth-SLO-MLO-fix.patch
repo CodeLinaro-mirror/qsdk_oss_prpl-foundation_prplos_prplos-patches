@@ -1,0 +1,105 @@
+From a5d03b4671285c6cc195b2d3db493b8a49734359 Mon Sep 17 00:00:00 2001
+From: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+Date: Wed, 24 Jun 2026 23:51:46 +0530
+Subject: [PATCH] Bandwidth mismatch and SLO-Legacy vap switch fix
+
+Signed-off-by: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+---
+
+diff --git a/include/wld/wld_hostapd_cfgFile.h b/include/wld/wld_hostapd_cfgFile.h
+index bbf5e73..8a79569 100644
+--- a/include/wld/wld_hostapd_cfgFile.h
++++ b/include/wld/wld_hostapd_cfgFile.h
+@@ -71,5 +71,6 @@ bool wld_hostapd_cfgFile_update(char* configPath, const char* interface, const c
+ void wld_hostapd_cfgFile_setRadioConfig(T_Radio* pRad, swl_mapChar_t* radConfigMap);
+ void wld_hostapd_cfgFile_setVapConfig(T_AccessPoint* pAP, swl_mapChar_t* vapConfigMap, swl_mapChar_t* multiAPConfig);
+ swl_rc_ne wld_hostapd_cfgFile_genConfigHash(char** pHashStr, swl_mapChar_t* configMap);
++void wld_hostapd_cfgFile_updatePerBssConfigs(T_Radio* pRad);
+ 
+ #endif /* __WLD_HOSTAPD_CFG_FILE_H__ */
+diff --git a/src/nl80211/wld_hostapd_cfgFile.c b/src/nl80211/wld_hostapd_cfgFile.c
+index 29942b6..02dce66 100644
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -1708,6 +1708,35 @@ void wld_hostapd_cfgFile_setVapConfig(T_AccessPoint* pAP, swl_mapChar_t* vapConf
+     s_saveVapConfigId(pAP, vapConfigMap);
+ }
+ 
++static void s_createPerBssCfgFiles(T_Radio* pRad, wld_hostapd_config_t* config);
++
++/**
++ * @brief Update per-BSS configuration files for all access points on a radio
++ *
++ * This function should be called when radio parameters (like bandwidth) change
++ * to ensure that per-BSS config files are updated with the new radio parameters.
++ * This is critical for secondary BSS that are added via ADD command, as they
++ * use the per-BSS config files.
++ *
++ * @param pRad Pointer to the radio structure
++ *
++ * @return void
++ */
++void wld_hostapd_cfgFile_updatePerBssConfigs(T_Radio* pRad) {
++    ASSERTS_NOT_NULL(pRad, , ME, "NULL");
++    ASSERTS_NOT_NULL(pRad->hostapd, , ME, "NULL");
++    ASSERTS_FALSE(amxc_llist_is_empty(&pRad->llAP), , ME, "No vaps");
++
++    wld_hostapd_config_t* config = NULL;
++    bool ret = wld_hostapd_createConfig(&config, pRad);
++    ASSERT_TRUE(ret, , ME, "Bad config");
++
++    SAH_TRACEZ_INFO(ME, "%s: Updating per-BSS config files with current radio params", pRad->Name);
++    s_createPerBssCfgFiles(pRad, config);
++
++    wld_hostapd_deleteConfig(config);
++}
++
+ /**
+  * @brief Create individual per-BSS configuration files for all access points on a radio
+  *
+diff --git a/src/nl80211/wld_hostapd_cfgManager.c b/src/nl80211/wld_hostapd_cfgManager.c
+index 6c6e8a7..48c0b70 100644
+--- a/src/nl80211/wld_hostapd_cfgManager.c
++++ b/src/nl80211/wld_hostapd_cfgManager.c
+@@ -211,6 +211,14 @@ bool wld_hostapd_createBssConfig(wld_hostapd_bssConfig_t** ppbssConfig, swl_mapC
+         "hw_mode", "channel", "country_code",
+         "ieee80211d", "ieee80211h",
+         "ieee80211n", "ieee80211ac", "ieee80211ax", "ieee80211be",
++        "ht_capab",
++        "vht_capab", "vht_oper_chwidth", "vht_oper_centr_freq_seg0_idx",
++        "he_oper_chwidth", "he_oper_centr_freq_seg0_idx",
++        "he_su_beamformer", "he_su_beamformee", "he_mu_beamformer",
++        "he_bss_color", "he_bss_color_partial", "he_spr_sr_control",
++        "eht_oper_chwidth", "eht_oper_centr_freq_seg0_idx",
++        "eht_su_beamformer", "eht_su_beamformee", "eht_mu_beamformer",
++        "op_class", "noscan", "ht_coex", "preamble",
+     };
+ 
+     for(uint32_t i = 0; i < SWL_ARRAY_SIZE(minimalRadioParamsForBssConfig); i++) {
+diff --git a/src/nl80211/wld_rad_hostapd_api.c b/src/nl80211/wld_rad_hostapd_api.c
+index 2f1125c..0a00ba2 100644
+--- a/src/nl80211/wld_rad_hostapd_api.c
++++ b/src/nl80211/wld_rad_hostapd_api.c
+@@ -240,6 +240,8 @@ swl_rc_ne wld_rad_hostapd_switchChannel(T_Radio* pR) {
+     //send command
+     bool ret = wld_ap_hostapd_sendCommand(primaryVap, cmd, "switch channel");
+     ASSERTS_TRUE(ret, SWL_RC_ERROR, ME, "NULL");
++    SAH_TRACEZ_INFO(ME, "%s: Updating per-BSS configs after channel switch", pR->Name);
++    wld_hostapd_cfgFile_updatePerBssConfigs(pR);
+     return SWL_RC_OK;
+ }
+ 
+diff --git a/src/nl80211/wld_wpaCtrlMngr.c b/src/nl80211/wld_wpaCtrlMngr.c
+index b138339..85e1f66 100644
+--- a/src/nl80211/wld_wpaCtrlMngr.c
++++ b/src/nl80211/wld_wpaCtrlMngr.c
+@@ -91,6 +91,9 @@ static int s_filterNames(const struct dirent* pEntry) {
+     if(swl_str_startsWith(fname, ".") || swl_str_startsWith(fname, "..")) {
+         return 0;
+     }
++    if(swl_str_startsWith(fname, "hostapd_if_eloop_")) {
++        return 0;
++    }
+     return 1;
+ }
+ 
