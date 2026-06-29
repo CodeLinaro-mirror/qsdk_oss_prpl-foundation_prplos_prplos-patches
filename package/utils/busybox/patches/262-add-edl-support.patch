@@ -1,0 +1,49 @@
+Author: Vijay Balaji <vijbal@qti.qualcomm.com>
+Subject: Add EDL mode boot support for reboot command in busybox
+
+This patch adds support to boot the board in
+EDL mode after reboot with command 'edl'.
+
+Change-Id: Ia5e3be6611a002df742954a31f15e4f73816e848
+Signed-off-by: Vijay Balaji <vijbal@qti.qualcomm.com>
+---
+
+Index: busybox-1.36.1/init/halt.c
+===================================================================
+--- busybox-1.36.1.orig/init/halt.c
++++ busybox-1.36.1/init/halt.c
+@@ -90,9 +90,17 @@
+ //usage:     "\n	-d SEC	Delay interval"
+ //usage:     "\n	-n	Do not sync"
+ //usage:     "\n	-f	Force (don't go through init)"
++//usage:     "\n	edl	Go in edl mode after reboot"
+ 
+ #include "libbb.h"
+ #include "reboot.h"
++#include <sys/syscall.h>
++
++#define LINUX_REBOOT_MAGIC1     0xfee1dead
++#define LINUX_REBOOT_MAGIC2     672274793
++
++#define LINUX_REBOOT_CMD_RESTART        0x01234567
++#define LINUX_REBOOT_CMD_RESTART2       0xA1B2C3D4
+ 
+ #if ENABLE_FEATURE_WTMP
+ #include <sys/utsname.h>
+@@ -197,6 +205,16 @@ int halt_main(int argc UNUSED_PARAM, cha
+ 	sleep(delay);
+ 
+ 	write_wtmp();
++	/* Check if a positional argument is passed for different reboot mode Ex: edl */
++	if (argv[optind]) {
++		const char *cmd = argv[optind];
++		long result = syscall(SYS_reboot, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, LINUX_REBOOT_CMD_RESTART2, cmd);
++		if (result == -1) {
++			perror("syscall reboot failed");
++			return EXIT_FAILURE;
++		}
++		return EXIT_SUCCESS;
++	}
+ 
+ 	if (flags & 8) /* -w */
+ 		return EXIT_SUCCESS;

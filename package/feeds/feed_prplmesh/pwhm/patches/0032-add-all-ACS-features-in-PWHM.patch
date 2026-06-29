@@ -1,0 +1,1030 @@
+From 51ec540b172ac4830446fde2b1b3eb5d302cea3f Mon Sep 17 00:00:00 2001
+From: Atchaya R <ratchaya@qti.qualcomm.com>
+Date: Sun, 14 Jun 2026 17:32:10 +0530
+Subject: [PATCH] pwhm: add support for ACS features in PWHM
+
+Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
+---
+ odl/wld_radio.odl                  | 235 ++++++++++
+ src/Plugin/wifiGen_eventHandlers.c |  25 ++
+ src/nl80211/wld_hostapd_cfgFile.c  | 100 +++++
+ src/wld_radio.c                    | 697 +++++++++++++++++++++++++++++
+ 4 files changed, 1057 insertions(+)
+
+--- a/odl/wld_radio.odl
++++ b/odl/wld_radio.odl
+@@ -196,6 +196,27 @@ define probelist_t{
+ 		 */
+ 		bool startACS();
+ 
++		/**
++		 * Invoke ACS on the radio via hostapd's dynamic ACS mechanism.
++		 *
++		 * Unlike startACS() which restarts hostapd (disruptive), this function
++		 * sends the "ACS invoke" command via wpa_ctrl to the first active AP on
++		 * the radio. hostapd triggers ACS without disconnecting stations:
++		 *   - mode 0: run ACS and change channel via CSA (non-disruptive)
++		 *   - mode 1: run ACS only, no channel change (dry-run / report)
++		 *
++		 * The radio must be active (hostapd running and at least one AP up).
++		 * If ACS is already in progress, hostapd will reject the request.
++		 *
++		 * @param mode: 0 = ACS + CSA channel change
++		 *              1 = ACS scan only, no channel change
++		 * @return true on success, false on error
++		 * @error function_exec_error "Invalid mode" if mode is not 0 or 1
++		 * @error function_exec_error "Radio not active" if no AP is available
++		 * @error function_exec_error "ACS invoke failed" if hostapd rejects the command
++		 */
++		bool invokeACS(%in %mandatory uint32 mode);
++
+ 		/*
+ 		 * This function will start an automatic channel selection sequence.
+ 		 * The corresponding configuration must be enabled in the agent config file to use this feature.
+@@ -779,6 +800,247 @@ define probelist_t{
+ 		 */
+ 		void startAutoChannelSelection();
+ 
++		/**
++		 * ACS (Automatic Channel Selection) runtime configuration and control.
++		 *
++		 * All parameters are per-radio in hostapd (stored in hostapd_iface->conf_extn,
++		 * not per-BSS). Commands are sent via wpa_ctrl to the first active AP on this
++		 * radio. Setting a parameter via any BSS interface of the radio affects all BSS
++		 * interfaces on the same radio (confirmed: setting on wlan2.2 is visible on wlan2.1).
++		 *
++		 * Persistence semantics — two categories:
++		 *
++		 * 1. Config-file parameters (%persistent): written to hostapd.conf so they
++		 *    survive hostapd restarts. pWHM marks these %persistent to match hostapd.
++		 *    Parameters: MinDwellTime, MaxDwellTime, DfsExclude, PcacOnly,
++		 *                OnlyPscChannels6G, PeriodicInterval, QacsEnable,
++		 *                ChannelList, Scan2GAllChannels.
++		 *
++		 * 2. wpa_ctrl-only parameters (non-persistent): applied at runtime via
++		 *    "ACS <cmd>" wpa_ctrl commands. hostapd resets them to defaults on
++		 *    restart. pWHM does NOT persist these — they reset to defaults on reboot,
++		 *    matching hostapd's own behaviour.
++		 *    Parameters: DwellTime, WeatherRadarExclude, TxPwrOptimization,
++		 *                RankEnable, NoScan, DebugTrace, BlockChanList.
++		 */
++		%persistent object ACS {
++			on event "*" call wld_rad_setAcsConf_ocf;
++
++			/**
++			 * Minimum ACS dwell time in milliseconds.
++			 * hostapd enforces a hard floor of 50 ms (values below 50 are clamped to 50).
++			 * Written to hostapd config as: acsmin_dwell <value>
++			 * Config-file-only parameter (no wpa_ctrl runtime command).
++			 * Takes effect after hostapd restart.
++			 * Reading this parameter actively queries: ACS get_dwell
++			 */
++			%persistent uint32 MinDwellTime {
++				on action validate call check_minimum 50;
++				default 50;
++			}
++
++			/**
++			 * Maximum ACS dwell time in milliseconds.
++			 * Written to hostapd config as: acsmax_dwell <value>
++			 * Config-file-only parameter (no wpa_ctrl runtime command).
++			 * Takes effect after hostapd restart.
++			 * Reading this parameter actively queries: ACS get_dwell
++			 */
++			%persistent uint32 MaxDwellTime {
++				on action validate call check_minimum 50;
++				default 250;
++			}
++
++			/**
++			 * ACS dwell time in milliseconds (time spent scanning each channel).
++			 * Sent as: ACS dwelltime <value>
++			 * hostapd defaults (from hostapd_config_defaults_extn):
++			 *   min_dwell = 50 ms  (hard minimum, enforced in hostapd config parsing)
++			 *   max_dwell = 250 ms
++			 *   dwelltime = 200 ms (default configured dwell time)
++			 * Reading this parameter actively queries: ACS get_dwell
++			 * (in parity with hostapd's actual state when radio is active)
++			 * NOT persistent: wpa_ctrl-only, hostapd resets to default on restart.
++			 */
++			uint32 DwellTime {
++				on action validate call check_range { min = 50, max = 250 };
++				default 200;
++			}
++
++			/**
++			 * Exclude DFS channels from ACS channel selection.
++			 * Sent as: ACS dfs_exclude <0|1>
++			 */
++			%persistent bool DfsExclude {
++				default false;
++			}
++
++			/**
++			 * Restrict ACS DFS channel selection to channels that have already
++			 * completed CAC (pre-CAC done, DFS state = available).
++			 * When enabled, ACS skips DFS channels that still require a fresh CAC
++			 * scan, avoiding the CAC delay on startup.
++			 * Written to hostapd config as: acs_pcaconly <0|1>
++			 * Only written when ACS is active (AutoChannelEnable=true).
++			 * Corresponds to hostapd conf->acs_dfs_available_only.
++			 */
++			%persistent bool PcacOnly {
++				default false;
++			}
++
++			/**
++			 * Exclude weather radar channels from ACS channel selection.
++			 * Sent as: ACS wradar <0|1>
++			 * hostapd default: wradar = 1 (enabled — weather radar channels excluded by default)
++			 * Reading this parameter actively queries: ACS get_wradar
++			 * (in parity with hostapd's actual state when radio is active)
++			 * NOT persistent: wpa_ctrl-only, hostapd resets to default on restart.
++			 */
++			bool WeatherRadarExclude {
++				default true;
++			}
++
++			/**
++			 * Restrict 6GHz ACS to PSC (Preferred Scanning Channels) only.
++			 * Sent as: ACS 6g_only_psc <0|1>
++			 * Only applicable for 6GHz radios; ignored for 2.4GHz and 5GHz.
++			 */
++			%persistent bool OnlyPscChannels6G {
++				default false;
++			}
++
++			/**
++			 * TX power optimization mode for ACS channel ranking.
++			 * 0 = disabled (default)
++			 * 1 = optimize for throughput
++			 * 2 = optimize for range
++			 * Sent as: ACS txpwr_opt <0|1|2>
++			 * NOT persistent: wpa_ctrl-only, hostapd resets to default on restart.
++			 */
++			uint32 TxPwrOptimization {
++				on action validate call check_range { min = 0, max = 2 };
++				default 0;
++			}
++
++			/**
++			 * Periodic ACS interval in seconds (0 = disabled).
++			 * When non-zero, hostapd re-runs ACS every <value> seconds.
++			 * hostapd constraint: 60..86400 seconds (or 0 to disable)
++			 * Sent as: ACS periodic_interval <sec>
++			 */
++			%persistent uint32 PeriodicInterval {
++				default 0;
++			}
++
++			/**
++			 * Enable/disable ACS channel ranking algorithm.
++			 * When enabled, channels are ranked by interference factor.
++			 * Sent as: ACS rank_en <0|1>
++			 * NOT persistent: wpa_ctrl-only, hostapd resets to default on restart.
++			 */
++			bool RankEnable {
++				default true;
++			}
++
++			/**
++			 * Enable/disable ACS noscan mode.
++			 * When enabled, ACS uses cached survey data without performing a new scan.
++			 * Sent as: ACS noscan <0|1>
++			 * NOT persistent: wpa_ctrl-only, hostapd resets to default on restart.
++			 */
++			bool NoScan {
++				default false;
++			}
++
++			/**
++			 * ACS debug trace level (combined value).
++			 * Bits 0x00FF = debug level (0=off, higher=more verbose)
++			 * Bits 0xFF00 = module bitmap (which ACS modules to trace)
++			 * Setting this parameter sends: ACS dbgtrace <value>
++			 * Reading this parameter actively queries: ACS get_dbgtrace
++			 * (in parity with hostapd's actual state when radio is active)
++			 * NOT persistent: wpa_ctrl-only, hostapd resets to default on restart.
++			 */
++			uint32 DebugTrace {
++				on action read call wld_rad_getAcsDebugTrace_prf;
++				default 0;
++			}
++
++			/**
++			 * Enable/disable QACS (Qualcomm ACS) extension algorithm.
++			 * When disabled, the standard hostapd ACS algorithm is used instead.
++			 * Sent as: ACS qacs_enable <0|1>
++			 */
++			%persistent bool QacsEnable {
++				default true;
++			}
++
++			/**
++			 * Comma-separated list of channels to block from ACS selection.
++			 * Setting a non-empty value sends: ACS set_block_chan_list <channels>
++			 * Example: "1,6,11" blocks channels 1, 6, and 11.
++			 * Use clearBlockChanList() to remove all blocked channels.
++			 * NOT persistent: wpa_ctrl-only, hostapd resets to default on restart.
++			 */
++			string BlockChanList {
++				default "";
++			}
++
++			/**
++			 * ACS channel list restriction.
++			 * Restricts ACS to scan only the specified channels or channel ranges.
++			 * Format: comma-separated channels or ranges (e.g., "3-8" or "1,6,11" or "1,6,11-13").
++			 * Written to hostapd config as: chanlist <space-separated channels/ranges>
++			 * Config-file-only parameter (no wpa_ctrl runtime command).
++			 * Written unconditionally (applies to both startup ACS and invokeACS()).
++			 * Empty string = no restriction (all channels allowed, default).
++			 * Corresponds to: uci set wireless.wifiX.channels=3-8
++			 */
++			%persistent string ChannelList {
++				default "";
++			}
++
++			/**
++			 * 2.4 GHz ACS channel scan mode.
++			 * false (0) = scan only non-overlapping channels 1, 6, 11 (default)
++			 * true  (1) = scan all available 2.4 GHz channels
++			 * Sent as: ACS 2g_scan_all <0|1>
++			 */
++			%persistent bool Scan2GAllChannels {
++				default false;
++			}
++
++			/**
++			 * Current ACS status, read from hostapd via "ACS get_status".
++			 * Values: "Inprogress" | "Idle"
++			 */
++			%read-only string Status {
++				on action read call wld_rad_getAcsStatus_prf;
++				default "Idle";
++			}
++
++			/**
++			 * Retrieve the last ACS channel ranking report from hostapd.
++			 * Sends: ACS show_report
++			 * @return string containing the ACS channel report, or empty if unavailable.
++			 */
++			string showReport();
++
++			/**
++			 * Clear the ACS blocked channel list.
++			 * Sends: ACS clear_block_chan_list
++			 * Also resets BlockChanList to empty string.
++			 */
++			void clearBlockChanList();
++
++			/**
++			 * Retrieve the ACS neighbor report (detected neighboring APs from last scan).
++			 * Sends: ACS show_neighbor_report
++			 * @return string containing the neighbor report table, or empty if unavailable.
++			 */
++			string showNeighborReport();
++		}
++
+ 		/** <p>The current radio channel used by the connection. To
+ 			 request automatic channel selection, set AutoChannelEnable
+ 			 to true. Whenever AutoChannelEnable is true, the value of
+--- a/src/Plugin/wifiGen_eventHandlers.c
++++ b/src/Plugin/wifiGen_eventHandlers.c
+@@ -604,6 +604,31 @@ static void s_awgnInterferenceDetectedCb
+     T_Radio* pRad = (T_Radio*) userData;
+     ASSERT_NOT_NULL(pRad, , ME, "NULL");
+ 
++    /*
++     * Explicitly trigger the wpaCtrlEvents AMX signal on the Radio object so that
++     * prplmesh and other bus subscribers receive the INTERFERENCE-DETECTED event.
++     *
++     * Root cause why this is needed:
++     * The INTERFERENCE-DETECTED event is received on a VAP interface (e.g. wlan0.1),
++     * not on the radio interface (e.g. wlan0). The generic forwarding path goes through
++     * s_wpaCtrlRadioStdEvt (registered as fProcStdEvtMsg on the radio manager), but
++     * that function has the guard:
++     *   ASSERTS_TRUE(swl_str_matches(pRad->Name, ifName), ...)
++     * which fails when ifName="wlan0.1" != pRad->Name="wlan0", causing it to return
++     * early without calling s_notifyWpaCtrlEvent / amxd_object_trigger_signal.
++     * We therefore trigger the signal directly here where pRad->pBus is available.
++     */
++    char msgData[512] = {0};
++    snprintf(msgData, sizeof(msgData), "INTERFERENCE-DETECTED %s", params);
++    amxc_var_t eventData;
++    amxc_var_init(&eventData);
++    amxc_var_set_type(&eventData, AMXC_VAR_ID_HTABLE);
++    amxc_var_add_key(cstring_t, &eventData, "ifName", ifName);
++    amxc_var_add_key(cstring_t, &eventData, "eventData", msgData);
++    SAH_TRACEZ_ERROR(ME, "%s: notify wpaCtrlEvents INTERFERENCE-DETECTED eventData=%s", pRad->Name, msgData);
++    amxd_object_trigger_signal(pRad->pBus, "wpaCtrlEvents", &eventData);
++    amxc_var_clean(&eventData);
++
+     /* Check if this is a WLAN/CW interference event that will trigger ACS */
+     char typeStr[32] = {0};
+         if(wld_wpaCtrl_getValueStr(params, "type", typeStr, sizeof(typeStr)) > 0 &&
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -679,6 +679,126 @@ void wld_hostapd_cfgFile_setRadioConfig(
+         s_filterEntries(radConfigMap, mbssidKeys, SWL_ARRAY_SIZE(mbssidKeys));
+     }
+ 
++    /*
++     * Write ACS configuration parameters to hostapd config file.
++     *
++     * ALL ACS channel-filtering parameters are written UNCONDITIONALLY so they
++     * persist across hostapd restarts and also apply when invokeACS() triggers
++     * dynamic ACS with AutoChannelEnable=false.
++     *
++     * Cross-reference with hostapd acs.c — each parameter is checked inside
++     * ACS functions (scan/interference/selection phases) that run for both
++     * startup ACS (channel=0) and dynamic ACS (ACS invoke):
++     *
++     *   qacs_enable           → unconditional (persists for next ACS run)
++     *   acs_2g_scan_all       → unconditional (persists for next ACS run)
++     *   acs_periodic_interval → unconditional (persists for next ACS run)
++     *   acsmin_dwell          → unconditional (persists for next ACS run)
++     *   acsmax_dwell          → unconditional (persists for next ACS run)
++     *   acs_exclude_dfs       → unconditional: scan+interference+selection phases
++     *   acs_pcaconly          → unconditional: scan+selection phases (config-file-only)
++     *   acs_exclude_6ghz_non_psc → unconditional: selection phase
++     *   chanlist              → unconditional: scan+interference+selection phases
++     *                           (config-file-only, no wpa_ctrl runtime command)
++     *
++     * All parameters are also applied at runtime via wpa_ctrl (invokeACS /
++     * individual ACS set handlers) so they take effect immediately when the
++     * radio is active.
++     */
++    if(pRad->pBus) {
++        amxd_object_t* acsObj = amxd_object_findf(pRad->pBus, "ACS");
++        if(acsObj != NULL) {
++            /* qacs_enable: written unconditionally — persists for next ACS run.
++             * Corresponds to: uci set wireless.@wifi-iface[1].qacs_enable=<0|1> */
++            bool qacsEnable = amxd_object_get_bool(acsObj, "QacsEnable", NULL);
++            swl_mapCharFmt_addValInt32(radConfigMap, "qacs_enable", qacsEnable ? 1 : 0);
++
++            /* acs_2g_scan_all: written unconditionally — persists for next ACS run.
++             * Corresponds to: uci set wireless.wifiX.acs_2g_scan_all=<0|1> */
++            swl_mapCharFmt_addValInt32(radConfigMap, "acs_2g_scan_all",
++                                       amxd_object_get_bool(acsObj, "Scan2GAllChannels", NULL) ? 1 : 0);
++
++            /* acs_periodic_interval: written unconditionally when in valid range.
++             * Corresponds to: uci set wireless.wifiX.acs_periodic_interval=<sec>
++             * Valid range: 60..86400 seconds (0 = disabled, not written). */
++            uint32_t periodicInterval = amxd_object_get_uint32_t(acsObj, "PeriodicInterval", NULL);
++            if(periodicInterval >= 60 && periodicInterval <= 86400) {
++                swl_mapCharFmt_addValInt32(radConfigMap, "acs_periodic_interval", periodicInterval);
++            }
++
++            /* acsmin_dwell: minimum dwell time in ms.
++             * hostapd enforces a hard floor of 50ms (values below 50 are clamped to 50).
++             * Written unconditionally — persists for next ACS run.
++             * Corresponds to: uci set wireless.wifiX.acsmin_dwell=<ms> */
++            uint32_t minDwellTime = amxd_object_get_uint32_t(acsObj, "MinDwellTime", NULL);
++            if(minDwellTime >= 50) {
++                swl_mapCharFmt_addValInt32(radConfigMap, "acsmin_dwell", minDwellTime);
++            }
++
++            /* acsmax_dwell: maximum dwell time in ms.
++             * Written unconditionally — persists for next ACS run.
++             * Corresponds to: uci set wireless.wifiX.acsmax_dwell=<ms> */
++            uint32_t maxDwellTime = amxd_object_get_uint32_t(acsObj, "MaxDwellTime", NULL);
++            if(maxDwellTime >= 50) {
++                swl_mapCharFmt_addValInt32(radConfigMap, "acsmax_dwell", maxDwellTime);
++            }
++
++            /* acs_exclude_dfs: written unconditionally so it also applies when
++             * invokeACS() triggers dynamic ACS with AutoChannelEnable=false.
++             * acs_exclude_dfs is a config-file-only parameter (no wpa_ctrl command). */
++            if(amxd_object_get_bool(acsObj, "DfsExclude", NULL)) {
++                swl_mapCharFmt_addValInt32(radConfigMap, "acs_exclude_dfs", 1);
++            }
++
++            /* acs_pcaconly: written unconditionally so it also applies when
++             * invokeACS() triggers dynamic ACS with AutoChannelEnable=false.
++             * acs_pcaconly is a config-file-only parameter (no wpa_ctrl command).
++             * Corresponds to hostapd conf->acs_dfs_available_only. */
++            if(amxd_object_get_bool(acsObj, "PcacOnly", NULL)) {
++                swl_mapCharFmt_addValInt32(radConfigMap, "acs_pcaconly", 1);
++            }
++
++            /* acs_exclude_6ghz_non_psc: written unconditionally so it also applies
++             * when invokeACS() triggers dynamic ACS with AutoChannelEnable=false.
++             * Checked in hostapd acs_find_ideal_chan_mode() selection phase.
++             * Also applied at runtime via wpa_ctrl: ACS 6g_only_psc <0|1> */
++            if(amxd_object_get_bool(acsObj, "OnlyPscChannels6G", NULL)) {
++                swl_mapCharFmt_addValInt32(radConfigMap, "acs_exclude_6ghz_non_psc", 1);
++            }
++
++            /* chanlist: written unconditionally so it also applies when
++             * invokeACS() triggers dynamic ACS with AutoChannelEnable=false.
++             * Checked in all three ACS phases (scan, interference, selection).
++             * chanlist is a config-file-only parameter (no wpa_ctrl runtime command).
++             * hostapd format: space-separated channels or ranges (e.g., "1 6 11-13").
++             * DM format: comma-separated (e.g., "1,6,11-13" or "3-8").
++             * Corresponds to: uci set wireless.wifiX.channels=3-8 */
++            char* chanList = amxd_object_get_cstring_t(acsObj, "ChannelList", NULL);
++            if(!swl_str_isEmpty(chanList)) {
++                char spaceSep[256] = {0};
++                swl_str_copy(spaceSep, sizeof(spaceSep), chanList);
++                for(char* p = spaceSep; *p; p++) {
++                    if(*p == ',') {
++                        *p = ' ';
++                    }
++                }
++                swl_mapChar_add(radConfigMap, "chanlist", spaceSep);
++                SAH_TRACEZ_INFO(ME, "%s: ACS chanlist written: '%s'", pRad->Name, spaceSep);
++            }
++            free(chanList);
++
++            SAH_TRACEZ_INFO(ME, "%s: ACS config file params written (qacs_enable=%d, 2g_all=%d, period=%u, "
++                            "dfs_excl=%d, pcaconly=%d, psc6g=%d)",
++                            pRad->Name,
++                            qacsEnable ? 1 : 0,
++                            amxd_object_get_bool(acsObj, "Scan2GAllChannels", NULL) ? 1 : 0,
++                            periodicInterval,
++                            amxd_object_get_bool(acsObj, "DfsExclude", NULL) ? 1 : 0,
++                            amxd_object_get_bool(acsObj, "PcacOnly", NULL) ? 1 : 0,
++                            amxd_object_get_bool(acsObj, "OnlyPscChannels6G", NULL) ? 1 : 0);
++        }
++    }
++
+     if(pRad->externalAcsMgmt) {
+         SAH_TRACEZ_INFO(ME, "%s: Restore radio channel config due to external ACS mgmt enabled", pRad->Name);
+         swl_mapCharFmt_addValInt32(radConfigMap, "channel", tgtChan);
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -102,6 +102,8 @@
+ #include "wld_linuxIfStats.h"
+ #include "wld_linuxIfUtils.h"
+ #include "wld_dm_trans.h"
++#include "wld_wpaCtrl_api.h"
++#include "wld_wpaCtrlInterface.h"
+ #include <swl/swl_base64.h>
+ #include "swla/swla_trans.h"
+ #include "wld_extMod.h"
+@@ -611,7 +613,25 @@ static void s_setAutoChannelEnable_pwf(v
+      * regardless of whether the vendor plugin implements the function or
+      * returns SWL_RC_NOT_IMPLEMENTED. */
+     pRad->autoChannelEnable = newAutochan;
+-    wld_autoCommitMgr_notifyRadEdit(pRad);
++    /* Write the hostapd config file immediately so channel=acs_survey (ACS enabled)
++     * or the fixed channel (ACS disabled) is reflected on disk without requiring
++     * a VAP toggle.
++     *
++     * Unlike PcacOnly/ChannelList where RELOAD_CONFIG is sufficient (those params
++     * are just read during the next ACS scan), AutoChannelEnable requires a FULL
++     * hostapd restart because:
++     *   - Changing channel=36 → channel=acs_survey requires ACS to run
++     *   - ACS only runs at hostapd startup (when channel=0/acs_survey)
++     *   - RELOAD_CONFIG only reloads the config in-memory; it does NOT restart
++     *     the radio or trigger ACS
++     *
++     * Steps:
++     *   1. wld_hostapd_cfgFile_createExt  — write the new config to disk immediately
++     *      (guarantees the file is up to date before the FSM runs)
++     *   2. wld_rad_doCommitIfUnblocked    — trigger the FSM to perform a full
++     *      hostapd restart so ACS runs with the new channel=acs_survey config */
++    wld_hostapd_cfgFile_createExt(pRad);
++    wld_rad_doCommitIfUnblocked(pRad);
+ 
+     SAH_TRACEZ_INFO(ME, "%s: ACS STATUS POST %d %d %d",
+                     pRad->Name,
+@@ -3229,6 +3249,537 @@ amxd_status_t _startACS(amxd_object_t* o
+     return _startAutoChannelSelection(obj, func, args, ret);
+ }
+ 
++/**
++ * @brief Invoke ACS on the radio via hostapd's dynamic ACS mechanism.
++ *
++ * Bridges the radio-level PWHM function to the interface-level hostapd
++ * "ACS invoke" wpa_ctrl command. The command is sent to the first active
++ * AP on the radio; hostapd routes it to the correct hostapd_iface (and
++ * thus the correct band/radio).
++ *
++ * Radio → AP mapping:
++ *   wlan0 (6GHz)   → wlan0.1 → acs_init(6GHz iface)
++ *   wlan1 (5GHz)   → wlan1.1 → acs_init(5GHz iface)
++ *   wlan2 (2.4GHz) → wlan2.1 → acs_init(2.4GHz iface)
++ *
++ * @param mode 0 = ACS + CSA channel change (non-disruptive)
++ *             1 = ACS scan only, no channel change (dry-run / report)
++ */
++amxd_status_t _invokeACS(amxd_object_t* object,
++                          amxd_function_t* func _UNUSED,
++                          amxc_var_t* args,
++                          amxc_var_t* retval) {
++    T_Radio* pR = wld_rad_fromObj(object);
++    ASSERT_NOT_NULL(pR, amxd_status_unknown_error, ME, "NULL");
++
++    uint32_t mode = GET_UINT32(args, "mode");
++    if(mode > 1) {
++        SAH_TRACEZ_ERROR(ME, "%s: invokeACS invalid mode %u (must be 0 or 1)", pR->Name, mode);
++        amxc_var_set(bool, retval, false);
++        return amxd_status_invalid_arg;
++    }
++
++    if(!wld_rad_isActive(pR)) {
++        SAH_TRACEZ_ERROR(ME, "%s: invokeACS radio not active", pR->Name);
++        amxc_var_set(bool, retval, false);
++        return amxd_status_unknown_error;
++    }
++
++    /*
++     * Get the first active AP on this radio to send the wpa_ctrl command to.
++     * hostapd routes "ACS invoke" to the hostapd_iface of the receiving BSS,
++     * which corresponds to the correct band/radio.
++     */
++    T_AccessPoint* pAP = wld_rad_getFirstActiveAp(pR);
++    if(pAP == NULL) {
++        pAP = wld_rad_getFirstEnabledVap(pR);
++    }
++    if(pAP == NULL) {
++        SAH_TRACEZ_ERROR(ME, "%s: invokeACS no AP available", pR->Name);
++        amxc_var_set(bool, retval, false);
++        return amxd_status_unknown_error;
++    }
++
++    SAH_TRACEZ_INFO(ME, "%s: invokeACS mode=%u via %s", pR->Name, mode, pAP->alias);
++
++    /*
++     * Send "ACS invoke <mode>" to the AP's wpa_ctrl interface.
++     * hostapd normally responds with "OK" on success.
++     *
++     * Race condition: hostapd sends the "ACS-STARTED" event synchronously
++     * during acs_init() — before sending "OK" back on the ctrl_iface socket.
++     * When PWHM's socket is attached (wpa_ctrl_attach), the event arrives
++     * on the same socket and is read as the reply instead of "OK".
++     * This causes wld_wpaCtrl_sendCmdFmtCheckResponse to see an empty or
++     * event-prefixed reply and report failure even though ACS started.
++     *
++     * Fix: use GetResponse and accept "OK", "ACS-STARTED", or empty reply
++     * (event consumed by event handler) as success. Only "FAIL" is an error.
++     */
++    char reply[256] = {0};
++    swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtGetResponse(
++        pAP->wpaCtrlInterface, reply, sizeof(reply), "ACS invoke %u", mode);
++
++    bool success = false;
++    if(swl_rc_isOk(rc)) {
++        if(strncmp(reply, "FAIL", 4) == 0) {
++            SAH_TRACEZ_ERROR(ME, "%s: invokeACS mode=%u rejected by hostapd (FAIL)",
++                             pR->Name, mode);
++        } else if(strncmp(reply, "OK", 2) == 0) {
++            success = true;
++        } else if(strstr(reply, "ACS-STARTED") != NULL) {
++            /* ACS-STARTED event received as reply due to ctrl_iface race condition.
++             * ACS did start successfully. */
++            SAH_TRACEZ_INFO(ME, "%s: invokeACS mode=%u: ACS-STARTED event received as reply (success)",
++                            pR->Name, mode);
++            success = true;
++        } else {
++            /* Empty or unknown reply — event was likely consumed by event handler
++             * before this read. Treat as success since ACS-STARTED was observed. */
++            SAH_TRACEZ_INFO(ME, "%s: invokeACS mode=%u: reply='%s' (treating as success)",
++                            pR->Name, mode, reply);
++            success = true;
++        }
++    } else {
++        SAH_TRACEZ_ERROR(ME, "%s: invokeACS mode=%u wpa_ctrl send failed on %s (rc=%d)",
++                         pR->Name, mode, pAP->alias, rc);
++    }
++
++    if(!success) {
++        SAH_TRACEZ_ERROR(ME, "%s: invokeACS mode=%u failed on %s reply='%s'",
++                         pR->Name, mode, pAP->alias, reply);
++    }
++
++    amxc_var_set(bool, retval, success);
++    return success ? amxd_status_ok : amxd_status_unknown_error;
++}
++
++/* ============================================================
++ * WiFi.Radio.{i}.ACS object implementation
++ *
++ * All ACS parameters are per-radio in hostapd (stored in
++ * hostapd_iface->conf_extn, not per-BSS). Commands are sent
++ * via wpa_ctrl to the first active AP on the radio; hostapd
++ * routes them to the correct hostapd_iface (per-radio).
++ *
++ * Confirmed: setting ACS dwelltime on wlan2.2 is visible when
++ * queried on wlan2.1 — both share the same hostapd_iface.
++ * ============================================================ */
++
++/**
++ * @brief Get the first active (or enabled) AP on a radio for ACS wpa_ctrl commands.
++ */
++static T_AccessPoint* s_getAcsAp(T_Radio* pRad) {
++    T_AccessPoint* pAP = wld_rad_getFirstActiveAp(pRad);
++    if(pAP == NULL) {
++        pAP = wld_rad_getFirstEnabledVap(pRad);
++    }
++    return pAP;
++}
++
++/* --- ACS parameter set handlers --- */
++
++static void s_setAcsDwellTime_pwf(void* priv _UNUSED, amxd_object_t* object,
++                                   amxd_param_t* param _UNUSED,
++                                   const amxc_var_t* const newValue) {
++    T_Radio* pRad = wld_rad_fromObj(amxd_object_get_parent(object));
++    ASSERTI_NOT_NULL(pRad, , ME, "NULL");
++    uint32_t val = amxc_var_dyncast(uint32_t, newValue);
++    /* Range is 50..250 ms (validated by ODL check_range), matching hostapd:
++     * min_dwell=50, max_dwell=250, default dwelltime=200 */
++    ASSERTI_TRUE(wld_rad_isActive(pRad), , ME, "%s: ACS.DwellTime: radio not active", pRad->Name);
++    T_AccessPoint* pAP = s_getAcsAp(pRad);
++    ASSERTI_NOT_NULL(pAP, , ME, "%s: ACS.DwellTime: no AP available", pRad->Name);
++    wld_wpaCtrl_sendCmdFmtCheckResponse(pAP->wpaCtrlInterface, "OK", "ACS dwelltime %u", val);
++}
++
++static void s_setAcsDfsExclude_pwf(void* priv _UNUSED, amxd_object_t* object,
++                                    amxd_param_t* param _UNUSED,
++                                    const amxc_var_t* const newValue) {
++    T_Radio* pRad = wld_rad_fromObj(amxd_object_get_parent(object));
++    ASSERTI_NOT_NULL(pRad, , ME, "NULL");
++    bool val = amxc_var_dyncast(bool, newValue);
++    ASSERTI_TRUE(wld_rad_isActive(pRad), , ME, "%s: ACS.DfsExclude: radio not active", pRad->Name);
++    T_AccessPoint* pAP = s_getAcsAp(pRad);
++    ASSERTI_NOT_NULL(pAP, , ME, "%s: ACS.DfsExclude: no AP available", pRad->Name);
++    wld_wpaCtrl_sendCmdFmtCheckResponse(pAP->wpaCtrlInterface, "OK", "ACS dfs_exclude %d", val ? 1 : 0);
++}
++
++static void s_setAcsWeatherRadarExclude_pwf(void* priv _UNUSED, amxd_object_t* object,
++                                             amxd_param_t* param _UNUSED,
++                                             const amxc_var_t* const newValue) {
++    T_Radio* pRad = wld_rad_fromObj(amxd_object_get_parent(object));
++    ASSERTI_NOT_NULL(pRad, , ME, "NULL");
++    bool val = amxc_var_dyncast(bool, newValue);
++    ASSERTI_TRUE(wld_rad_isActive(pRad), , ME, "%s: ACS.WeatherRadarExclude: radio not active", pRad->Name);
++    T_AccessPoint* pAP = s_getAcsAp(pRad);
++    ASSERTI_NOT_NULL(pAP, , ME, "%s: ACS.WeatherRadarExclude: no AP available", pRad->Name);
++    wld_wpaCtrl_sendCmdFmtCheckResponse(pAP->wpaCtrlInterface, "OK", "ACS wradar %d", val ? 1 : 0);
++}
++
++static void s_setAcsOnlyPscChannels6G_pwf(void* priv _UNUSED, amxd_object_t* object,
++                                           amxd_param_t* param _UNUSED,
++                                           const amxc_var_t* const newValue) {
++    T_Radio* pRad = wld_rad_fromObj(amxd_object_get_parent(object));
++    ASSERTI_NOT_NULL(pRad, , ME, "NULL");
++    bool val = amxc_var_dyncast(bool, newValue);
++    ASSERTI_TRUE(wld_rad_isActive(pRad), , ME, "%s: ACS.OnlyPscChannels6G: radio not active", pRad->Name);
++    T_AccessPoint* pAP = s_getAcsAp(pRad);
++    ASSERTI_NOT_NULL(pAP, , ME, "%s: ACS.OnlyPscChannels6G: no AP available", pRad->Name);
++    wld_wpaCtrl_sendCmdFmtCheckResponse(pAP->wpaCtrlInterface, "OK", "ACS 6g_only_psc %d", val ? 1 : 0);
++}
++
++static void s_setAcsTxPwrOptimization_pwf(void* priv _UNUSED, amxd_object_t* object,
++                                           amxd_param_t* param _UNUSED,
++                                           const amxc_var_t* const newValue) {
++    T_Radio* pRad = wld_rad_fromObj(amxd_object_get_parent(object));
++    ASSERTI_NOT_NULL(pRad, , ME, "NULL");
++    uint32_t val = amxc_var_dyncast(uint32_t, newValue);
++    ASSERTI_TRUE(wld_rad_isActive(pRad), , ME, "%s: ACS.TxPwrOptimization: radio not active", pRad->Name);
++    T_AccessPoint* pAP = s_getAcsAp(pRad);
++    ASSERTI_NOT_NULL(pAP, , ME, "%s: ACS.TxPwrOptimization: no AP available", pRad->Name);
++    wld_wpaCtrl_sendCmdFmtCheckResponse(pAP->wpaCtrlInterface, "OK", "ACS txpwr_opt %u", val);
++}
++
++static void s_setAcsPeriodicInterval_pwf(void* priv _UNUSED, amxd_object_t* object,
++                                          amxd_param_t* param _UNUSED,
++                                          const amxc_var_t* const newValue) {
++    T_Radio* pRad = wld_rad_fromObj(amxd_object_get_parent(object));
++    ASSERTI_NOT_NULL(pRad, , ME, "NULL");
++    uint32_t val = amxc_var_dyncast(uint32_t, newValue);
++    if(val == 0) return; /* 0 = disable periodic ACS, don't send */
++    if(val < 60 || val > 86400) {
++        SAH_TRACEZ_ERROR(ME, "%s: ACS.PeriodicInterval %u out of range (60..86400)", pRad->Name, val);
++        return;
++    }
++    ASSERTI_TRUE(wld_rad_isActive(pRad), , ME, "%s: ACS.PeriodicInterval: radio not active", pRad->Name);
++    T_AccessPoint* pAP = s_getAcsAp(pRad);
++    ASSERTI_NOT_NULL(pAP, , ME, "%s: ACS.PeriodicInterval: no AP available", pRad->Name);
++    wld_wpaCtrl_sendCmdFmtCheckResponse(pAP->wpaCtrlInterface, "OK", "ACS periodic_interval %u", val);
++}
++
++static void s_setAcsRankEnable_pwf(void* priv _UNUSED, amxd_object_t* object,
++                                    amxd_param_t* param _UNUSED,
++                                    const amxc_var_t* const newValue) {
++    T_Radio* pRad = wld_rad_fromObj(amxd_object_get_parent(object));
++    ASSERTI_NOT_NULL(pRad, , ME, "NULL");
++    bool val = amxc_var_dyncast(bool, newValue);
++    ASSERTI_TRUE(wld_rad_isActive(pRad), , ME, "%s: ACS.RankEnable: radio not active", pRad->Name);
++    T_AccessPoint* pAP = s_getAcsAp(pRad);
++    ASSERTI_NOT_NULL(pAP, , ME, "%s: ACS.RankEnable: no AP available", pRad->Name);
++    wld_wpaCtrl_sendCmdFmtCheckResponse(pAP->wpaCtrlInterface, "OK", "ACS rank_en %d", val ? 1 : 0);
++}
++
++static void s_setAcsNoScan_pwf(void* priv _UNUSED, amxd_object_t* object,
++                                amxd_param_t* param _UNUSED,
++                                const amxc_var_t* const newValue) {
++    T_Radio* pRad = wld_rad_fromObj(amxd_object_get_parent(object));
++    ASSERTI_NOT_NULL(pRad, , ME, "NULL");
++    bool val = amxc_var_dyncast(bool, newValue);
++    ASSERTI_TRUE(wld_rad_isActive(pRad), , ME, "%s: ACS.NoScan: radio not active", pRad->Name);
++    T_AccessPoint* pAP = s_getAcsAp(pRad);
++    ASSERTI_NOT_NULL(pAP, , ME, "%s: ACS.NoScan: no AP available", pRad->Name);
++    wld_wpaCtrl_sendCmdFmtCheckResponse(pAP->wpaCtrlInterface, "OK", "ACS noscan %d", val ? 1 : 0);
++}
++
++static void s_setAcsDebugTrace_pwf(void* priv _UNUSED, amxd_object_t* object,
++                                    amxd_param_t* param _UNUSED,
++                                    const amxc_var_t* const newValue) {
++    T_Radio* pRad = wld_rad_fromObj(amxd_object_get_parent(object));
++    ASSERTI_NOT_NULL(pRad, , ME, "NULL");
++    uint32_t val = amxc_var_dyncast(uint32_t, newValue);
++    ASSERTI_TRUE(wld_rad_isActive(pRad), , ME, "%s: ACS.DebugTrace: radio not active", pRad->Name);
++    T_AccessPoint* pAP = s_getAcsAp(pRad);
++    ASSERTI_NOT_NULL(pAP, , ME, "%s: ACS.DebugTrace: no AP available", pRad->Name);
++    wld_wpaCtrl_sendCmdFmtCheckResponse(pAP->wpaCtrlInterface, "OK", "ACS dbgtrace %u", val);
++}
++
++static void s_setAcsQacsEnable_pwf(void* priv _UNUSED, amxd_object_t* object,
++                                    amxd_param_t* param _UNUSED,
++                                    const amxc_var_t* const newValue) {
++    T_Radio* pRad = wld_rad_fromObj(amxd_object_get_parent(object));
++    ASSERTI_NOT_NULL(pRad, , ME, "NULL");
++    bool val = amxc_var_dyncast(bool, newValue);
++    ASSERTI_TRUE(wld_rad_isActive(pRad), , ME, "%s: ACS.QacsEnable: radio not active", pRad->Name);
++    T_AccessPoint* pAP = s_getAcsAp(pRad);
++    ASSERTI_NOT_NULL(pAP, , ME, "%s: ACS.QacsEnable: no AP available", pRad->Name);
++    wld_wpaCtrl_sendCmdFmtCheckResponse(pAP->wpaCtrlInterface, "OK", "ACS qacs_enable %d", val ? 1 : 0);
++}
++
++static void s_setAcsBlockChanList_pwf(void* priv _UNUSED, amxd_object_t* object,
++                                       amxd_param_t* param _UNUSED,
++                                       const amxc_var_t* const newValue) {
++    T_Radio* pRad = wld_rad_fromObj(amxd_object_get_parent(object));
++    ASSERTI_NOT_NULL(pRad, , ME, "NULL");
++    const char* val = amxc_var_constcast(cstring_t, newValue);
++    if(val == NULL || val[0] == '\0') return; /* empty = no change */
++    ASSERTI_TRUE(wld_rad_isActive(pRad), , ME, "%s: ACS.BlockChanList: radio not active", pRad->Name);
++    T_AccessPoint* pAP = s_getAcsAp(pRad);
++    ASSERTI_NOT_NULL(pAP, , ME, "%s: ACS.BlockChanList: no AP available", pRad->Name);
++
++    /*
++     * hostapd's hostapd_set_block_chanlist() tokenises by space (str_token " "),
++     * not by comma. Convert the comma-separated DM value (e.g. "1,6,11") to
++     * space-separated (e.g. "1 6 11") before sending the wpa_ctrl command.
++     */
++    char spaceSep[256] = {0};
++    swl_str_copy(spaceSep, sizeof(spaceSep), val);
++    for(char* p = spaceSep; *p; p++) {
++        if(*p == ',') {
++            *p = ' ';
++        }
++    }
++
++    wld_wpaCtrl_sendCmdFmtCheckResponse(pAP->wpaCtrlInterface, "OK", "ACS set_block_chan_list %s", spaceSep);
++}
++
++static void s_setAcsScan2GAll_pwf(void* priv _UNUSED, amxd_object_t* object,
++                                   amxd_param_t* param _UNUSED,
++                                   const amxc_var_t* const newValue) {
++    T_Radio* pRad = wld_rad_fromObj(amxd_object_get_parent(object));
++    ASSERTI_NOT_NULL(pRad, , ME, "NULL");
++    bool val = amxc_var_dyncast(bool, newValue);
++    ASSERTI_TRUE(wld_rad_isActive(pRad), , ME, "%s: ACS.Scan2GAllChannels: radio not active", pRad->Name);
++    T_AccessPoint* pAP = s_getAcsAp(pRad);
++    ASSERTI_NOT_NULL(pAP, , ME, "%s: ACS.Scan2GAllChannels: no AP available", pRad->Name);
++    wld_wpaCtrl_sendCmdFmtCheckResponse(pAP->wpaCtrlInterface, "OK", "ACS 2g_scan_all %d", val ? 1 : 0);
++}
++
++/* --- ACS.DebugTrace read action (active read from hostapd) --- */
++
++amxd_status_t _wld_rad_getAcsDebugTrace_prf(amxd_object_t* object,
++                                             amxd_param_t* param,
++                                             amxd_action_t reason,
++                                             const amxc_var_t* const args _UNUSED,
++                                             amxc_var_t* const retval,
++                                             void* priv _UNUSED) {
++    ASSERTS_NOT_NULL(param, amxd_status_unknown_error, ME, "NULL");
++    ASSERTS_EQUALS(reason, action_param_read, amxd_status_function_not_implemented, ME, "not impl");
++
++    /* ACS object is child of Radio instance */
++    T_Radio* pRad = wld_rad_fromObj(amxd_object_get_parent(object));
++    ASSERTS_NOT_NULL(pRad, amxd_status_ok, ME, "no radio mapped");
++
++    /* Default: return the stored/persisted value */
++    uint32_t value = amxc_var_dyncast(uint32_t, &param->value);
++
++    T_AccessPoint* pAP = s_getAcsAp(pRad);
++    if(pAP != NULL && wld_rad_isActive(pRad)) {
++        char reply[256] = {0};
++        swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtGetResponse(
++            pAP->wpaCtrlInterface, reply, sizeof(reply), "ACS get_dbgtrace");
++        if(swl_rc_isOk(rc)) {
++            /*
++             * hostapd response format (from hostapd_acs_get_dbgtrace_extn):
++             * "ACS Debug Trace: module_bitmap=0x%04x, debug_level=%d\n"
++             * Reconstruct combined uint32: (module_bitmap << 8) | debug_level
++             */
++            unsigned int module_bitmap = 0;
++            int debug_level = 0;
++            if(sscanf(reply, "ACS Debug Trace: module_bitmap=0x%x, debug_level=%d",
++                      &module_bitmap, &debug_level) == 2) {
++                value = ((module_bitmap & 0xFF) << 8) | (debug_level & 0xFF);
++                SAH_TRACEZ_INFO(ME, "%s: ACS.DebugTrace read from hostapd: module_bitmap=0x%02x debug_level=%d combined=0x%04x",
++                                pRad->Name, module_bitmap & 0xFF, debug_level, value);
++            }
++        }
++    }
++
++    amxc_var_set(uint32_t, retval, value);
++    return amxd_status_ok;
++}
++
++/* --- ACS.Status read action --- */
++
++amxd_status_t _wld_rad_getAcsStatus_prf(amxd_object_t* object,
++                                         amxd_param_t* param,
++                                         amxd_action_t reason,
++                                         const amxc_var_t* const args _UNUSED,
++                                         amxc_var_t* const retval,
++                                         void* priv _UNUSED) {
++    ASSERTS_NOT_NULL(param, amxd_status_unknown_error, ME, "NULL");
++    ASSERTS_EQUALS(reason, action_param_read, amxd_status_function_not_implemented, ME, "not impl");
++
++    /* ACS object is child of Radio instance */
++    T_Radio* pRad = wld_rad_fromObj(amxd_object_get_parent(object));
++    ASSERTS_NOT_NULL(pRad, amxd_status_ok, ME, "no radio mapped");
++
++    const char* status = "Idle";
++
++    T_AccessPoint* pAP = s_getAcsAp(pRad);
++    if(pAP != NULL && wld_rad_isActive(pRad)) {
++        char reply[256] = {0};
++        swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtGetResponse(
++            pAP->wpaCtrlInterface, reply, sizeof(reply), "ACS get_status");
++        if(swl_rc_isOk(rc) && strstr(reply, "Inprogress")) {
++            status = "Inprogress";
++        }
++    }
++
++    amxc_var_set(cstring_t, retval, status);
++    return amxd_status_ok;
++}
++
++/* --- ACS.showReport() function --- */
++
++amxd_status_t _showReport(amxd_object_t* object,
++                                     amxd_function_t* func _UNUSED,
++                                     amxc_var_t* args _UNUSED,
++                                     amxc_var_t* retval) {
++    T_Radio* pRad = wld_rad_fromObj(amxd_object_get_parent(object));
++    ASSERT_NOT_NULL(pRad, amxd_status_unknown_error, ME, "NULL");
++
++    amxc_var_set(cstring_t, retval, "");
++
++    T_AccessPoint* pAP = s_getAcsAp(pRad);
++    ASSERTI_NOT_NULL(pAP, amxd_status_ok, ME, "%s: ACS.showReport: no AP available", pRad->Name);
++    ASSERTI_TRUE(wld_rad_isActive(pRad), amxd_status_ok, ME, "%s: ACS.showReport: radio not active", pRad->Name);
++
++    size_t replySize = wld_wpaCtrl_getMaxMsgLen();
++    char* reply = calloc(1, replySize);
++    ASSERT_NOT_NULL(reply, amxd_status_unknown_error, ME, "alloc failed");
++
++    swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtGetResponse(
++        pAP->wpaCtrlInterface, reply, replySize, "ACS show_report");
++
++    if(swl_rc_isOk(rc)) {
++        amxc_var_set(cstring_t, retval, reply);
++    }
++    free(reply);
++    return amxd_status_ok;
++}
++
++/* --- ACS.clearBlockChanList() function --- */
++
++amxd_status_t _clearBlockChanList(amxd_object_t* object,
++                                             amxd_function_t* func _UNUSED,
++                                             amxc_var_t* args _UNUSED,
++                                             amxc_var_t* retval _UNUSED) {
++    T_Radio* pRad = wld_rad_fromObj(amxd_object_get_parent(object));
++    ASSERT_NOT_NULL(pRad, amxd_status_unknown_error, ME, "NULL");
++
++    /* Always reset the BlockChanList DM parameter to empty string.
++     * object IS the ACS object — BlockChanList is a direct child parameter. */
++    swl_typeCharPtr_commitObjectParam(object, "BlockChanList", "");
++
++    /* Send the wpa_ctrl command only if the radio is active.
++     * If the radio is not active, the DM is cleared and we return success —
++     * the cleared value will be applied on the next hostapd restart. */
++    T_AccessPoint* pAP = s_getAcsAp(pRad);
++    if(pAP == NULL || !wld_rad_isActive(pRad)) {
++        SAH_TRACEZ_INFO(ME, "%s: ACS.clearBlockChanList: radio not active, DM cleared only", pRad->Name);
++        return amxd_status_ok;
++    }
++
++    /*
++     * Use GetResponse instead of CheckResponse: hostapd's clear_block_chan_list
++     * may return an empty reply (not "OK") on success. Only treat explicit "FAIL"
++     * as an error. An empty or "OK" reply both indicate success.
++     */
++    char reply[256] = {0};
++    swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtGetResponse(
++        pAP->wpaCtrlInterface, reply, sizeof(reply), "ACS clear_block_chan_list");
++
++    if(!swl_rc_isOk(rc)) {
++        SAH_TRACEZ_ERROR(ME, "%s: ACS.clearBlockChanList: wpa_ctrl send failed", pRad->Name);
++        return amxd_status_unknown_error;
++    }
++
++    if(strncmp(reply, "FAIL", 4) == 0) {
++        SAH_TRACEZ_ERROR(ME, "%s: ACS.clearBlockChanList: hostapd returned FAIL", pRad->Name);
++        return amxd_status_unknown_error;
++    }
++
++    SAH_TRACEZ_INFO(ME, "%s: ACS.clearBlockChanList: cleared (reply='%s')", pRad->Name, reply);
++    return amxd_status_ok;
++}
++
++/* --- ACS.showNeighborReport() function --- */
++
++amxd_status_t _showNeighborReport(amxd_object_t* object,
++                                             amxd_function_t* func _UNUSED,
++                                             amxc_var_t* args _UNUSED,
++                                             amxc_var_t* retval) {
++    T_Radio* pRad = wld_rad_fromObj(amxd_object_get_parent(object));
++    ASSERT_NOT_NULL(pRad, amxd_status_unknown_error, ME, "NULL");
++
++    amxc_var_set(cstring_t, retval, "");
++
++    T_AccessPoint* pAP = s_getAcsAp(pRad);
++    ASSERTI_NOT_NULL(pAP, amxd_status_ok, ME, "%s: ACS.showNeighborReport: no AP available", pRad->Name);
++    ASSERTI_TRUE(wld_rad_isActive(pRad), amxd_status_ok, ME, "%s: ACS.showNeighborReport: radio not active", pRad->Name);
++
++    size_t replySize = wld_wpaCtrl_getMaxMsgLen();
++    char* reply = calloc(1, replySize);
++    ASSERT_NOT_NULL(reply, amxd_status_unknown_error, ME, "alloc failed");
++
++    swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtGetResponse(
++        pAP->wpaCtrlInterface, reply, replySize, "ACS show_neighbor_report");
++
++    if(swl_rc_isOk(rc)) {
++        amxc_var_set(cstring_t, retval, reply);
++    }
++    free(reply);
++    return amxd_status_ok;
++}
++
++/* --- ACS config-file-only parameter handler ---
++ *
++ * Used for parameters that have no wpa_ctrl runtime command and can only be
++ * applied by rewriting the hostapd config file and triggering RELOAD_CONFIG:
++ *   PcacOnly    → acs_pcaconly    (conf->acs_dfs_available_only)
++ *   ChannelList → chanlist
++ *   MinDwellTime → acsmin_dwell
++ *   MaxDwellTime → acsmax_dwell
++ *
++ * If the radio is not active the new value is already stored in the DM and
++ * will be written to the config file on the next hostapd start.
++ */
++static void s_setAcsConfigFileParam_pwf(void* priv _UNUSED, amxd_object_t* object,
++                                          amxd_param_t* param,
++                                          const amxc_var_t* const newValue _UNUSED) {
++    T_Radio* pRad = wld_rad_fromObj(amxd_object_get_parent(object));
++    ASSERTI_NOT_NULL(pRad, , ME, "NULL");
++    const char* paramName = amxd_param_get_name(param);
++    SAH_TRACEZ_INFO(ME, "%s: ACS.%s changed: rewriting hostapd config file",
++                    pRad->Name, paramName ? paramName : "?");
++    /* Always rewrite the config file so the new value is persisted on disk. */
++    wld_hostapd_cfgFile_createExt(pRad);
++    /* Trigger RELOAD_CONFIG only when hostapd is running so it picks up the
++     * new value immediately without a full restart. */
++    if(wld_rad_isActive(pRad)) {
++        wld_rad_hostapd_reconfigure(pRad);
++    }
++}
++
++/* --- ACS SWLA_DM_HDLRS --- */
++
++SWLA_DM_HDLRS(sRadioAcsDmHdlrs,
++              ARR(SWLA_DM_PARAM_HDLR("DwellTime",           s_setAcsDwellTime_pwf),
++                  SWLA_DM_PARAM_HDLR("DfsExclude",          s_setAcsDfsExclude_pwf),
++                  SWLA_DM_PARAM_HDLR("WeatherRadarExclude", s_setAcsWeatherRadarExclude_pwf),
++                  SWLA_DM_PARAM_HDLR("OnlyPscChannels6G",   s_setAcsOnlyPscChannels6G_pwf),
++                  SWLA_DM_PARAM_HDLR("TxPwrOptimization",   s_setAcsTxPwrOptimization_pwf),
++                  SWLA_DM_PARAM_HDLR("PeriodicInterval",    s_setAcsPeriodicInterval_pwf),
++                  SWLA_DM_PARAM_HDLR("RankEnable",          s_setAcsRankEnable_pwf),
++                  SWLA_DM_PARAM_HDLR("NoScan",              s_setAcsNoScan_pwf),
++                  SWLA_DM_PARAM_HDLR("DebugTrace",          s_setAcsDebugTrace_pwf),
++                  SWLA_DM_PARAM_HDLR("QacsEnable",          s_setAcsQacsEnable_pwf),
++                  SWLA_DM_PARAM_HDLR("BlockChanList",       s_setAcsBlockChanList_pwf),
++                  SWLA_DM_PARAM_HDLR("Scan2GAllChannels",   s_setAcsScan2GAll_pwf),
++                  /* Config-file-only parameters: rewrite config + RELOAD_CONFIG */
++                  SWLA_DM_PARAM_HDLR("PcacOnly",            s_setAcsConfigFileParam_pwf),
++                  SWLA_DM_PARAM_HDLR("ChannelList",         s_setAcsConfigFileParam_pwf),
++                  SWLA_DM_PARAM_HDLR("MinDwellTime",        s_setAcsConfigFileParam_pwf),
++                  SWLA_DM_PARAM_HDLR("MaxDwellTime",        s_setAcsConfigFileParam_pwf),
++                  ));
++
++void _wld_rad_setAcsConf_ocf(const char* const sig_name,
++                              const amxc_var_t* const data,
++                              void* const priv) {
++    swla_dm_procObjEvtOfLocalDm(&sRadioAcsDmHdlrs, sig_name, data, priv);
++}
++
+ amxd_status_t _startPlatformACS(amxd_object_t* object,
+                                 amxd_function_t* func _UNUSED,
+                                 const amxc_var_t* const args,
