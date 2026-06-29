@@ -1,0 +1,237 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jassim Shanavaskhan <jshanava@qti.qualcomm.com>
+Date: Thu, 26 Jun 2026 00:00:00 +0530
+Subject: [PATCH] pwhm: add and fix STA AssociatedDevice parameters
+
+Add new AssociatedDevice DM parameters and fix existing ones.
+All are populated at AP-STA-CONNECTED event after pAD->object
+is created by wld_vap_sync_device.
+
+New parameters:
+  Channel        - AP radio channel (pAP->pRadio->channel)
+  OperatingClass - AP radio operating class (WiFi.Radio.N.OperatingClass)
+  LinkBandwidth  - AP radio bandwidth (pRadio->runningChannelBandwidth)
+  ERP            - STA ERP flag from 802.11 capability field
+  MinTxPower     - STA minimum TX power from 802.11 Power Capability IE
+  MaxTxPower     - STA maximum TX power from 802.11 Power Capability IE
+
+Note: Channel, OperatingClass and LinkBandwidth reflect the AP radio
+context (same for all STAs on that AP). ERP, MinTxPower and MaxTxPower
+are STA-specific values from the association request frame.
+
+MinTxPower and MaxTxPower are sourced from the 802.11 Power Capability
+IE (EID=33) in the STA assoc request, exposed by hostapd wpa_ctrl as
+min_txpower= and max_txpower= in the STA command response. This is the
+standard nl80211/hostapd path — no vendor commands needed.
+
+Fixed parameters (were returning wrong/zero values):
+  VhtCapabilities          - parse vht_caps_info= from hostapd STA reply
+  SignalStrength           - parse signal= from hostapd STA reply
+  MaxDownlinkRateSupported - parse maxphyrate= from hostapd STA reply
+  MaxUplinkRateSupported   - same source as MaxDownlinkRateSupported
+  LinkBandwidth            - read pRadio->runningChannelBandwidth
+
+Set assocCaps.linkBandwidthSetByDriver=true to prevent
+wld_ad_syncCapabilities recalculating back to HT-cap bandwidth.
+
+Signed-off-by: Jassim Shanavaskhan <jshanava@qti.qualcomm.com>
+---
+ odl/wld_accesspoint.odl           |  38 +++++
+ src/Plugin/wifiGen_eventHandlers.c | 126 +++++++++++++++++++
+ 2 files changed, 164 insertions(+)
+
+--- a/odl/wld_accesspoint.odl
++++ /local/mnt/workspace/js_prpl/IPQ5424_new/prplos/build_dir/target-aarch64_cortex-a55+neon-vfpv4_musl/pwhm-v7.27.2/odl/wld_accesspoint.odl	2026-06-29 14:13:21.460777902 +0530
+@@ -1791,6 +1791,34 @@
+ 				default "Unknown";
+ 			}
+ 
++			/** Primary channel number the STA is associated on (from hostapd STA query). */
++			%read-only uint32 Channel {
++				default 0;
++			}
++
++			/** 802.11 operating class for the association link (from hostapd STA query). */
++			%read-only uint32 OperatingClass {
++				default 0;
++			}
++
++			/** ERP (Extended Rate PHY) flag from the STA association (from hostapd STA query).
++			 * 0 = STA does not use ERP protection, 1 = STA uses ERP (802.11g protection mode). */
++			%read-only bool ERP {
++				default 0;
++			}
++
++			/** Minimum TX power capability of the STA in dBm (from 802.11 Power Capability IE
++			 * in the association request, reported by hostapd STA query as min_txpower). */
++			%read-only int32 MinTxPower {
++				default 0;
++			}
++
++			/** Maximum TX power capability of the STA in dBm (from 802.11 Power Capability IE
++			 * in the association request, reported by hostapd STA query as max_txpower). */
++			%read-only int32 MaxTxPower {
++				default 0;
++			}
++
+ 			/** Station is in power save mode */
+ 			%volatile %read-only bool PowerSave;
+ 
+--- a/src/Plugin/wifiGen_eventHandlers.c
++++ /local/mnt/workspace/js_prpl/IPQ5424_new/prplos/build_dir/target-aarch64_cortex-a55+neon-vfpv4_musl/pwhm-v7.27.2/src/Plugin/wifiGen_eventHandlers.c	2026-06-29 14:13:21.460777902 +0530
+@@ -1177,6 +1177,8 @@
+     swl_str_copyMalloc(pPrimLinkIfName, pLinkIfName);
+ }
+ 
++static void s_syncStaAssocInfo(T_AccessPoint* pAP, T_AssociatedDevice* pAD);
++
+ static void s_apStationConnectedEvt(void* pRef, char* ifName, swl_macBin_t* macAddress) {
+     T_AccessPoint* pAP = (T_AccessPoint*) pRef;
+     ASSERT_NOT_NULL(pAP, , ME, "NULL");
+@@ -1191,6 +1193,8 @@
+     pAP->pFA->mfn_wvap_get_single_station_stats(pAD);
+ 
+     wld_ad_add_connection_success(pAP, pAD);
++    /* pAD->object is now created by wld_vap_sync_device inside add_connection_success */
++    s_syncStaAssocInfo(pAP, pAD);
+ }
+ 
+ static void s_stationEapCompletedEvt(void* pRef, char* ifName, swl_macBin_t* macAddress) {
+@@ -1325,6 +1329,134 @@
+     }
+ }
+ 
++/* Query hostapd for channel and operating class of a newly associated STA and
++ * write them directly to the AssociatedDevice DM object.
++ *
++ * Sends "STA <mac>" to the AP's wpa_ctrl interface and parses:
++ *   channel=<N>
++ *   Operating_class=<N>
++ *
++ * Silently skips if wpa_ctrl is unavailable or STA is not yet known. */
++static void s_syncStaAssocInfo(T_AccessPoint* pAP, T_AssociatedDevice* pAD) {
++    ASSERT_NOT_NULL(pAP, , ME, "NULL");
++    ASSERT_NOT_NULL(pAD, , ME, "NULL");
++
++    if(!pAD->object) {
++        SAH_TRACEZ_WARNING(ME, "%s: syncStaAssocInfo sta=%s object is NULL, skip",
++            pAP->alias, pAD->Name);
++        return;
++    }
++
++    if(pAP->pRadio && pAP->pRadio->channel > 0) {
++        amxd_object_set_value(uint32_t, pAD->object, "Channel",
++                              (uint32_t)pAP->pRadio->channel);
++    }
++
++    if(pAP->pRadio) {
++        swl_bandwidth_e bw = swl_radBw_toBw[pAP->pRadio->runningChannelBandwidth];
++        if(bw != SWL_BW_AUTO) {
++            amxd_object_set_value(cstring_t, pAD->object, "LinkBandwidth",
++                                  swl_bandwidth_unknown_str[bw]);
++            pAD->assocCaps.linkBandwidth = bw;
++            pAD->assocCaps.linkBandwidthSetByDriver = true;
++        }
++    }
++
++    if(pAP->pRadio && pAP->pRadio->pBus) {
++        const amxc_var_t* oc = amxd_object_get_param_value(pAP->pRadio->pBus, "OperatingClass");
++        if(oc) {
++            uint32_t opclass = amxc_var_dyncast(uint32_t, oc);
++            if(opclass > 0)
++                amxd_object_set_value(uint32_t, pAD->object, "OperatingClass", opclass);
++        }
++    }
++
++    if(!pAP->wpaCtrlInterface || !wld_wpaCtrlInterface_isReady(pAP->wpaCtrlInterface)) {
++        SAH_TRACEZ_WARNING(ME, "%s: syncStaAssocInfo wpaCtrl not ready, skip STA-specific fields",
++            pAP->alias);
++        return;
++    }
++
++    char reply[2048] = {0};
++    swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtGetResponse(
++        pAP->wpaCtrlInterface, reply, sizeof(reply),
++        "STA %02x:%02x:%02x:%02x:%02x:%02x",
++        pAD->MACAddress[0], pAD->MACAddress[1], pAD->MACAddress[2],
++        pAD->MACAddress[3], pAD->MACAddress[4], pAD->MACAddress[5]);
++
++    if(!swl_rc_isOk(rc) || reply[0] == '\0' || reply[0] == 'F') {
++        SAH_TRACEZ_WARNING(ME, "%s: syncStaAssocInfo STA query failed for %s",
++            pAP->alias, pAD->Name);
++        return;
++    }
++
++    uint32_t maxphyrate = 0;
++    int32_t  sig = 0;
++    unsigned int vht_caps_raw = 0;
++    bool has_vht = false;
++    int erp = 0;
++    bool has_erp = false;
++    int min_txpwr = 0;
++    bool has_min_txpwr = false;
++    int max_txpwr = 0;
++    bool has_max_txpwr = false;
++
++    char* line = reply;
++    while(line && *line) {
++        char* nl = strchr(line, '\n');
++        if(nl) *nl = '\0';
++        unsigned int tmp = 0;
++        int stmp = 0;
++        if(sscanf(line, "signal=%d", &stmp) == 1) {
++            sig = stmp;
++            amxd_object_set_value(int32_t, pAD->object, "SignalStrength", sig);
++        } else if(sscanf(line, "maxphyrate=%u", &tmp) == 1) {
++            maxphyrate = tmp;
++            amxd_object_set_value(uint32_t, pAD->object, "MaxDownlinkRateSupported", maxphyrate);
++            amxd_object_set_value(uint32_t, pAD->object, "MaxUplinkRateSupported", maxphyrate);
++        } else if(sscanf(line, "vht_caps_info=0x%x", &tmp) == 1) {
++            vht_caps_raw = tmp;
++            has_vht = true;
++        } else if(sscanf(line, "ERP=%d", &stmp) == 1) {
++            erp = stmp;
++            has_erp = true;
++            amxd_object_set_value(bool, pAD->object, "ERP", (bool)erp);
++        } else if(sscanf(line, "min_txpower=%d", &stmp) == 1) {
++            min_txpwr = stmp;
++            has_min_txpwr = true;
++            amxd_object_set_value(int32_t, pAD->object, "MinTxPower", min_txpwr);
++        } else if(sscanf(line, "max_txpower=%d", &stmp) == 1) {
++            max_txpwr = stmp;
++            has_max_txpwr = true;
++            amxd_object_set_value(int32_t, pAD->object, "MaxTxPower", max_txpwr);
++        }
++        line = nl ? nl + 1 : NULL;
++    }
++
++    if(has_vht) {
++        swl_staCapVht_m vhtMask = 0;
++        if(vht_caps_raw & M_SWL_80211_VHTCAPINFO_SGI_80)  vhtMask |= M_SWL_STACAP_VHT_SGI80;
++        if(vht_caps_raw & M_SWL_80211_VHTCAPINFO_SGI_160) vhtMask |= M_SWL_STACAP_VHT_SGI160;
++        if(vht_caps_raw & M_SWL_80211_VHTCAPINFO_SU_BFR)  vhtMask |= M_SWL_STACAP_VHT_SU_BFR;
++        if(vht_caps_raw & M_SWL_80211_VHTCAPINFO_SU_BFE)  vhtMask |= M_SWL_STACAP_VHT_SU_BFE;
++        if(vht_caps_raw & M_SWL_80211_VHTCAPINFO_MU_BFR)  vhtMask |= M_SWL_STACAP_VHT_MU_BFR;
++        if(vht_caps_raw & M_SWL_80211_VHTCAPINFO_MU_BFE)  vhtMask |= M_SWL_STACAP_VHT_MU_BFE;
++        char vhtStr[64] = {0};
++        swl_conv_maskToChar(vhtStr, sizeof(vhtStr), vhtMask, swl_staCapVht_str, SWL_STACAP_VHT_MAX);
++        amxd_object_set_value(cstring_t, pAD->object, "VhtCapabilities", vhtStr);
++        pAD->assocCaps.vhtCapabilities = vhtMask;
++    }
++
++    SAH_TRACEZ_INFO(ME, "%s: sta %s ch=%d bw=%d sig=%d maxrate=%u vht=0x%x erp=%d mintxpwr=%d maxtxpwr=%d",
++        pAP->alias, pAD->Name,
++        pAP->pRadio ? pAP->pRadio->channel : -1,
++        pAP->pRadio ? (int)pAP->pRadio->runningChannelBandwidth : -1,
++        sig, maxphyrate, vht_caps_raw,
++        has_erp ? erp : -1,
++        has_min_txpwr ? min_txpwr : -1,
++        has_max_txpwr ? max_txpwr : -1);
++}
++
+ static void s_commonAssocReqCb(T_AccessPoint* pAP, swl_80211_mgmtFrame_t* frame, size_t frameLen, swl_bit8_t* iesData, size_t iesLen) {
+     ASSERT_NOT_NULL(pAP, , ME, "NULL");
+     ASSERT_NOT_NULL(pAP->pRadio, , ME, "NULL");
+
+--
+2.34.1
