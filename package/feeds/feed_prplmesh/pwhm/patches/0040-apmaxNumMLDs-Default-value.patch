@@ -1,0 +1,21 @@
+From ed2b3f8fad3e6a996f5450e4800e4ca777eb3905 Mon Sep 17 00:00:00 2001
+From: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+Date: Mon, 29 Jun 2026 23:53:55 +0530
+Subject: [PATCH] Fix incorrect MaxNumMLDs value
+
+Signed-off-by: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+---
+
+Index: pwhm-v7.27.5/src/Plugin/wifiGen_rad.c
+===================================================================
+--- pwhm-v7.27.5.orig/src/Plugin/wifiGen_rad.c
++++ pwhm-v7.27.5/src/Plugin/wifiGen_rad.c
+@@ -700,7 +700,7 @@ int wifiGen_rad_supports(T_Radio* pRad,
+              * When APMLO is supported, all BSSs can be set as SLOs
+              * which defines maxNumAPMLDs to maxBSSs that can be created by the wiphy device
+              */
+-            apMldCapa.maxNumMLDs = wld_getMaxNrAPs();
++            apMldCapa.maxNumMLDs = wiphyInfo.nApMax;
+             apMldCapa.maxNumLinksPerMLD = wiphyInfo.extCapas.maxNumSimultenousLinks[WLD_WIPHY_IFTYPE_AP] + 1;
+ 
+             pRad->cap.apCap7.tidLinkMapNegotiation = (pRad->cap.tidLinkMapCapability != TID_LINK_MAP_CAPABILITY_NOT_SUPPORTED);
