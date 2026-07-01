@@ -223,10 +223,9 @@ Index: pwhm-v7.27.4/include/wld/wld.h
 ===================================================================
 --- pwhm-v7.27.4.orig/include/wld/wld.h
 +++ pwhm-v7.27.4/include/wld/wld.h
-@@ -1739,6 +1739,7 @@ struct WLD_RADIO {
+@@ -1739,5 +1739,6 @@ struct WLD_RADIO {
      swl_channel_t disabledSubchannels[SWL_BW_CHANNELS_MAX]; /* Disabled Subchannel list, for 11be static channel puncturing */
      uint32_t nrDisabledSubChannels;                         /* Nr of disabled sub channels */
-     uint8_t mLReconfigurationCount;                         /** Number of beacons with ML Reconfiguration IE before link removal */
 +    bool discardAwgnEvent;                                  /* When true, add discard_6g_awgn_event=1 to hostapd config (6GHz only) */
  };
  
@@ -299,10 +298,9 @@ Index: pwhm-v7.27.4/src/wld_radio.c
  SWLA_DM_HDLRS(sRadioDmHdlrs,
                ARR(SWLA_DM_PARAM_HDLR("RegulatoryDomain", s_setCountryCode_pwf),
                    SWLA_DM_PARAM_HDLR("IEEE80211hEnabled", s_set80211hEnable_pwf),
-@@ -5084,6 +5097,7 @@ SWLA_DM_HDLRS(sRadioDmHdlrs,
+@@ -5084,5 +5097,6 @@ SWLA_DM_HDLRS(sRadioDmHdlrs,
                    SWLA_DM_PARAM_HDLR("OperationalDataTransmitRates", s_setOperationalDataTransmitRates_pwf),
                    SWLA_DM_PARAM_HDLR("BasicDataTransmitRates", s_setBasicDataTransmitRates_pwf),
-                   SWLA_DM_PARAM_HDLR("PowerType", s_setPowerType_pwf),
 +                  SWLA_DM_PARAM_HDLR("DiscardAwgnEvent", s_setDiscardAwgnEvent_pwf),
                    ),
                .instAddedCb = s_addInstance_oaf);

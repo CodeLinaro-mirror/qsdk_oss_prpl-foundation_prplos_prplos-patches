@@ -167,10 +167,11 @@ Signed-off-by: VedhaLoganathan <vedhaval@qti.qualcomm.com>
  
  #define ME "actions"
  
-@@ -481,4 +482,34 @@ amxd_status_t _return_false(UNUSED amxd_
-     return amxd_status_ok;
+@@ -403,3 +404,35 @@ amxd_status_t _check_is_in_power_capability_or_error(amxd_object_t* object,
+     SAH_TRACEZ_OUT(ME);
+     return rv;
  }
- 
++
 +amxd_status_t _flowcontrol_on_read(amxd_object_t* const object,
 +                                   UNUSED amxd_param_t* const param,
 +                                   amxd_action_t reason,
@@ -194,7 +195,7 @@ Signed-off-by: VedhaLoganathan <vedhaval@qti.qualcomm.com>
 +
 +    // Update FlowControl status from driver
 +    dm_ethernet_ethtool_update_flowcontrol(ethernet);
- 
++
 +    // Read the updated value from the data model
 +    rv = amxd_action_param_read(object, param, reason, args, retval, priv);
 +
