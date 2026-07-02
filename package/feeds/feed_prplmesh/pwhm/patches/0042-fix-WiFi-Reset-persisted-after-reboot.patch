@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+Date: Mon, 30 Jun 2026 00:00:00 +0000
+Subject: [PATCH] pwhm: fix WiFi.Reset() not removing persisted guest VAPs
+
+Two bugs cause guest VAPs to survive WiFi.Reset() after a reboot:
+
+Bug 1 - Saved conf not deleted before radio stop causes wld restart:
+wld_persist_deleteSavedConf() is called at the bottom of _Reset(), but
+wld_rad_doRadioReset() (called earlier) causes procd to restart wld
+before the conf deletion is ever reached. On the next startup,
+wld_persist_onStart() finds the saved conf still on disk and reloads
+all guest VAPs. Fix: call wld_persist_deleteSavedConf() as the FIRST
+action in _Reset(), before any radio stop or DM cleanup.
+
+Bug 2 - nrDefaultAps baseline inflated by persisted guest VAPs:
+After daemon restart the saved conf contains user-created VAPs. On
+startup wld_persist_onStart() sets nrDefaultAps from the full loaded
+state, so guest VAPs inflate the count making while(N > N) = false
+and the Reset deletion loop never fires.
+Fix: count only APs with UserAdded=false for nrDefaultAps. VAPs
+created via addVAPIntf() have UserAdded=true (set at creation time)
+and are excluded from the baseline. The original single-pass loading
+is preserved (load saved conf OR defaults, never both) to avoid double
+Radio FSM initialization that causes EventCounter duplicate errors and
+prevents the saved conf from being fully applied on normal reboots.
+
+Signed-off-by: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+---
+
+Index: pwhm-v7.27.5/odl/wld_accesspoint.odl
+===================================================================
+--- pwhm-v7.27.5.orig/odl/wld_accesspoint.odl
++++ pwhm-v7.27.5/odl/wld_accesspoint.odl
+@@ -255,6 +255,15 @@
+ 		 */
+ 		%persistent string CustomAlias;
+
++		/**
++		 * Set to true when this AccessPoint was created at runtime via
++		 * addVAPIntf (not loaded from factory defaults). Used by
++		 * wld_persist_onStart() to compute the correct nrDefaultAps
++		 * baseline so that WiFi.Reset() can remove user-created VAPs
++		 * even after a daemon restart.
++		 */
++		%persistent bool UserAdded = false;
++
+ 		/** Index in the AccessPoint tree (also for the SSID tree,
+ 		 *  both are inline) */
+ 		%read-only uint32 Index;
+Index: pwhm-v7.27.5/src/RadMgt/wld_rad_ifMgt.c
+===================================================================
+--- pwhm-v7.27.5.orig/src/RadMgt/wld_rad_ifMgt.c
++++ pwhm-v7.27.5/src/RadMgt/wld_rad_ifMgt.c
+@@ -158,6 +158,24 @@
+     amxd_trans_clean(&trans);
+
+     ASSERT_EQUALS(status, amxd_status_ok, status, ME, "%s: fail to apply trans to add ap (%s)", pR->Name, apname);
++
++    /*
++     * Mark the new AP as user-created so wld_persist_onStart() can
++     * exclude it from the nrDefaultAps baseline on the next startup.
++     * Without this, after daemon restart the saved conf loads the guest
++     * VAP and nrDefaultAps is inflated, causing WiFi.Reset() to skip
++     * the deletion loop (while(N > N) is always false).
++     */
++    amxd_object_t* newApInst = amxd_object_findf(apObjTmpl, "%s", apname);
++    if(newApInst != NULL) {
++        amxd_trans_t mark_trans;
++        amxd_trans_init(&mark_trans);
++        amxd_trans_select_object(&mark_trans, newApInst);
++        amxd_trans_set_bool(&mark_trans, "UserAdded", true);
++        amxd_trans_apply(&mark_trans, get_wld_plugin_dm());
++        amxd_trans_clean(&mark_trans);
++    }
++
+     amxc_var_set(bool, retval, true);
+
+     SAH_TRACEZ_OUT(ME);
+Index: pwhm-v7.27.5/src/Features/persist/wld_persist_on.c
+===================================================================
+--- pwhm-v7.27.5.orig/src/Features/persist/wld_persist_on.c
++++ pwhm-v7.27.5/src/Features/persist/wld_persist_on.c
+@@ -115,18 +115,6 @@
+     amxd_object_t* rootObj = amxd_dm_get_root(get_wld_plugin_dm());
+     amxo_parser_t* parser = get_wld_plugin_parser();
+     if(s_getSavedConfPath(&confPath) && swl_fileUtils_existsFile(amxc_string_get(&confPath, 0))) {
+-        /* Load the factory defaults first so nrDefaultAps reflects the
+-         * baseline AP count (before any user-added guest VAPs). Then load
+-         * the saved conf on top to restore the full saved configuration.
+-         * Without this, nrDefaultAps would include user-created APs and
+-         * WiFi.Reset() would fail to delete them. */
+-        amxo_parser_parse_string(parser, "include '${odl.dm-defaults}';", rootObj);
+-        while(amxp_signal_read() == 0) {
+-        }
+-        T_Radio* pDefaultRad = NULL;
+-        wld_for_eachRad(pDefaultRad) {
+-            pDefaultRad->nrDefaultAps = (uint32_t) amxc_llist_size(&pDefaultRad->llAP);
+-        }
+         rv = amxo_parser_parse_file(parser, amxc_string_get(&confPath, 0), rootObj);
+     } else {
+         rv = amxo_parser_parse_string(parser, "include '${odl.dm-defaults}';", rootObj);
+@@ -142,20 +130,23 @@
+         return false;
+     }
+     /*
+-     * Record the default AP count per radio now that the defaults (or saved
+-     * conf) have been fully loaded. This snapshot is used by _Reset() to
+-     * identify user-created APs (those added beyond this baseline count)
+-     * and delete them to achieve a true factory reset.
+-     */
+-    /*
+-     * Record the default AP count per radio (defaults-only path). The
+-     * saved-conf path already recorded this before loading the saved conf.
++     * Count nrDefaultAps excluding UserAdded VAPs. APs created via
++     * addVAPIntf() have UserAdded=true and must not inflate the baseline
++     * or WiFi.Reset() will never delete them (while(N > N) = false).
++     * Factory-default APs always have UserAdded=false and are counted.
++     * Uses amxc_llist_for_each directly (wld_radio.h not included here).
+      */
+     T_Radio* pRad = NULL;
+     wld_for_eachRad(pRad) {
+-        if(pRad->nrDefaultAps == 0) {
+-            pRad->nrDefaultAps = (uint32_t) amxc_llist_size(&pRad->llAP);
+-        }
++        uint32_t defaultCount = 0;
++        amxc_llist_for_each(ap_it, &pRad->llAP) {
++            T_AccessPoint* pAP = amxc_container_of(ap_it, T_AccessPoint, it);
++            if((pAP->pBus == NULL) ||
++               !amxd_object_get_value(bool, pAP->pBus, "UserAdded", NULL)) {
++                defaultCount++;
++            }
++        }
++        pRad->nrDefaultAps = defaultCount;
+     }
+     SAH_TRACEZ_OUT(ME);
+     return true;
+Index: pwhm-v7.27.5/src/wld.c
+===================================================================
+--- pwhm-v7.27.5.orig/src/wld.c
++++ pwhm-v7.27.5/src/wld.c
+@@ -1049,6 +1049,16 @@
+                      amxc_var_t* retval _UNUSED) {
+
+     /*
++     * Delete the persisted ODL file FIRST, before any radio stop.
++     * Stopping radios causes wld to restart (procd watchdog), so the
++     * wld_persist_deleteSavedConf() call at the bottom of this function
++     * is never reached. Deleting the conf here ensures that even if
++     * wld restarts mid-reset, the next startup loads from factory
++     * defaults instead of the saved conf with user-created VAPs.
++     */
++    wld_persist_deleteSavedConf();
++
++    /*
+      * Delete user-created VAPs (APs added beyond the default set) BEFORE
+      * stopping the radios, so the kernel VAP interfaces are still up and
+      * mfn_wrad_delvapif can properly tear them down. After radio stop, the
