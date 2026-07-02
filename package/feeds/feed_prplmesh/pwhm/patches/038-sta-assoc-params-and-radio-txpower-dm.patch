@@ -41,7 +41,7 @@ Signed-off-by: Jassim Shanavaskhan <jshanava@qti.qualcomm.com>
  2 files changed, 164 insertions(+)
 
 --- a/odl/wld_accesspoint.odl
-+++ /local/mnt/workspace/js_prpl/IPQ5424_new/prplos/build_dir/target-aarch64_cortex-a55+neon-vfpv4_musl/pwhm-v7.27.2/odl/wld_accesspoint.odl	2026-06-29 14:13:21.460777902 +0530
++++ b/odl/wld_accesspoint.odl
 @@ -1791,6 +1791,34 @@
  				default "Unknown";
  			}
@@ -78,7 +78,7 @@ Signed-off-by: Jassim Shanavaskhan <jshanava@qti.qualcomm.com>
  			%volatile %read-only bool PowerSave;
  
 --- a/src/Plugin/wifiGen_eventHandlers.c
-+++ /local/mnt/workspace/js_prpl/IPQ5424_new/prplos/build_dir/target-aarch64_cortex-a55+neon-vfpv4_musl/pwhm-v7.27.2/src/Plugin/wifiGen_eventHandlers.c	2026-06-29 14:13:21.460777902 +0530
++++ b/src/Plugin/wifiGen_eventHandlers.c
 @@ -1177,6 +1177,8 @@
      swl_str_copyMalloc(pPrimLinkIfName, pLinkIfName);
  }
