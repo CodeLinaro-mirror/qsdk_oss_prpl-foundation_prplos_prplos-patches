@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Abhi Teja Cholleti <abhiteja.cholleti@qti.qualcomm.com>
+Date: Thu, 03 Jul 2026 00:00:00 +0530
+Subject: [PATCH] pwhm: fix radio_idx for single-phy MLD devices
+
+On single-phy MLD devices all bands (2.4/5/6 GHz) share one phy#0.
+cfg80211tool uses radio_idx to distinguish the band within that phy:
+  0 = 2.4 GHz, 1 = 5 GHz, 2 = 6 GHz
+
+All four cfg80211tool calls in the regulatory helpers were hardcoded to
+radio_idx 0 (2.4 GHz), causing the driver to reject commands with
+"valid only for 6 GHz radio" when called for 5 GHz or 6 GHz radios.
+
+Changes:
+- Add s_band_to_radio_idx() helper to explicitly map operatingFrequencyBand
+  to radio_idx, decoupling the enum from the driver ABI and logging unknown
+  bands rather than silently passing a wrong value.
+- Guard the fix with wld_rad_countWiphyRads(): use operatingFrequencyBand
+  as radio_idx only on single-phy MLD devices (>1 radio share one wiphy);
+  on traditional multi-phy devices radio_idx 0 remains correct.
+
+Signed-off-by: Abhi Teja Cholleti <abhiteja.cholleti@qti.qualcomm.com>
+---
+ src/wld_radio.c | 45 +++++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 39 insertions(+), 6 deletions(-)
+
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -4136,6 +4136,21 @@
+ /* Maximum output buffer for popen-based cfg80211tool queries */
+ #define QCA_POPEN_OUT_MAX  4096
+ 
++/* Map operatingFrequencyBand enum to cfg80211tool radio_idx.
++ * On single-phy MLD devices radio_idx selects the band within the shared phy:
++ *   0=2.4GHz, 1=5GHz, 2=6GHz.
++ * This explicit mapping decouples the enum numeric values from the driver ABI. */
++static uint32_t s_band_to_radio_idx(swl_freqBandExt_e band) {
++    switch(band) {
++    case SWL_FREQ_BAND_EXT_2_4GHZ: return 0;
++    case SWL_FREQ_BAND_EXT_5GHZ:   return 1;
++    case SWL_FREQ_BAND_EXT_6GHZ:   return 2;
++    default:
++        SAH_TRACEZ_WARNING(ME, "Unknown band %d, defaulting radio_idx to 0", band);
++        return 0;
++    }
++}
++
+ /* Helper: get the first usable AP for wpa_ctrl commands on pRad. */
+ static T_AccessPoint* s_getCtrlAp(T_Radio* pRad) {
+     T_AccessPoint* pAP = wld_rad_getFirstActiveAp(pRad);
+@@ -4200,10 +4215,14 @@
+     char cmd[256];
+     char out[QCA_POPEN_OUT_MAX];
+     /* cfg80211tool requires: phyX radio_idx <idx> <cmd> [value]
+-     * radio_idx must immediately follow the phy interface name. */
++     * radio_idx must immediately follow the phy interface name.
++     * On single-phy MLD devices use the band index; on multi-phy devices use 0. */
++    uint32_t radio_idx = (wld_rad_countWiphyRads(pR->wiphy) > 1)
++                         ? s_band_to_radio_idx(pR->operatingFrequencyBand)
++                         : 0;
+     snprintf(cmd, sizeof(cmd),
+-             "cfg80211tool %s radio_idx 0 set_country_id %u 2>&1",
+-             phyName, countryId);
++             "cfg80211tool %s radio_idx %u set_country_id %u 2>&1",
++             phyName, radio_idx, countryId);
+ 
+     SAH_TRACEZ_INFO(ME, "%s: setCountryId %u cmd='%s'", pR->Name, countryId, cmd);
+     bool success = (s_cfg80211tool_run(cmd, out, sizeof(out)) == SWL_RC_OK);
+@@ -4224,9 +4243,12 @@
+     char out[QCA_POPEN_OUT_MAX];
+     char phyName[IFNAMSIZ];
+     s_get_phy_name(pR->wiphyName, phyName, sizeof(phyName));
++    uint32_t radio_idx = (wld_rad_countWiphyRads(pR->wiphy) > 1)
++                         ? s_band_to_radio_idx(pR->operatingFrequencyBand)
++                         : 0;
+     snprintf(cmd, sizeof(cmd),
+-             "cfg80211tool %s radio_idx 0 get_country_id 2>&1",
+-             phyName);
++             "cfg80211tool %s radio_idx %u get_country_id 2>&1",
++             phyName, radio_idx);
+ 
+     SAH_TRACEZ_INFO(ME, "%s: getCountryId cmd='%s'", pR->Name, cmd);
+     if(s_cfg80211tool_run(cmd, out, sizeof(out)) != SWL_RC_OK) {
+@@ -4489,9 +4511,12 @@
+     char out[QCA_POPEN_OUT_MAX];
+     char phyName[IFNAMSIZ];
+     s_get_phy_name(pR->wiphyName, phyName, sizeof(phyName));
++    uint32_t radio_idx = (wld_rad_countWiphyRads(pR->wiphy) > 1)
++                         ? s_band_to_radio_idx(pR->operatingFrequencyBand)
++                         : 0;
+     snprintf(cmd, sizeof(cmd),
+-             "cfg80211tool %s radio_idx 0 display_band_chans 2>&1",
+-             phyName);
++             "cfg80211tool %s radio_idx %u display_band_chans 2>&1",
++             phyName, radio_idx);
+ 
+     SAH_TRACEZ_INFO(ME, "%s: displayBandChans cmd='%s'", pR->Name, cmd);
+     if(s_cfg80211tool_run(cmd, out, sizeof(out)) != SWL_RC_OK) {
+@@ -4515,9 +4540,12 @@
+     char out[QCA_POPEN_OUT_MAX];
+     char phyName[IFNAMSIZ];
+     s_get_phy_name(pR->wiphyName, phyName, sizeof(phyName));
++    uint32_t radio_idx = (wld_rad_countWiphyRads(pR->wiphy) > 1)
++                         ? s_band_to_radio_idx(pR->operatingFrequencyBand)
++                         : 0;
+     snprintf(cmd, sizeof(cmd),
+-             "cfg80211tool %s radio_idx 0 display_super_chan_list 2>&1",
+-             phyName);
++             "cfg80211tool %s radio_idx %u display_super_chan_list 2>&1",
++             phyName, radio_idx);
+ 
+     SAH_TRACEZ_INFO(ME, "%s: displaySuperChanList cmd='%s'", pR->Name, cmd);
+     if(s_cfg80211tool_run(cmd, out, sizeof(out)) != SWL_RC_OK) {
