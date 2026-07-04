@@ -1,0 +1,204 @@
+From 23fc3b0881bd1d35d08b3a2a047d41567280b15d Mon Sep 17 00:00:00 2001
+From: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
+Date: Tue, 04 Jul 2026 00:00:00 +0530
+Subject: [PATCH] pwhm: fix BH disconnect on channel-change and puncturing when FH VAPs enabled
+
+* Added CTRL-EVENT-STARTED-LINK-CHANNEL-SWITCH and CTRL-EVENT-LINK-CHANNEL-SWITCH
+  to handle wpa_supplicant link-specific event for MLD CSA
+
+* Add s_chanSwitchStartedCb to issue CHAN_SWITCH to FH VAPs on MLD non-primary link
+  CSA and redirect chanspec update to correct FH radio on completion
+
+* wpa_supplicant has short form "punct_bitmap" instead of "puncturing_bitmap so after
+  the primary key lookup fails (bitmap == 0), retry with the short "punct_bitmap" key
+  in both s_chanSwitchStartedEvtCb and  s_chanSwitchEvtCb. 
+
+Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
+---
+diff --git a/src/nl80211/wld_wpaCtrl_events.c b/src/nl80211/wld_wpaCtrl_events.c
+--- a/src/nl80211/wld_wpaCtrl_events.c
++++ b/src/nl80211/wld_wpaCtrl_events.c
+@@ -490,27 +490,35 @@ static void s_chanSwitchStartedEvtCb(wld_wpaCtrlInterface_t* pInterface, char*
+     swl_chanspec_t chanSpec = SWL_CHANSPEC_EMPTY;
+     ASSERT_FALSE(s_freqParamToChanSpec(params, "freq", &chanSpec) < SWL_RC_OK, , ME, "fail to get freq");
+     s_chWidthDescToChanSpec(params, "ch_width", &chanSpec);
+     s_punctBitmapDescToChanSpec(params, "puncturing_bitmap", &chanSpec);
++    /* wpa_supplicant has short form "punct_bitmap" instead of "puncturing_bitmap" */
++    if(chanSpec.punctBitmap == 0) {
++        s_punctBitmapDescToChanSpec(params, "punct_bitmap", &chanSpec);
++    }
+ 
+     SAH_TRACEZ_INFO(ME, "%s: channel=%d width=%d band=%d punctBitmap=0x%x", pInterface->name, chanSpec.channel,
+                     chanSpec.bandwidth, chanSpec.band, chanSpec.punctBitmap);
+ 
+     CALL_MGR_I(pInterface, fChanSwitchStartedCb, &chanSpec);
+ }
+ 
+ static void s_chanSwitchEvtCb(wld_wpaCtrlInterface_t* pInterface, char* event _UNUSED, char* params) {
+     /**
+      * Examples:
+      * CTRL-EVENT-CHANNEL-SWITCH freq=2427 ht_enabled=0 ch_offset=0 ch_width=20 MHz (no HT) cf1=2427 cf2=0 dfs=0
+      * CTRL-EVENT-CHANNEL-SWITCH freq=6135 ht_enabled=0 ch_offset=-1 ch_width=320 MHz cf1=6105 cf2=0 is_dfs0=0 dfs=0 puncturing_bitmap=0x%04x
+      */
+     swl_chanspec_t chanSpec = SWL_CHANSPEC_EMPTY;
+     ASSERT_FALSE(s_freqParamToChanSpec(params, "freq", &chanSpec) < SWL_RC_OK, , ME, "fail to get freq");
+     s_chWidthDescToChanSpec(params, "ch_width", &chanSpec);
+     s_punctBitmapDescToChanSpec(params, "puncturing_bitmap", &chanSpec);
++    /* wpa_supplicant has form "punct_bitmap" instead of "puncturing_bitmap" */
++    if(chanSpec.punctBitmap == 0) {
++        s_punctBitmapDescToChanSpec(params, "punct_bitmap", &chanSpec);
++    }
+ 
+     SAH_TRACEZ_INFO(ME, "%s: channel=%d width=%d band=%d punctBitmap=0x%x", pInterface->name, chanSpec.channel,
+                     chanSpec.bandwidth, chanSpec.band, chanSpec.punctBitmap);
+ 
+     CALL_MGR_I(pInterface, fChanSwitchCb, &chanSpec);
+ }
+@@ -916,4 +924,6 @@ static const swl_wpaCtrlEvtEntry_t s_wpaCtrlEvtTable[] = {
+               {"CTRL-EVENT-STARTED-CHANNEL-SWITCH", &s_chanSwitchStartedEvtCb},
+               {"CTRL-EVENT-CHANNEL-SWITCH", &s_chanSwitchEvtCb},
++              {"CTRL-EVENT-STARTED-LINK-CHANNEL-SWITCH", &s_chanSwitchStartedEvtCb},
++              {"CTRL-EVENT-LINK-CHANNEL-SWITCH", &s_chanSwitchEvtCb},
+               {"AP-CSA-FINISHED", &s_apCsaFinishedEvtCb},
+               {"AP-MGMT-FRAME-RECEIVED", &s_mgtFrameEvt},
+diff --git a/src/Plugin/wifiGen_eventHandlers.c b/src/Plugin/wifiGen_eventHandlers.c
+--- a/src/Plugin/wifiGen_eventHandlers.c
++++ b/src/Plugin/wifiGen_eventHandlers.c
+@@ -336,9 +336,126 @@ static void s_chanSwitchCb(void* userData, char* ifName _UNUSED, swl_chanspec_t
+     T_EndPoint* pEP = wld_vep_from_name(ifName);
+     if(pEP != NULL) {
+         reason = CHAN_REASON_EP_MOVE;
+     }
+-    s_saveChanChanged(pRad, chanSpec, reason);
+-}
+-
++
++    /*
++     * MLO multi-link BH: CTRL-EVENT-CHANNEL-SWITCH (or CTRL-EVENT-LINK-CHANNEL-SWITCH)
++     * fires on the MLD STA interface (e.g. wlan0/6GHz) after a non-primary link switch
++     * completes (e.g. 5GHz link_id=1).  The chanSpec band differs from pRad's current
++     * band.  Find the physical radio that owns that band and redirect the chanspec update
++     * to it.  Do NOT apply a cross-band chanspec to the primary MLD radio.
++     */
++    if((reason == CHAN_REASON_EP_MOVE) &&
++       (pRad->currentChanspec.chanspec.band != SWL_FREQ_BAND_EXT_AUTO) &&
++       (chanSpec->band != SWL_FREQ_BAND_EXT_AUTO) &&
++       (pRad->currentChanspec.chanspec.band != chanSpec->band)) {
++        T_Radio* pFhRad = NULL;
++        wld_for_eachRad(pFhRad) {
++            if(pFhRad == pRad) {
++                continue;
++            }
++            if((pFhRad->currentChanspec.chanspec.band == SWL_FREQ_BAND_EXT_AUTO) ||
++               (pFhRad->currentChanspec.chanspec.band != chanSpec->band)) {
++                continue;
++            }
++            SAH_TRACEZ_WARNING(ME, "%s: MLD BH link switch completed (band=%s ch=%d) -> update radio %s chanspec",
++                               pRad->Name, swl_freqBandExt_str[chanSpec->band],
++                               chanSpec->channel, pFhRad->Name);
++            s_saveChanChanged(pFhRad, chanSpec, CHAN_REASON_EP_MOVE);
++            break;
++        }
++        return;
++    }
++
++    s_saveChanChanged(pRad, chanSpec, reason);
++}
++
++/*
++ * Separate handler for CTRL-EVENT-STARTED-CHANNEL-SWITCH (fChanSwitchStartedCb).
++ *
++ * For non-MLO radios or same-band links: return early when an EP is running
++ * (the completion event s_chanSwitchCb handles the actual chanspec update).
++ *
++ * For MLO multi-link BH: when the event arrives on the MLD STA primary radio
++ * (e.g. wlan0/6GHz) for a non-primary link (e.g. 5GHz link_id=1), the chanSpec
++ * band differs from pRad's current band.  In this case mac80211 requires ALL
++ * interfaces on the 5GHz radio channel-context to participate in the channel
++ * switch simultaneously.  Hostapd does NOT receive this notification automatically
++ * because the kernel sends NL80211_CMD_CH_SWITCH_STARTED_NOTIFY to the MLD STA
++ * netlink socket, not to the FH AP socket on the same physical radio.
++ * Issue a CHAN_SWITCH command to hostapd for that radio's FH VAPs so that
++ * mac80211 can finalize the channel-context reservation without force-
++ * disconnecting the BH STA (err=-16 EBUSY).
++ */
++static void s_chanSwitchStartedCb(void* userData, char* ifName _UNUSED, swl_chanspec_t* chanSpec) {
++    T_Radio* pRad = (T_Radio*) userData;
++    ASSERT_NOT_NULL(pRad, , ME, "NULL");
++    SAH_TRACEZ_WARNING(ME, "%s: channel switch STARTED central_chan=%d bandwidth=%s band=%s",
++                       pRad->Name, chanSpec->channel,
++                       swl_bandwidth_str[chanSpec->bandwidth],
++                       swl_freqBandExt_str[chanSpec->band]);
++
++    if(!wld_rad_hasRunningEndpoint(pRad)) {
++        s_saveChanChanged(pRad, chanSpec, pRad->targetChanspec.reason);
++        return;
++    }
++
++    /*
++     * MLO non-primary link CSA: chanSpec band differs from pRad's current band.
++     * Find the FH radio for that band and issue CHAN_SWITCH so mac80211 can
++     * finalize the channel-context reservation before the CSA countdown expires.
++     */
++    if((pRad->currentChanspec.chanspec.band != SWL_FREQ_BAND_EXT_AUTO) &&
++       (chanSpec->band != SWL_FREQ_BAND_EXT_AUTO) &&
++       (pRad->currentChanspec.chanspec.band != chanSpec->band)) {
++        T_Radio* pFhRad = NULL;
++        wld_for_eachRad(pFhRad) {
++            if(pFhRad == pRad) {
++                continue;
++            }
++            if((pFhRad->currentChanspec.chanspec.band == SWL_FREQ_BAND_EXT_AUTO) ||
++               (pFhRad->currentChanspec.chanspec.band != chanSpec->band)) {
++                continue;
++            }
++            SAH_TRACEZ_WARNING(ME, "%s: MLD BH link CSA (band=%s ch=%d bw=%s) -> FH radio %s: issuing CHAN_SWITCH",
++                               pRad->Name, swl_freqBandExt_str[chanSpec->band],
++                               chanSpec->channel, swl_bandwidth_str[chanSpec->bandwidth],
++                               pFhRad->Name);
++            if(wld_secDmn_isEnabled(pFhRad->hostapd)) {
++                pFhRad->targetChanspec.chanspec = *chanSpec;
++                pFhRad->targetChanspec.reason = CHAN_REASON_EP_MOVE;
++                wld_rad_hostapd_switchChannel(pFhRad);
++            } else {
++                SAH_TRACEZ_WARNING(ME, "%s: hostapd not active on FH radio %s, cannot pre-switch FH VAPs",
++                                   pRad->Name, pFhRad->Name);
++            }
++            break;
++        }
++        return;
++    }
++
++    /*
++     * Same-band case: pRad has a running BH EP AND FH VAPs on the same physical
++     * radio (e.g. wlan1/5GHz holds both ep5g0 and wlan1.1).  This occurs when
++     * the controller performs a bandwidth or puncturing change (e.g. 80->40 MHz
++     * due to DisabledSubChannels).  mac80211 requires ALL interfaces on the
++     * channel-context to participate in the CSA simultaneously.  Issue CHAN_SWITCH
++     * to the FH VAPs on THIS radio so both the BH STA and FH AP switch together.
++     */
++    if(wld_secDmn_isEnabled(pRad->hostapd)) {
++        SAH_TRACEZ_WARNING(ME, "%s: BH EP + FH VAP on same radio (ch=%d bw=%s punct=0x%x): issuing CHAN_SWITCH",
++                           pRad->Name, chanSpec->channel,
++                           swl_bandwidth_str[chanSpec->bandwidth], chanSpec->punctBitmap);
++        pRad->targetChanspec.chanspec = *chanSpec;
++        pRad->targetChanspec.reason = CHAN_REASON_EP_MOVE;
++        wld_rad_hostapd_switchChannel(pRad);
++        return;
++    }
++
++    /* No FH VAPs on this radio: defer chanspec update to the completion event */
++    SAH_TRACEZ_WARNING(ME, "%s: EP running (no FH VAPs), deferring chanspec update to channel-switch completion event",
++                       pRad->Name);
++}
++
+ static void s_csaFinishedCb(void* userData, char* ifName _UNUSED, swl_chanspec_t* chanSpec) {
+     T_Radio* pRad = (T_Radio*) userData;
+@@ -828,5 +945,5 @@ static swl_rc_ne s_setWpaCtrlRadEvtHandlers(wld_wpaCtrlMngr_t* wpaCtrlMngr, T_R
+     //Set here the wpa_ctrl RAD event handlers
+     SET_HDLR(wpaCtrlRadEvthandlers.fProcStdEvtMsg, s_wpaCtrlRadioStdEvt);
+-    SET_HDLR(wpaCtrlRadEvthandlers.fChanSwitchStartedCb, s_chanSwitchCb);
++    SET_HDLR(wpaCtrlRadEvthandlers.fChanSwitchStartedCb, s_chanSwitchStartedCb);
+     SET_HDLR(wpaCtrlRadEvthandlers.fChanSwitchCb, s_chanSwitchCb);
+     SET_HDLR(wpaCtrlRadEvthandlers.fApCsaFinishedCb, s_csaFinishedCb);
+     SET_HDLR(wpaCtrlRadEvthandlers.fMngrReadyCb, s_mngrReadyCb);
