@@ -1,0 +1,208 @@
+From: Kartheek E <karte@qti.qualcomm.com>
+Date: Mon, 06 July 2026
+
+Subject: [PATCH] pwhm: Add distinct MRSNO sub-mode support (wpa3-com-8 and wpa3-com-24)
+
+The Airties controller supports three distinct MRSNO modes that differ in
+which RSN overrides are applied per frequency band:
+
+  wpa3-com-8   (DM: "WPA3-Personal-Compatibility-8"):
+    RSN override 1 (SAE/AKM:8)  applied to 2.4 GHz and 5 GHz only
+    No RSN override applied to 6 GHz
+
+  wpa3-com-24  (DM: "WPA3-Personal-Compatibility-24"):
+    RSN override 2 (SAE-EXT-KEY/AKM:24) applied to 2.4 GHz and 5 GHz only
+    No RSN override applied to 6 GHz
+
+  wpa3-com-8-24 (DM: "WPA3-Personal-Compatibility" -- existing behaviour):
+    RSN overrides 1 and 2 applied to 2.4 GHz and 5 GHz
+    RSN override 2 applied to 6 GHz
+
+Signed-off-by: Kartheek E <karte@qti.qualcomm.com>
+---
+--- a/include/wld/wld.h
++++ b/include/wld/wld.h
+@@ -1869,6 +1869,12 @@
+ } wld_cfg11u_t;
+ 
+ 
++typedef enum {
++    WLD_MRSNO_SUBMODE_COM_8_24 = 0,
++    WLD_MRSNO_SUBMODE_COM_8,
++    WLD_MRSNO_SUBMODE_COM_24,
++} wld_mrsnoSubMode_e;
++
+ struct S_ACCESSPOINT {
+     int debug;                       /* FIX ME */
+     wld_intfStatus_e status;
+@@ -1908,6 +1914,7 @@
+     swl_security_apMode_m secModesAvailable;    /* Bit pattern for available security modes */
+     swl_security_apMode_m secModesSupported;    /* Bit pattern for supported security modes */
+     swl_security_apMode_e secModeEnabled;       /* ModesSupported. */
++    wld_mrsnoSubMode_e mrsnoSubMode;            /* MRSNO sub-mode for WPA3-Personal-Compatibility */
+     char WEPKey[36];                            /* Max 32, but we need some 0 for termination (and alignment) */
+     char preSharedKey[PSK_KEY_SIZE_LEN];
+     char keyPassPhrase[PSK_KEY_SIZE_LEN];
+--- a/src/ApMgt/wld_ap_security.c
++++ b/src/ApMgt/wld_ap_security.c
+@@ -133,8 +133,13 @@
+     }
+     swl_security_apMode_e modeEnabledId = SWL_SECURITY_APMODE_UNKNOWN;
+     const char* modeEnabled = GET_CHAR(pParams, "ModeEnabled");
++    const char* modeToConvert = modeEnabled;
+     if(!swl_str_isEmpty(modeEnabled)) {
+-        modeEnabledId = swl_security_apModeFromString((char*) modeEnabled);
++        if(swl_str_matches(modeEnabled, "WPA3-Personal-Compatibility-8") ||
++           swl_str_matches(modeEnabled, "WPA3-Personal-Compatibility-24")) {
++            modeToConvert = "WPA3-Personal-Compatibility";
++        }
++        modeEnabledId = swl_security_apModeFromString((char*) modeToConvert);
+     }
+     const char* wepKey = GET_CHAR(pParams, "WEPKey");
+     const char* preSharedKey = GET_CHAR(pParams, "PreSharedKey");
+@@ -163,7 +168,7 @@
+         return false;
+     }
+     const char* finalModeEnabled = swl_security_apMode_str[modeEnabledId];
+-    if(modeEnabledId != swl_security_apModeFromString((char*) modeEnabled)) {
++    if(modeEnabledId != swl_security_apModeFromString((char*) modeToConvert)) {
+         SAH_TRACEZ_WARNING(ME, "%s: ModeEnabled (%s) not available: assume reverting to (%s)", oname, modeEnabled, finalModeEnabled);
+     }
+ 
+@@ -354,7 +359,16 @@
+     ASSERT_NOT_NULL(pAP, , ME, "Invalid AP Ctx");
+ 
+     const char* mode = amxc_var_constcast(cstring_t, newValue);
+-    swl_security_apMode_e modeId = swl_security_apModeFromString((char*) mode);
++    wld_mrsnoSubMode_e mrsnoSubMode = WLD_MRSNO_SUBMODE_COM_8_24;
++    const char* modeToConvert = mode;
++    if(swl_str_matches(mode, "WPA3-Personal-Compatibility-8")) {
++        mrsnoSubMode = WLD_MRSNO_SUBMODE_COM_8;
++        modeToConvert = "WPA3-Personal-Compatibility";
++    } else if(swl_str_matches(mode, "WPA3-Personal-Compatibility-24")) {
++        mrsnoSubMode = WLD_MRSNO_SUBMODE_COM_24;
++        modeToConvert = "WPA3-Personal-Compatibility";
++    }
++    swl_security_apMode_e modeId = swl_security_apModeFromString((char*) modeToConvert);
+     swl_security_apMode_e finalModeId = s_getFinalModeEnabled(pAP->secModesAvailable, modeId);
+     if(swl_security_isApModeWEP(finalModeId)) {
+         finalModeId = isValidWEPKey(pAP->WEPKey);
+@@ -363,10 +377,20 @@
+     if(finalModeId != modeId) {
+         swl_typeCharPtr_commitObjectParam(object, amxd_param_get_name(param), (char*) finalModeStr);
+     }
+-    ASSERTI_NOT_EQUALS(finalModeId, pAP->secModeEnabled, , ME, "%s: EQUAL mode %d", pAP->alias, finalModeId);
++    bool mrsnoSubModeChanged = (finalModeId == SWL_SECURITY_APMODE_WPA3_P_CM) &&
++                               (mrsnoSubMode != pAP->mrsnoSubMode);
++    if((finalModeId == pAP->secModeEnabled) && !mrsnoSubModeChanged) {
++        SAH_TRACEZ_INFO(ME, "%s: Security mode %d and MRSNO sub-mode %d unchanged",
++                        pAP->alias, finalModeId, mrsnoSubMode);
++        SAH_TRACEZ_OUT(ME);
++        return;
++    }
+     pAP->secModeEnabled = finalModeId;
+-
+-    SAH_TRACEZ_INFO(ME, "%s: Security Mode Enable %s %d", pAP->alias, finalModeStr, finalModeId);
++    if(finalModeId == SWL_SECURITY_APMODE_WPA3_P_CM) {
++        pAP->mrsnoSubMode = mrsnoSubMode;
++    }
++    SAH_TRACEZ_INFO(ME, "%s: Security Mode Enable %s %d (mrsnoSubMode=%d)",
++                    pAP->alias, finalModeStr, finalModeId, pAP->mrsnoSubMode);
+     wld_ap_sec_doSync(pAP);
+     if(pAP->pSSID) {
+         wld_mld_setLinkConfigured(pAP->pSSID->pMldLink, false);
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -1313,17 +1313,23 @@
+             swl_mapCharFmt_addValInt32(vapConfigMap, "ieee80211w", SWL_SECURITY_MFPMODE_REQUIRED);
+         }
+ 
+-        if(!is6g) { /* AKM:8 for RSNO1; not advertised on 6GHz */
++        bool applyRsno1 = !is6g && (pAP->mrsnoSubMode != WLD_MRSNO_SUBMODE_COM_24);
++        bool applyRsno2 = enableVap11be &&
++                          ((!is6g && pAP->mrsnoSubMode != WLD_MRSNO_SUBMODE_COM_8) ||
++                           (is6g && pAP->mrsnoSubMode == WLD_MRSNO_SUBMODE_COM_8_24));
++
++        if(applyRsno1) {
+             s_checkAndSetParamValueStr(pAP->wpaCtrlInterface, vapConfigMap, "rsn_override_key_mgmt", "SAE");
+             s_checkAndSetParamValueStr(pAP->wpaCtrlInterface, vapConfigMap, "rsn_override_pairwise", "CCMP");
+             s_checkAndSetParamValueInt32(pAP->wpaCtrlInterface, vapConfigMap, "rsn_override_mfp", SWL_SECURITY_MFPMODE_REQUIRED);
+         }
+-        if(enableVap11be) { /* AKM:24 for RSNO2 on all bands */
++        if(applyRsno2) {
+             s_checkAndSetParamValueStr(pAP->wpaCtrlInterface, vapConfigMap, "rsn_override_key_mgmt_2", "SAE-EXT-KEY");
+             s_checkAndSetParamValueStr(pAP->wpaCtrlInterface, vapConfigMap, "rsn_override_pairwise_2", "GCMP-256");
+             s_checkAndSetParamValueInt32(pAP->wpaCtrlInterface, vapConfigMap, "rsn_override_mfp_2", SWL_SECURITY_MFPMODE_REQUIRED);
+         }
+-        if(!is6g) { /* The RSNXE is not advertised in the 2.4 and 5 GHz bands, replaced by RSNXE Override element */
++        /* rsn_override_omit_rsnxe: suppress RSNXE on 2.4/5 GHz whenever any RSN override is active */
++        if(!is6g && (applyRsno1 || applyRsno2)) {
+             s_checkAndSetParamValueInt32(pAP->wpaCtrlInterface, vapConfigMap, "rsn_override_omit_rsnxe", true);
+         }
+ 
+--- a/src/wld_accesspoint.c
++++ b/src/wld_accesspoint.c
+@@ -851,6 +851,20 @@
+ }
+ 
+ 
++static const char* s_getModeEnabledStr(const T_AccessPoint* pAP) {
++    if(pAP->secModeEnabled == SWL_SECURITY_APMODE_WPA3_P_CM) {
++        switch(pAP->mrsnoSubMode) {
++        case WLD_MRSNO_SUBMODE_COM_8:
++            return "WPA3-Personal-Compatibility-8";
++        case WLD_MRSNO_SUBMODE_COM_24:
++            return "WPA3-Personal-Compatibility-24";
++        default: /* WLD_MRSNO_SUBMODE_COM_8_24 falls through to base string */
++            break;
++        }
++    }
++    return swl_security_apModeToString(pAP->secModeEnabled, SWL_SECURITY_APMODEFMT_LEGACY);
++}
++
+ void SyncData_AP2OBJ(amxd_object_t* object, T_AccessPoint* pAP, int set) {
+     char TBuf[256];
+     amxc_var_t variant;
+@@ -937,12 +951,26 @@
+ 
+         amxd_trans_select_object(&trans, secObj);
+ 
+-        swl_security_apModeMaskToString(TBuf, sizeof(TBuf), SWL_SECURITY_APMODEFMT_LEGACY, pAP->secModesSupported);
+-        amxd_trans_set_csv_string_t(&trans, "ModesSupported", TBuf);
++        char modesSupportedBuf[512] = {0};
++        swl_security_apModeMaskToString(modesSupportedBuf, sizeof(modesSupportedBuf),
++                                        SWL_SECURITY_APMODEFMT_LEGACY, pAP->secModesSupported);
++        if(pAP->secModesSupported & M_SWL_SECURITY_APMODE_WPA3_P_CM) {
++            size_t msBufLen = strlen(modesSupportedBuf);
++            snprintf(modesSupportedBuf + msBufLen, sizeof(modesSupportedBuf) - msBufLen,
++                     ",WPA3-Personal-Compatibility-8,WPA3-Personal-Compatibility-24");
++        }
++        amxd_trans_set_csv_string_t(&trans, "ModesSupported", modesSupportedBuf);
+ 
+-        swl_security_apModeMaskToString(TBuf, sizeof(TBuf), SWL_SECURITY_APMODEFMT_LEGACY, pAP->secModesAvailable);
+-        amxd_trans_set_cstring_t(&trans, "ModesAvailable", TBuf);
+-        amxd_trans_set_cstring_t(&trans, "ModeEnabled", swl_security_apModeToString(pAP->secModeEnabled, SWL_SECURITY_APMODEFMT_LEGACY));
++        char modesAvailableBuf[512] = {0};
++        swl_security_apModeMaskToString(modesAvailableBuf, sizeof(modesAvailableBuf),
++                                        SWL_SECURITY_APMODEFMT_LEGACY, pAP->secModesAvailable);
++        if(pAP->secModesAvailable & M_SWL_SECURITY_APMODE_WPA3_P_CM) {
++            size_t maBufLen = strlen(modesAvailableBuf);
++            snprintf(modesAvailableBuf + maBufLen, sizeof(modesAvailableBuf) - maBufLen,
++                     ",WPA3-Personal-Compatibility-8,WPA3-Personal-Compatibility-24");
++        }
++        amxd_trans_set_cstring_t(&trans, "ModesAvailable", modesAvailableBuf);
++        amxd_trans_set_cstring_t(&trans, "ModeEnabled", s_getModeEnabledStr(pAP));
+         amxd_trans_set_cstring_t(&trans, "MFPConfig", swl_security_mfpModeToString(pAP->mfpConfig));
+         amxd_trans_set_int32_t(&trans, "SPPAmsdu", pAP->sppAmsdu);
+ 
+--- a/src/Plugin/wifiGen_fsm.c
++++ b/src/Plugin/wifiGen_fsm.c
+@@ -1360,7 +1360,7 @@
+     wld_secDmn_action_rc_ne rc = wld_ap_hostapd_setSecParams(pAP);
+     ASSERT_FALSE(rc < SECDMN_ACTION_OK_DONE, true, ME, "%s: fail to set secret key", pAP->alias);
+     // Force RELOAD_SECKEY for security changes to avoid warm apply issue on RE_ADD_LINK/RE_ADD operations
+-    if(rc > SECDMN_ACTION_OK_DONE) {
++    if(rc > SECDMN_ACTION_OK_DONE && pAP->secModeEnabled != SWL_SECURITY_APMODE_WPA3_P_CM) {
+         SAH_TRACEZ_WARNING(ME, "Forcing security change to use RELOAD_SECKEY (was action=%d) - AP=%s", rc, pAP->alias);
+         rc = SECDMN_ACTION_OK_NEED_RELOAD_SECKEY;
+     }
