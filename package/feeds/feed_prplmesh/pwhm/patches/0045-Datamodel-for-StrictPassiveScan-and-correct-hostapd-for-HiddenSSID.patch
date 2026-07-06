@@ -1,0 +1,142 @@
+From fb2a29fb2acad8bc6b687d35427c22bdc9fda6e4 Mon Sep 17 00:00:00 2001
+From: rayakuma <rayakuma@qti.qualcomm.com>
+Date: Mon, 6 Jul 2026 19:55:08 +0530
+Subject: [PATCH] Datamodel for StrictPassiveScan and correct hostapd value for
+ ignore_broadcast_ssid
+Signed-off-by: Rohith Kumar <rayakuma@qti.qualcomm.com>
+
+Change-Id: If832bae7f19b1486d18213ad93a67cc8889932c2
+---
+ .../pwhm-v7.27.5/odl/wld_radio.odl            | 11 ++++
+ .../src/nl80211/wld_hostapd_ap_api.c          |  2 +-
+ .../src/nl80211/wld_hostapd_cfgFile.c         |  2 +-
+ .../pwhm-v7.27.5/src/wld_radio.c              | 58 +++++++++++++++++++
+ 4 files changed, 71 insertions(+), 2 deletions(-)
+
+diff --git a/odl/wld_radio.odl b/odl/wld_radio.odl
+index 210dbc154e..cc60c92e65 100644
+--- a/odl/wld_radio.odl
++++ b/odl/wld_radio.odl
+@@ -3878,6 +3878,17 @@ define probelist_t{
+                         default false;
+                 }
+ 
++                /**
++                 * Enable strict passive scan on PCH (Primary Channel) channels.
++                 * When enabled, the radio performs passive-only scans on PCH channels.
++                 * Sent to driver via:
++                 *   cfg80211tool <phy> radio_idx <idx> wifi_params 81 <0|1>
++                 * param 81 = QCA_WLAN_VENDOR_RADIO_PARAM_SCAN_STRICT_PASSIVE_PCH
++                 */
++                %persistent bool StrictPassiveScan {
++                        default false;
++                }
++
+ 		/**
+ 		 * Static puncturing feature
+ 		 */
+diff --git a/src/nl80211/wld_hostapd_ap_api.c b/src/nl80211/wld_hostapd_ap_api.c
+index 89dc964207..9122bd2630 100644
+--- a/src/nl80211/wld_hostapd_ap_api.c
++++ b/src/nl80211/wld_hostapd_ap_api.c
+@@ -734,7 +734,7 @@ wld_secDmn_action_rc_ne wld_ap_hostapd_setSSIDAdvertisement(T_AccessPoint* pAP,
+     ASSERTI_TRUE(ret, SECDMN_ACTION_ERROR, ME, "no saved config");
+     swl_mapChar_t* pCurrVapParams = wld_hostapd_getConfigMapByBssid(config, (swl_macBin_t*) pAP->pSSID->BSSID);
+     wld_secDmn_action_rc_ne action = SECDMN_ACTION_OK_DONE;
+-    s_setChangedParam(pAP, pCurrVapParams, "ignore_broadcast_ssid", (enable ? "0" : "2"), &action);
++    s_setChangedParam(pAP, pCurrVapParams, "ignore_broadcast_ssid", (enable ? "0" : "1"), &action);
+     wld_hostapd_deleteConfig(config);
+     return action;
+ }
+diff --git a/src/nl80211/wld_hostapd_cfgFile.c b/src/nl80211/wld_hostapd_cfgFile.c
+index 02dce66a9e..33c224214a 100644
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -1176,7 +1176,7 @@ static bool s_setVapCommonConfig(T_AccessPoint* pAP, swl_mapChar_t* vapConfigMap
+          }
+     }
+ 
+-    swl_mapChar_add(vapConfigMap, "ignore_broadcast_ssid", pAP->SSIDAdvertisementEnabled ? "0" : "2");
++    swl_mapChar_add(vapConfigMap, "ignore_broadcast_ssid", pAP->SSIDAdvertisementEnabled ? "0" : "1");
+     if(!wld_ap_hasStackEnabled(pAP)) {
+         swl_mapChar_add(vapConfigMap, "start_disabled", "1");
+     }
+diff --git a/src/wld_radio.c b/src/wld_radio.c
+index 99c464fa8a..593653e0b7 100644
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -6376,6 +6376,63 @@ static void s_setAllowScanDfsChan_pwf(void* priv _UNUSED, amxd_object_t* object,
+     SAH_TRACEZ_OUT(ME);
+ }
+ 
++/**
++ * @brief Write handler for Radio.{i}.StrictPassiveScan
++ *
++ * Enables or disables strict passive scan on PCH (Primary Channel) channels.
++ * Uses cfg80211tool directly (not NL80211 vendor command):
++ *   cfg80211tool <phy> radio_idx <idx> wifi_params 81 <0|1>
++ *   param 81 = QCA_WLAN_VENDOR_RADIO_PARAM_SCAN_STRICT_PASSIVE_PCH
++ *
++ * Test:  ubus-cli Device.WiFi.Radio.1.StrictPassiveScan=1
++ */
++static void s_setStrictPassiveScan_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_Radio* pRad = wld_rad_fromObj(object);
++    ASSERTS_NOT_NULL(pRad, , ME, "NULL");
++
++    bool enable = amxc_var_dyncast(bool, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set StrictPassiveScan %d", pRad->Name, enable);
++
++    /* Resolve phy name (e.g. "phy0") from wlan interface name */
++    char phyName[IFNAMSIZ] = {0};
++    s_get_phy_name(pRad->wiphyName, phyName, sizeof(phyName));
++
++    /* Derive radio_idx from frequency band: 0=2.4GHz, 1=5GHz, 2=6GHz */
++    uint32_t radio_idx = s_band_to_radio_idx(pRad->operatingFrequencyBand);
++
++    /* Build cfg80211tool command:
++     *   cfg80211tool <phy> radio_idx <idx> wifi_params 81 <0|1>
++     *   param 81 = QCA_WLAN_VENDOR_RADIO_PARAM_SCAN_STRICT_PASSIVE_PCH
++     */
++    char cmd[256] = {0};
++    char out[256] = {0};
++    snprintf(cmd, sizeof(cmd),
++             "cfg80211tool %s radio_idx %u strict_passive_scan %u 2>&1",
++             phyName, radio_idx, enable ? 1u : 0u);
++
++    SAH_TRACEZ_INFO(ME, "%s: StrictPassiveScan cmd='%s'", pRad->Name, cmd);
++
++    swl_rc_ne rc = s_cfg80211tool_run(cmd, out, sizeof(out));
++
++    /* Strip trailing newline for clean logging */
++    size_t outLen = strlen(out);
++    while(outLen > 0 && (out[outLen - 1] == '\n' || out[outLen - 1] == '\r')) {
++        out[--outLen] = '\0';
++    }
++
++    if(rc != SWL_RC_OK) {
++        SAH_TRACEZ_ERROR(ME, "%s: StrictPassiveScan cfg80211tool FAILED rc=%d cmd='%s' out='%s'",
++                         pRad->Name, rc, cmd, out);
++    } else {
++        SAH_TRACEZ_INFO(ME, "%s: StrictPassiveScan cfg80211tool SUCCESS enable=%d out='%s'",
++                        pRad->Name, enable, out);
++    }
++
++    SAH_TRACEZ_OUT(ME);
++}
++
+ /**
+  * @brief Write handler for Radio.{i}.PowerSaveEnable
+  *
+@@ -6463,6 +6520,7 @@ SWLA_DM_HDLRS(sRadioDmHdlrs,
+                   SWLA_DM_PARAM_HDLR("AntennaGain2G", s_setAntennaGain2G_pwf),
+                   SWLA_DM_PARAM_HDLR("AntennaGain5G", s_setAntennaGain5G_pwf),
+                   SWLA_DM_PARAM_HDLR("PowerSaveEnable", s_setPowerSaveEnable_pwf),
++                  SWLA_DM_PARAM_HDLR("StrictPassiveScan", s_setStrictPassiveScan_pwf),
+                   ),
+               .instAddedCb = s_addInstance_oaf);
+ 
+-- 
+2.34.1
+
