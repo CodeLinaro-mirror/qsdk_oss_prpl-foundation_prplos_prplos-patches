@@ -1,0 +1,37 @@
+From ce398c1088541c63dd032365a31fbbbd23935994 Mon Sep 17 00:00:00 2001
+From: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+Date: Tue, 7 Jul 2026 13:23:08 +0530
+Subject: [PATCH] Fix duplicate bssid in rrm beacontable
+
+Signed-off-by: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+---
+
+diff --git a/src/ApMgt/wld_ap_rrm.c b/src/ApMgt/wld_ap_rrm.c
+index 72499ab..1fac043 100644
+--- a/src/ApMgt/wld_ap_rrm.c
++++ b/src/ApMgt/wld_ap_rrm.c
+@@ -115,7 +115,23 @@ void wld_ap_rrm_item(T_AccessPoint* ap, const swl_macChar_t* mac, amxc_var_t* re
+         rrm_wait_t* wait = amxc_llist_it_get_data(it, rrm_wait_t, it);
+         if((wait->ap == ap) && swl_mac_charMatches(mac, &wait->mac)) {
+             if(result) {
+-                amxc_var_add(amxc_htable_t, wait->result_list, amxc_var_get_amxc_htable_t(result));
++                const char* new_bssid = GET_CHAR(result, "BSSID");
++                bool is_duplicate = false;
++
++                if(new_bssid) {
++                    amxc_var_for_each(entry, wait->result_list) {
++                        const char* existing_bssid = GET_CHAR(entry, "BSSID");
++                        if(existing_bssid && (strcmp(existing_bssid, new_bssid) == 0)) {
++                            is_duplicate = true;
++                            SAH_TRACEZ_WARNING(ME, "Skipping duplicate BSSID: %s", new_bssid);
++                            break;
++                        }
++                    }
++                }
++
++                if(!is_duplicate) {
++                    amxc_var_add(amxc_htable_t, wait->result_list, amxc_var_get_amxc_htable_t(result));
++                }
+                 amxp_timer_start(wait->timer, 300);
+                 return;
+             } else {
