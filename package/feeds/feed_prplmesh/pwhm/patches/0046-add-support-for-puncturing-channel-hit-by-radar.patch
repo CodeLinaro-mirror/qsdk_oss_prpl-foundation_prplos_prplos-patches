@@ -1,0 +1,445 @@
+From 6be7c63c2a9d7cf0cfba3eee2795648c441fc92b Mon Sep 17 00:00:00 2001
+From: Atchaya R <ratchaya@qti.qualcomm.com>
+Date: Tue, 7 Jul 2026 15:40:17 +0530
+Subject: [PATCH] pwhm: add support for puncturing the channel hit by radar
+
+Instead of switching the channel when radar is hit, puncture the channel
+that is affected by radar and transmit in the channels unaffected in the
+bandwidth
+
+Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
+---
+ include/wld/wld.h                  |   1 +
+ include/wld/wld_radio.h            |  28 ++++++
+ odl/wld_radio.odl                  |  13 +++
+ src/Plugin/wifiGen_eventHandlers.c | 102 +++++++++++++++++++++-
+ src/nl80211/wld_hostapd_cfgFile.c  |  13 +++
+ src/nl80211/wld_wpaCtrl_events.c   |  22 ++++-
+ src/wld_radio.c                    | 136 ++++++++++++++++++++++++++++-
+ 7 files changed, 309 insertions(+), 6 deletions(-)
+
+diff --git a/include/wld/wld.h b/include/wld/wld.h
+index 8238bc6..bdc87f9 100644
+--- a/include/wld/wld.h
++++ b/include/wld/wld.h
+@@ -1742,6 +1742,7 @@ struct WLD_RADIO {
+     uint32_t nrDisabledSubChannels;                         /* Nr of disabled sub channels */
+     uint8_t mLReconfigurationCount;                         /** Number of beacons with ML Reconfiguration IE before link removal */
+     bool discardAwgnEvent;                                  /* When true, add discard_6g_awgn_event=1 to hostapd config (6GHz only) */
++    bool useRuPunctureDfs;                                  /* When true, add use_ru_puncture_dfs=1 to hostapd config (11be only) */
+ };
+ 
+ typedef struct {
+diff --git a/include/wld/wld_radio.h b/include/wld/wld_radio.h
+index c55a40a..14a37ce 100644
+--- a/include/wld/wld_radio.h
++++ b/include/wld/wld_radio.h
+@@ -340,6 +340,34 @@ T_Radio* wld_rad_fromIt(amxc_llist_it_t* it);
+ void wld_rad_triggerChangeEvent(T_Radio* pRad, wld_rad_changeEvent_e event, void* data);
+ void wld_rad_triggerFrameEvent(T_Radio* pRad, swl_bit8_t* frame, size_t frameLen, int32_t rssi);
+ 
++/**
++ * @brief Update DisabledSubChannels from a puncturing bitmap.
++ *
++ * Called from s_chanSwitchCb when UseRuPunctureDfs is enabled and the
++ * puncturing bitmap changes on the same channel.  Handles both directions:
++ *   - Bitmap increases (radar punctured a sub-channel)
++ *   - Bitmap decreases or clears (NOP finished, hostapd auto-unpunctured)
++ *
++ * Updates the internal disabledSubchannels[] array FIRST to prevent the
++ * write handler from triggering a channel reconfiguration.
++ *
++ * @param pRad      radio context
++ * @param pChanSpec chanspec carrying the new punctBitmap
++ */
++void wld_rad_updateDisabledSubChannelsFromPunctBitmap(T_Radio* pRad, swl_chanspec_t* pChanSpec);
++
++/**
++ * @brief Add a single 20MHz sub-channel to the DisabledSubChannels list.
++ *
++ * Called from s_dfsRadarDetectedCb when UseRuPunctureDfs is enabled.
++ * Updates the internal array first, then commits to the data model via
++ * transaction to prevent a re-entrant s_setChannelSpec call.
++ *
++ * @param pRad    radio context
++ * @param channel 20MHz sub-channel number hit by radar
++ */
++void wld_rad_addDisabledSubChannel(T_Radio* pRad, swl_channel_t channel);
++
+ /**
+  * @brief validate puncturing channels array
+  * based on reference punct bitmaps and radio's capabilities
+diff --git a/odl/wld_radio.odl b/odl/wld_radio.odl
+index 210dbc1..653b55e 100644
+--- a/odl/wld_radio.odl
++++ b/odl/wld_radio.odl
+@@ -3890,6 +3890,19 @@ define probelist_t{
+ 			%persistent csv_string DisabledSubChannels{
+ 				on action validate call wld_rad_validateDisabledSubChannels_pvf;
+ 			}
++
++			/**
++			 * When enabled, on radar detection hostapd punctures only the
++			 * affected sub-channel(s) and keeps the radio operating on the
++			 * remaining sub-channels instead of performing a full channel switch.
++			 * Falls back to a full channel switch if the resulting puncturing
++			 * pattern is unusable (too many sub-channels affected).
++			 * Requires IEEE 802.11be (Wi-Fi 7) support.
++			 * Corresponds to hostapd config option: use_ru_puncture_dfs
++			 */
++			%persistent bool UseRuPunctureDfs {
++				default false;
++			}
+ 		}
+ 
+ 		/**
+diff --git a/src/Plugin/wifiGen_eventHandlers.c b/src/Plugin/wifiGen_eventHandlers.c
+index df3a04c..e8f03c5 100644
+--- a/src/Plugin/wifiGen_eventHandlers.c
++++ b/src/Plugin/wifiGen_eventHandlers.c
+@@ -332,6 +332,23 @@ static void s_chanSwitchCb(void* userData, char* ifName _UNUSED, swl_chanspec_t*
+         pRad->obssCoexistenceActive = true;
+     }
+ 
++    /*
++     * When UseRuPunctureDfs is enabled, track puncturing bitmap changes to keep
++     * DisabledSubChannels in sync with the driver state.  Must be done BEFORE
++     * s_saveChanChanged() updates the current chanspec (which would overwrite
++     * the old punctBitmap we compare against).
++     *
++     * Two cases handled:
++     *   - Radar punctures a sub-channel: bitmap increases → DisabledSubChannels updated
++     *   - NOP finishes, hostapd auto-unpunctures: bitmap clears → DisabledSubChannels cleared
++     */
++    if(pRad->useRuPunctureDfs &&
++       (chanSpec->punctBitmap != wld_chanmgt_getCurChspec(pRad).punctBitmap)) {
++        SAH_TRACEZ_INFO(ME, "%s: UseRuPunctureDfs: punctBitmap changed 0x%x->0x%x, updating DisabledSubChannels",
++                        pRad->Name, wld_chanmgt_getCurChspec(pRad).punctBitmap, chanSpec->punctBitmap);
++        wld_rad_updateDisabledSubChannelsFromPunctBitmap(pRad, chanSpec);
++    }
++
+     wld_channelChangeReason_e reason = pRad->targetChanspec.reason;
+     T_EndPoint* pEP = wld_vep_from_name(ifName);
+     if(pEP != NULL) {
+@@ -462,6 +479,35 @@ static void s_dfsCacStartedCb(void* userData, char* ifName, swl_chanspec_t* chan
+     SAH_TRACEZ_WARNING(ME, "%s: CAC started on channel %d for %d sec", ifName, chanSpec->channel, cac_time);
+     T_Radio* pRad = (T_Radio*) userData;
+     ASSERT_NOT_NULL(pRad, , ME, "NULL");
++
++    /*
++     * When UseRuPunctureDfs is enabled, hostapd may send DFS-CAC-START in two
++     * distinct situations:
++     *
++     * 1. Radar detected on current operating channel: hostapd starts a brief
++     *    internal CAC before aborting it and puncturing the sub-channel.
++     *    In this case the CAC channel IS the current operating channel.
++     *    → Skip: pwhm must NOT transition to FG_CAC; hostapd manages internally.
++     *
++     * 2. Moving to a new DFS channel (non-DFS→DFS, bandwidth increase, etc.):
++     *    The CAC channel is DIFFERENT from the current operating channel.
++     *    → Proceed: normal CAC must run so the new channel is properly cleared.
++     *
++     * Use swl_channel_isInChanspec() to distinguish the two cases.
++     */
++    if(pRad->useRuPunctureDfs) {
++        swl_chanspec_t curChspec = wld_chanmgt_getCurChspec(pRad);
++        if(swl_channel_isInChanspec(&curChspec, chanSpec->channel)) {
++            SAH_TRACEZ_INFO(ME, "%s: UseRuPunctureDfs enabled - ignoring radar-triggered DFS-CAC-START "
++                            "on current channel %d (hostapd will abort CAC and puncture sub-channel)",
++                            ifName, chanSpec->channel);
++            return;
++        }
++        SAH_TRACEZ_INFO(ME, "%s: UseRuPunctureDfs enabled but CAC channel %d != current channel %d "
++                        "- proceeding with normal CAC (non-DFS→DFS or BW increase)",
++                        ifName, chanSpec->channel, curChspec.channel);
++    }
++
+     wld_channelChangeReason_e reason = pRad->targetChanspec.reason;
+     if(wld_channel_is_radar_detected(pRad->currentChanspec.chanspec)) {
+         reason = CHAN_REASON_DFS;
+@@ -515,13 +561,65 @@ static void s_dfsCacExpiredCb(void* userData, char* ifName, swl_chanspec_t* chan
+ }
+ 
+ static void s_dfsRadarDetectedCb(void* userData, char* ifName, swl_chanspec_t* chanSpec) {
+-    SAH_TRACEZ_WARNING(ME, "%s: DFS Radar detected on channel %d bw %d", ifName, chanSpec->channel, chanSpec->bandwidth);
++    SAH_TRACEZ_WARNING(ME, "%s: DFS Radar detected on channel %d bw %d radar_bitmap=0x%x",
++                       ifName, chanSpec->channel, chanSpec->bandwidth, chanSpec->punctBitmap);
+     T_Radio* pRad = (T_Radio*) userData;
+     ASSERT_NOT_NULL(pRad, , ME, "NULL");
+-    wld_channel_mark_radar_detected_band(*chanSpec);
++
++    /*
++     * Mark radar-detected channels using NL80211_ATTR_RADAR_BITMAP when available.
++     * The bitmap (stored in chanSpec->punctBitmap by s_radDfsRadarDetectedEvt) indicates
++     * which specific 20MHz sub-channel(s) were hit by radar:
++     *   - Bit 0 = lowest sub-channel (e.g. ch100 in 80MHz block 100-112)
++     *   - Bit 1 = next sub-channel (e.g. ch104)
++     *   - etc.
++     * When the bitmap is available, mark only the specific sub-channel(s) so that
++     * RadarTriggeredDfsChannels shows "104" instead of "100,104,108,112".
++     * Fall back to marking the entire band when no bitmap is provided (legacy drivers).
++     */
++    if(chanSpec->punctBitmap > 0) {
++        swl_channel_t chanList[SWL_BW_CHANNELS_MAX] = {0};
++        int nChans = swl_chanspec_getChannelsInChanspec(chanSpec, chanList, SWL_BW_CHANNELS_MAX);
++        bool markedAny = false;
++        for(int i = 0; i < nChans; i++) {
++            if(chanSpec->punctBitmap & (1u << i)) {
++                swl_chanspec_t subChanSpec = SWL_CHANSPEC_NEW(chanList[i], SWL_BW_20MHZ, chanSpec->band);
++                wld_channel_mark_radar_detected_channel(subChanSpec);
++                SAH_TRACEZ_INFO(ME, "%s: radar_bitmap: marking sub-channel %d as radar-detected",
++                                ifName, chanList[i]);
++                markedAny = true;
++            }
++        }
++        if(!markedAny) {
++            /* Bitmap was non-zero but no channels matched — fall back to band marking */
++            wld_channel_mark_radar_detected_band(*chanSpec);
++        }
++    } else {
++        /* No bitmap from driver — mark entire band (legacy behavior) */
++        wld_channel_mark_radar_detected_band(*chanSpec);
++    }
++
+     if(wld_bgdfs_isRunning(pRad)) {
+         wld_bgdfs_notifyClearEnded(pRad, DFS_RESULT_RADAR);
+     }
++
++    if(pRad->useRuPunctureDfs) {
++        /*
++         * When UseRuPunctureDfs is enabled, hostapd handles the radar by puncturing
++         * only the affected sub-channel and keeping the radio on the same channel.
++         * Skip wld_rad_updateState to prevent pwhm from triggering a foreground CAC
++         * (FG_CAC) or channel switch — hostapd manages the channel internally.
++         * Update DisabledSubChannels to reflect the newly punctured sub-channel.
++         * chanSpec->channel is the radar-affected 20MHz sub-channel derived from
++         * the DFS-RADAR-DETECTED freq= parameter.
++         */
++        SAH_TRACEZ_INFO(ME, "%s: UseRuPunctureDfs: radar on sub-channel %d, updating DisabledSubChannels",
++                        ifName, chanSpec->channel);
++        wld_rad_addDisabledSubChannel(pRad, chanSpec->channel);
++        wld_chanmgt_writeDfsChannels(pRad);
++        return;
++    }
++
+     wld_rad_updateState(pRad, false);
+     wld_chanmgt_writeDfsChannels(pRad);
+ }
+diff --git a/src/nl80211/wld_hostapd_cfgFile.c b/src/nl80211/wld_hostapd_cfgFile.c
+index 02dce66..6c6fb3d 100644
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -625,6 +625,19 @@ void wld_hostapd_cfgFile_setRadioConfig(T_Radio* pRad, swl_mapChar_t* radConfigM
+         if(tgtChspec.punctBitmap > 0) {
+             swl_mapCharFmt_addValInt32(radConfigMap, "punct_bitmap", tgtChspec.punctBitmap);
+         }
++
++        /*
++         * use_ru_puncture_dfs: when enabled, on radar detection hostapd punctures
++         * only the affected sub-channel(s) and keeps the radio operating on the
++         * remaining sub-channels instead of performing a full channel switch.
++         * Falls back to a full channel switch if the resulting puncturing pattern
++         * is unusable (too many sub-channels affected).
++         * Corresponds to WiFi.Radio.{i}.StaticPuncturing.UseRuPunctureDfs
++         */
++        if(pRad->useRuPunctureDfs) {
++            SAH_TRACEZ_INFO(ME, "%s: Adding use_ru_puncture_dfs=1 to hostapd config", pRad->Name);
++            swl_mapCharFmt_addValInt32(radConfigMap, "use_ru_puncture_dfs", 1);
++        }
+     }
+ 
+     int32_t rtsThreshold = -1;
+diff --git a/src/nl80211/wld_wpaCtrl_events.c b/src/nl80211/wld_wpaCtrl_events.c
+index eb46daa..9d9b98d 100644
+--- a/src/nl80211/wld_wpaCtrl_events.c
++++ b/src/nl80211/wld_wpaCtrl_events.c
+@@ -638,12 +638,28 @@ static void s_radDfsCacExpiredEvt(wld_wpaCtrlInterface_t* pInterface, char* even
+     CALL_MGR_I(pInterface, fDfsCacExpiredCb, &chanSpec);
+ }
+ static void s_radDfsRadarDetectedEvt(wld_wpaCtrlInterface_t* pInterface, char* event _UNUSED, char* params) {
+-    // Example: DFS-RADAR-DETECTED freq=5540 ht_enabled=0 chan_offset=0 chan_width=3 cf1=5530 cf2=0
++    // Example: DFS-RADAR-DETECTED freq=5540 ht_enabled=0 chan_offset=0 chan_width=3 cf1=5530 cf2=0 radar_bitmap:2
++    // Note: radar_bitmap uses ':' separator (not '='), provided by NL80211_ATTR_RADAR_BITMAP
+     swl_chanspec_t chanSpec = SWL_CHANSPEC_EMPTY;
+     ASSERT_FALSE(s_freqParamToChanSpec(params, "freq", &chanSpec) < SWL_RC_OK, , ME, "fail to get freq");
+     s_chWidthIdToChanSpec(params, "chan_width", &chanSpec);
+-    SAH_TRACEZ_INFO(ME, "%s: DFS radar detected on channel=%d width=%d band=%d",
+-                    pInterface->name, chanSpec.channel, chanSpec.bandwidth, chanSpec.band);
++
++    /* Parse radar_bitmap if present — indicates which 20MHz sub-channel(s) were hit.
++     * Stored in chanSpec.punctBitmap so s_dfsRadarDetectedCb can mark only the
++     * specific sub-channel(s) instead of the entire band. */
++    char* radarBitmapStr = strstr(params, "radar_bitmap:");
++    if(radarBitmapStr != NULL) {
++        int radarBitmap = 0;
++        if(sscanf(radarBitmapStr, "radar_bitmap:%d", &radarBitmap) == 1 && radarBitmap > 0) {
++            chanSpec.punctBitmap = (uint16_t) radarBitmap;
++            SAH_TRACEZ_INFO(ME, "%s: DFS radar detected on channel=%d width=%d band=%d radar_bitmap=0x%x",
++                            pInterface->name, chanSpec.channel, chanSpec.bandwidth, chanSpec.band, chanSpec.punctBitmap);
++        }
++    } else {
++        SAH_TRACEZ_INFO(ME, "%s: DFS radar detected on channel=%d width=%d band=%d",
++                        pInterface->name, chanSpec.channel, chanSpec.bandwidth, chanSpec.band);
++    }
++
+     CALL_MGR_I(pInterface, fDfsRadarDetectedCb, &chanSpec);
+ }
+ static void s_radDfsNopFinishedEvt(wld_wpaCtrlInterface_t* pInterface, char* event _UNUSED, char* params) {
+diff --git a/src/wld_radio.c b/src/wld_radio.c
+index 6735292..7edcd1a 100644
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -6764,6 +6764,111 @@ static void s_saveDisabledSubChannels(T_Radio* pRad, swl_channel_t* pPunctChans,
+     }
+ }
+ 
++/**
++ * @brief Add a single sub-channel to the DisabledSubChannels list (radar puncturing path).
++ *
++ * Called from s_dfsRadarDetectedCb when UseRuPunctureDfs is enabled.
++ * Updates the internal pRad->disabledSubchannels[] array FIRST, then commits
++ * the new value to the DisabledSubChannels data model parameter via transaction.
++ *
++ * Updating the internal array before the transaction prevents a re-entrant
++ * call to s_setChannelSpec from s_setDisabledSubChannels_pwf:
++ * s_getNewDisabledSubChannels() will see no change and skip the channel
++ * reconfiguration.
++ *
++ * @param pRad  radio context
++ * @param channel  20MHz sub-channel number that was hit by radar
++ */
++/**
++ * @brief Update DisabledSubChannels from a puncturing bitmap (NOP-finished path).
++ *
++ * Called from s_chanSwitchCb when UseRuPunctureDfs is enabled and the
++ * puncturing bitmap changes on the same channel.  Handles both directions:
++ *   - Bitmap increases (radar punctured a sub-channel)
++ *   - Bitmap decreases or clears (NOP finished, hostapd auto-unpunctured)
++ *
++ * Updates the internal disabledSubchannels[] array FIRST to prevent the
++ * write handler from triggering a channel reconfiguration.
++ *
++ * @param pRad      radio context
++ * @param pChanSpec chanspec carrying the new punctBitmap
++ */
++void wld_rad_updateDisabledSubChannelsFromPunctBitmap(T_Radio* pRad, swl_chanspec_t* pChanSpec) {
++    ASSERTS_NOT_NULL(pRad, , ME, "NULL");
++    ASSERTS_NOT_NULL(pChanSpec, , ME, "NULL");
++    ASSERTS_NOT_NULL(pRad->pBus, , ME, "NULL");
++
++    /* Convert punctBitmap to list of disabled sub-channels */
++    swl_channel_t chanList[SWL_BW_CHANNELS_MAX] = {0};
++    int nChans = swl_chanspec_getChannelsInChanspec(pChanSpec, chanList, SWL_BW_CHANNELS_MAX);
++    swl_channel_t newPunctChans[SWL_BW_CHANNELS_MAX] = {0};
++    size_t nNewPunctChans = 0;
++    for(int i = 0; i < nChans; i++) {
++        if(pChanSpec->punctBitmap & (1u << i)) {
++            newPunctChans[nNewPunctChans++] = chanList[i];
++        }
++    }
++
++    /* No-op if value hasn't changed */
++    if((nNewPunctChans == pRad->nrDisabledSubChannels) &&
++       swl_typeUInt8_arrayMatches(pRad->disabledSubchannels, pRad->nrDisabledSubChannels,
++                                   newPunctChans, nNewPunctChans)) {
++        SAH_TRACEZ_INFO(ME, "%s: DisabledSubChannels unchanged from punctBitmap 0x%x",
++                        pRad->Name, pChanSpec->punctBitmap);
++        return;
++    }
++
++    /* Update internal state FIRST (prevents re-entrant s_setChannelSpec call) */
++    s_saveDisabledSubChannels(pRad, newPunctChans, nNewPunctChans);
++
++    /* Build comma-separated string for data model */
++    char disabledStr[256] = {0};
++    swl_typeUInt8_arrayToChar(disabledStr, sizeof(disabledStr), newPunctChans, nNewPunctChans);
++    SAH_TRACEZ_INFO(ME, "%s: UseRuPunctureDfs: updating DisabledSubChannels to (%s) from punctBitmap 0x%x",
++                    pRad->Name, disabledStr, pChanSpec->punctBitmap);
++
++    /* Commit to data model via transaction */
++    amxd_object_t* staticPuncObj = amxd_object_get(pRad->pBus, "StaticPuncturing");
++    if(staticPuncObj != NULL) {
++        amxd_trans_t trans;
++        ASSERT_TRANSACTION_INIT(staticPuncObj, &trans, , ME, "%s: trans init failure", pRad->Name);
++        amxd_trans_set_cstring_t(&trans, "DisabledSubChannels", disabledStr);
++        ASSERT_TRANSACTION_LOCAL_DM_END(&trans, , ME, "%s: trans apply failure", pRad->Name);
++    }
++}
++
++void wld_rad_addDisabledSubChannel(T_Radio* pRad, swl_channel_t channel) {
++    ASSERTS_NOT_NULL(pRad, , ME, "NULL");
++
++    /* Skip if channel is already in the disabled list */
++    if(swl_typeUInt8_arrayContains(pRad->disabledSubchannels, pRad->nrDisabledSubChannels, channel)) {
++        SAH_TRACEZ_INFO(ME, "%s: sub-channel %d already in DisabledSubChannels, skipping", pRad->Name, channel);
++        return;
++    }
++
++    /* Update internal state first (prevents re-entrant s_setChannelSpec call) */
++    if(pRad->nrDisabledSubChannels < SWL_BW_CHANNELS_MAX) {
++        pRad->disabledSubchannels[pRad->nrDisabledSubChannels++] = channel;
++    } else {
++        SAH_TRACEZ_WARNING(ME, "%s: DisabledSubChannels array full, cannot add channel %d", pRad->Name, channel);
++        return;
++    }
++
++    /* Build the comma-separated string for the data model */
++    char disabledStr[256] = {0};
++    swl_typeUInt8_arrayToChar(disabledStr, sizeof(disabledStr), pRad->disabledSubchannels, pRad->nrDisabledSubChannels);
++    SAH_TRACEZ_INFO(ME, "%s: UseRuPunctureDfs: updating DisabledSubChannels to (%s)", pRad->Name, disabledStr);
++
++    /* Commit to data model via transaction */
++    amxd_object_t* staticPuncObj = amxd_object_get(pRad->pBus, "StaticPuncturing");
++    if(staticPuncObj != NULL) {
++        amxd_trans_t trans;
++        ASSERT_TRANSACTION_INIT(staticPuncObj, &trans, , ME, "%s: trans init failure", pRad->Name);
++        amxd_trans_set_cstring_t(&trans, "DisabledSubChannels", disabledStr);
++        ASSERT_TRANSACTION_LOCAL_DM_END(&trans, , ME, "%s: trans apply failure", pRad->Name);
++    }
++}
++
+ amxd_status_t wld_rad_validateDisabledSubChannels(T_Radio* pRad, swl_channel_t* pPunctChans, size_t nPunctChans) {
+     ASSERTI_NOT_NULL(pRad, amxd_status_unknown_error, ME, "NULL");
+     amxd_status_t status = amxd_status_invalid_value;
+@@ -6853,8 +6958,37 @@ static void s_setDisabledSubChannels_pwf(void* priv _UNUSED, amxd_object_t* obje
+     SAH_TRACEZ_OUT(ME);
+ }
+ 
++/**
++ * @brief Handler for UseRuPunctureDfs parameter change on the StaticPuncturing object.
++ *
++ * When enabled, sends: USE_RU_PUNCTURE_DFS 1 to hostapd via wpa_ctrl (takes effect
++ * without restart). When disabled, sends: USE_RU_PUNCTURE_DFS 0.
++ * The value is also written to hostapd.conf (use_ru_puncture_dfs) so it persists
++ * across hostapd restarts.
++ */
++static void s_setUseRuPunctureDfs_pwf(void* priv _UNUSED, amxd_object_t* object,
++                                       amxd_param_t* param _UNUSED,
++                                       const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++    T_Radio* pRad = wld_rad_fromObj(amxd_object_get_parent(object));
++    ASSERTI_NOT_NULL(pRad, , ME, "INVALID");
++
++    bool enable = amxc_var_dyncast(bool, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set UseRuPunctureDfs %d", pRad->Name, enable);
++    pRad->useRuPunctureDfs = enable;
++
++    ASSERTI_TRUE(wld_rad_isActive(pRad), , ME, "%s: UseRuPunctureDfs: radio not active", pRad->Name);
++    T_AccessPoint* pAP = s_getAcsAp(pRad);
++    ASSERTI_NOT_NULL(pAP, , ME, "%s: UseRuPunctureDfs: no AP available", pRad->Name);
++    wld_wpaCtrl_sendCmdFmtCheckResponse(pAP->wpaCtrlInterface, "OK",
++                                        "USE_RU_PUNCTURE_DFS %d", enable ? 1 : 0);
++
++    SAH_TRACEZ_OUT(ME);
++}
++
+ SWLA_DM_HDLRS(sStaticPuncturingDmHdlrs,
+-              ARR(SWLA_DM_PARAM_HDLR("DisabledSubChannels", s_setDisabledSubChannels_pwf)));
++              ARR(SWLA_DM_PARAM_HDLR("DisabledSubChannels", s_setDisabledSubChannels_pwf),
++                  SWLA_DM_PARAM_HDLR("UseRuPunctureDfs", s_setUseRuPunctureDfs_pwf)));
+ 
+ void _wld_rad_setStaticPuncturing_ocf(const char* const sig_name,
+                                       const amxc_var_t* const data,
+-- 
+2.34.1
+
