@@ -1,0 +1,699 @@
+From 3466e5b8e0bb789b7cc0fcc29395aa4475671362 Mon Sep 17 00:00:00 2001
+From: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+Date: Fri, 3 Jul 2026 16:14:02 +0530
+Subject: [PATCH] DFS new DM Implementation
+
+Signed-off-by: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+---
+
+diff --git a/include/wld/wld_chanmgt.h b/include/wld/wld_chanmgt.h
+index f23b4ac..3959c59 100644
+--- a/include/wld/wld_chanmgt.h
++++ b/include/wld/wld_chanmgt.h
+@@ -112,5 +112,6 @@ swl_rc_ne wld_chanmgt_updateApplicableRadBwMask(T_Radio* pRad);
+ swl_radBw_m wld_chanmgt_getApplicableRadBwMask(T_Radio* pRad);
+ swl_radBw_e wld_chanmgt_getHighestApplicableRadBw(T_Radio* pRad);
+ swl_bandwidth_e wld_chanmgt_getHighestApplicableBw(T_Radio* pRad);
++void wld_chanmgt_setNOPPeriod_pwf(void* priv, amxd_object_t* object, amxd_param_t* param, const amxc_var_t* const newValue);
+ 
+ #endif /* _WLD_CHANMGT_PCB_H_ */
+diff --git a/include/wld/wld_rad_nl80211.h b/include/wld/wld_rad_nl80211.h
+index 995bdfc..2c6ef5c 100644
+--- a/include/wld/wld_rad_nl80211.h
++++ b/include/wld/wld_rad_nl80211.h
+@@ -546,6 +546,20 @@ swl_rc_ne wld_rad_nl80211_getFirstEnabledVapLinkInfo(T_Radio* pRadio, int32_t* p
+  */
+ swl_rc_ne wld_rad_nl80211_getFirstActiveIntfLinkInfo(T_Radio* pRadio, int32_t* pIfIndex, int8_t* pLinkId);
+ 
++/*
++ * @brief Get radio index for QCA vendor commands.
++ *
++ * Returns the radio index based on operating frequency band:
++ *   2.4GHz -> 0
++ *   5GHz   -> 1
++ *   6GHz   -> 2
++ *
++ * @param pRad pointer to radio context
++ *
++ * @return radio index (0, 1, or 2)
++ */
++uint32_t wld_rad_nl80211_getRadioIdx(T_Radio* pRad);
++
+ /*
+  * @brief Set WSI bypass device state for power save control via NL80211 vendor command.
+  *
+@@ -560,4 +574,32 @@ swl_rc_ne wld_rad_nl80211_getFirstActiveIntfLinkInfo(T_Radio* pRadio, int32_t* p
+  *         <= SWL_RC_ERROR otherwise
+  */
+ swl_rc_ne wld_rad_nl80211_setWsiBypassDevice(T_Radio* pRad, bool enable);
++
++/*
++ * @brief Get radar detection count via NL80211 vendor command (READ-ONLY).
++ *
++ * Sends vendor GET command (subcmd=506) with dparam1=75 to retrieve
++ * the number of radar detections on this radio.
++ *
++ * @param pRad pointer to radio context
++ * @param pRadarCount pointer to store the radar detection count
++ *
++ * @return SWL_RC_OK in case of success
++ *         <= SWL_RC_ERROR otherwise
++ */
++swl_rc_ne wld_rad_nl80211_getRadarDetectCount(T_Radio* pRad, uint32_t* pRadarCount);
++
++/*
++ * @brief Set subchannel marking enable/disable via NL80211 vendor command.
++ *
++ * Sends vendor SET command (subcmd=505) with dparam1=74 to enable or
++ * disable subchannel marking on this radio.
++ *
++ * @param pRad pointer to radio context
++ * @param enable true to enable subchannel marking, false to disable
++ *
++ * @return SWL_RC_OK in case of success
++ *         <= SWL_RC_ERROR otherwise
++ */
++swl_rc_ne wld_rad_nl80211_setSubChannelMarking(T_Radio* pRad, bool enable);
+ #endif /* INCLUDE_WLD_WLD_RAD_NL80211_H_ */
+diff --git a/odl/wld_radio.odl b/odl/wld_radio.odl
+index cc60c92..20ca65d 100644
+--- a/odl/wld_radio.odl
++++ b/odl/wld_radio.odl
+@@ -2811,6 +2811,50 @@ define probelist_t{
+ 				default -1;
+ 			}
+ 
++                       /**
++                       * Skip weather radar channels during DFS random channel selection.
++                       * When enabled (true), weather radar channels are excluded from DFS
++                       **/
++                       bool DFSWeatherRadarExclude {
++                               default false;
++                       }
++
++                       /**
++                       * Ignore CAC (Channel Availability Check) requirement on DFS channels.
++                       * When enabled (true), the AP will skip the CAC period and start
++                       * beaconing immediately after moving to a DFS channel. When disabled
++                       * (false), the AP waits for the CAC timeout period before beaconing.
++                       **/
++                       %persistent bool IgnoreCAC {
++                               default false;
++                       }
++                       /**
++                        * Number of radar detections on this radio (READ-ONLY).
++                        * Retrieved via QCA vendor command (subcmd=506, dparam1=75).
++                        */
++                       %read-only uint32 RadarDetectCount {
++                               on action read call wld_chanmgt_getRadarDetectCount_prf;
++                               default 0;
++                       }
++
++                       /**
++                        * Enable or disable subchannel marking on this radio.
++                        * Controls whether the radio marks subchannels via QCA vendor commands.
++                        */
++                       %persistent bool SubChannelMarkingEnable {
++                               on action write call _wld_chanmgt_setSubChannelMarking_pwf;
++                               default true;
++                       }
++                       /**
++                       * DFS Non-Occupancy Period in seconds.
++                       * This parameter controls how long a channel remains unavailable
++                       * after radar detection. The value is written to the kernel's
++                       */
++                       %persistent uint32 NOPPeriod {
++                               on action validate call check_range { min = 0, max = 86400 };
++                               default 0;
++                       }
++
+ 			/**
+ 			 * Background DFS clearing feature
+ 			 * Based on chipset vendor capabilities, BgDfs will try to clear all DFS channels
+diff --git a/src/ChannelManagement/wld_chanmgt.c b/src/ChannelManagement/wld_chanmgt.c
+index bba9cfe..ad3fb30 100644
+--- a/src/ChannelManagement/wld_chanmgt.c
++++ b/src/ChannelManagement/wld_chanmgt.c
+@@ -78,6 +78,9 @@
+ #include "swla/swla_trans.h"
+ #include "wld_dm_trans.h"
+ #include "Utils/wld_autoCommitMgr.h"
++#include "wld/wld_wpaCtrl_api.h"
++#include "wld/wld_hostapd_cfgFile.h"
++#include "wld_rad_nl80211.h"
+ 
+ #define ME "chanMgt"
+ 
+@@ -1120,9 +1123,138 @@ void wld_chanmgt_cleanup(T_Radio* pRad) {
+     }
+ }
+ 
++static T_AccessPoint* s_getDfsAp(T_Radio* pRad) {
++    SAH_TRACEZ_WARNING(ME, "s_getDfsAp called for radio: %s",
++                       pRad ? pRad->Name : "NULL");
++    T_AccessPoint* pAP = wld_rad_getFirstActiveAp(pRad);
++    if(pAP == NULL) {
++        pAP = wld_rad_getFirstEnabledVap(pRad);
++    }
++    return pAP;
++}
++
++static void s_setDfsNoWradar_pwf(void* priv _UNUSED, amxd_object_t* object,
++                                   amxd_param_t* param _UNUSED,
++                                   const amxc_var_t* const newValue) {
++    amxd_object_t* parent = amxd_object_get_parent(object);
++    T_Radio* pRad = wld_rad_fromObj(parent);
++    ASSERTI_NOT_NULL(pRad, , ME, "NULL");
++    bool val = amxc_var_dyncast(bool, newValue);
++    SAH_TRACEZ_WARNING(ME, "Entering s_setDfsNoWradar_pwf for radio %s", pRad->Name);
++    ASSERTI_TRUE(wld_rad_isActive(pRad), , ME, "%s: DFSWeatherRadarExclude: radio not active", pRad->Name);
++    T_AccessPoint* pAP = s_getDfsAp(pRad);
++    ASSERTI_NOT_NULL(pAP, , ME, "%s: DFSWeatherRadarExclude: no AP available", pRad->Name);
++    SAH_TRACEZ_WARNING(ME, "%s: DFSWeatherRadarExclude=%d via %s", pRad->Name, val ? 1 : 0, pAP->alias);
++    wld_wpaCtrl_sendCmdFmtCheckResponse(pAP->wpaCtrlInterface, "OK", "DFS_NO_WRADAR %d", val ? 1 : 0);
++}
++#define IGNORECAC_SYSFS_PATH "/sys/module/cfg80211/parameters/ignorecac"
++
++static int s_writeIgnoreCacSysfs(bool enable) {
++
++    FILE* f = fopen(IGNORECAC_SYSFS_PATH, "w");
++    if (!f) {
++        SAH_TRACEZ_INFO(ME, "IgnoreCAC: Failed to open %s for writing: %s",
++                         IGNORECAC_SYSFS_PATH, strerror(errno));
++        return -1;
++    }
++
++    if (fprintf(f, "%d\n", enable ? 1 : 0) < 0) {
++        SAH_TRACEZ_INFO(ME, "IgnoreCAC: fprintf failed for value %d to %s",
++                         enable ? 1 : 0, IGNORECAC_SYSFS_PATH);
++        fclose(f);
++        return -1;
++    }
++
++    fclose(f);
++    return 0;
++}
++
++static void s_setIgnoreCac_pwf(void* priv _UNUSED, amxd_object_t* object,
++                                 amxd_param_t* param _UNUSED,
++                                 const amxc_var_t* const newValue) {
++    T_Radio* pRad = wld_rad_fromObj(amxd_object_get_parent(object));
++    ASSERTI_NOT_NULL(pRad, , ME, "NULL");
++    bool val = amxc_var_dyncast(bool, newValue);
++    SAH_TRACEZ_WARNING(ME, "Entering s_setIgnoreCac_pwf for radio %s, value=%d", pRad->Name, val ? 1 : 0);
++    
++    int sysfsResult = s_writeIgnoreCacSysfs(val);
++    if (sysfsResult < 0) {
++        SAH_TRACEZ_ERROR(ME, "%s: IgnoreCAC: Failed to write to sysfs", pRad->Name);
++    } else {
++        SAH_TRACEZ_WARNING(ME, "%s: IgnoreCAC: Successfully set sysfs parameter to %d", pRad->Name, val ? 1 : 0);
++    }
++    
++    wld_hostapd_cfgFile_createExt(pRad);
++    
++    if(!wld_rad_isActive(pRad)) {
++        SAH_TRACEZ_WARNING(ME, "%s: IgnoreCAC: Radio not active, config file updated only", pRad->Name);
++        return;
++    }
++    
++    T_AccessPoint* pAP = s_getDfsAp(pRad);
++    if(pAP == NULL) {
++        SAH_TRACEZ_WARNING(ME, "%s: IgnoreCAC: No AP available, will apply on next radio activation", pRad->Name);
++        return;
++    }
++    
++    SAH_TRACEZ_WARNING(ME, "%s: IgnoreCAC=%d via %s (wpaCtrlInterface=%p)", 
++                       pRad->Name, val ? 1 : 0, pAP->alias, pAP->wpaCtrlInterface);
++    
++    if(pAP->wpaCtrlInterface == NULL) {
++        SAH_TRACEZ_ERROR(ME, "%s: IgnoreCAC: wpaCtrlInterface is NULL for AP %s", pRad->Name, pAP->alias);
++        return;
++    }
++    
++    swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pAP->wpaCtrlInterface, "OK","IGNORECAC %d", val ? 1 : 0);
++    if(rc != SWL_RC_OK) {
++        SAH_TRACEZ_ERROR(ME, "%s: IgnoreCAC: Failed to send command via %s, rc=%d", pRad->Name, pAP->alias, rc);
++    }
++}
++amxd_status_t wld_chanmgt_getRadarDetectCount_prf(amxd_object_t* object,
++                                                   amxd_param_t* param _UNUSED,
++                                                   amxd_action_t reason _UNUSED,
++                                                   const amxc_var_t* const args _UNUSED,
++                                                   amxc_var_t* const retval,
++                                                   void* priv _UNUSED) {
++    T_Radio* pRad = wld_rad_fromObj(amxd_object_get_parent(object));
++    ASSERT_NOT_NULL(pRad, amxd_status_ok, ME, "No radio mapped");
++
++    uint32_t radarCount = 0;
++    swl_rc_ne rc = wld_rad_nl80211_getRadarDetectCount(pRad, &radarCount);
++
++    if(rc == SWL_RC_OK) {
++        amxc_var_set(uint32_t, retval, radarCount);
++    } else {
++        SAH_TRACEZ_INFO(ME, "%s: Failed to get radar detect count, returning 0", pRad->Name);
++        amxc_var_set(uint32_t, retval, 0);
++    }
++
++    return amxd_status_ok;
++}
++
++static void s_setSubChannelMarking_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++    T_Radio* pR = wld_rad_fromObj(amxd_object_get_parent(object));
++    ASSERT_NOT_NULL(pR, , ME, "NULL");
++    bool enable = amxc_var_dyncast(bool, newValue);
++    int ret = wld_rad_nl80211_setSubChannelMarking(pR, enable);
++    if (ret != 0) {
++        SAH_TRACEZ_ERROR(ME, "Failed to set subchannel marking for %s to %d, ret=%d",
++                         pR->Name, enable, ret);
++        return;
++    }
++
++    SAH_TRACEZ_OUT(ME);
++}
++
+ SWLA_DM_HDLRS(sChanMgtDmHdlrs,
+               ARR(SWLA_DM_PARAM_HDLR("ChangeLogSize", s_setChannelChangeLogSize_pwf),
+-                  SWLA_DM_PARAM_HDLR("AcsBootChannel", s_setAcsBootChannel_pwf)));
++                  SWLA_DM_PARAM_HDLR("AcsBootChannel", s_setAcsBootChannel_pwf),
++                  SWLA_DM_PARAM_HDLR("DFSWeatherRadarExclude", s_setDfsNoWradar_pwf),
++                  SWLA_DM_PARAM_HDLR("IgnoreCAC", s_setIgnoreCac_pwf),
++                  SWLA_DM_PARAM_HDLR("SubChannelMarkingEnable", s_setSubChannelMarking_pwf),
++                  SWLA_DM_PARAM_HDLR("NOPPeriod", wld_chanmgt_setNOPPeriod_pwf),
++                  ));
+ 
+ void _wld_chanmgt_setConf_ocf(const char* const sig_name,
+                               const amxc_var_t* const data,
+@@ -1148,8 +1280,89 @@ amxd_status_t _wld_chanmgt_validateAcsBootChannel_pvf(amxd_object_t* object,
+     return amxd_status_ok;
+ }
+ 
++amxd_status_t _wld_chanmgt_getRadarDetectCount_prf(amxd_object_t* object,
++                                                     amxd_param_t* param _UNUSED,
++                                                     amxd_action_t reason _UNUSED,
++                                                     const amxc_var_t* const args _UNUSED,
++                                                     amxc_var_t* const retval,
++                                                     void* priv _UNUSED) {
++    T_Radio* pRad = wld_rad_fromObj(amxd_object_get_parent(object));
++    ASSERTI_NOT_NULL(pRad, amxd_status_ok, ME, "No radio mapped");
++
++    uint32_t count = 0;
++    int ret = wld_rad_nl80211_getRadarDetectCount(pRad, &count);
++    SAH_TRACEZ_ERROR(ME, "%s: Get radarcount= %d for, ret=%d", pRad->Name,count, ret);
++    if (ret == 0) {
++        amxc_var_set(uint32_t, retval, count);
++        return amxd_status_ok;
++    }
++
++    SAH_TRACEZ_ERROR(ME, "Failed to get radar detect count for %s, ret=%d", pRad->Name, ret);
++    return amxd_status_ok;  
++}
++
++amxd_status_t _wld_chanmgt_setSubChannelMarking_pwf(amxd_object_t* object,
++                                                      amxd_param_t* param _UNUSED,
++                                                      amxd_action_t reason _UNUSED,
++                                                      const amxc_var_t* const args,
++                                                      amxc_var_t* const retval _UNUSED,
++                                                      void* priv _UNUSED) {
++    ASSERTS_FALSE(amxc_var_is_null(args), amxd_status_invalid_value, ME, "invalid args");
++    T_Radio* pRad = wld_rad_fromObj(amxd_object_get_parent(object));
++    ASSERTI_NOT_NULL(pRad, amxd_status_ok, ME, "No radio mapped");
++
++    bool enable = amxc_var_dyncast(bool, args);
++    int ret = wld_rad_nl80211_setSubChannelMarking(pRad, enable);
++    if (ret != 0) {
++        SAH_TRACEZ_ERROR(ME, "Failed to set subchannel marking for %s to %d, ret=%d",
++                         pRad->Name, enable, ret);
++        return amxd_status_unknown_error;
++    }
+ 
++    SAH_TRACEZ_WARNING(ME, "%s: SubChannelMarkingEnable set to %d", pRad->Name, enable);
++    return amxd_status_ok;
++}
+ 
+ void wld_chanmgt_init(T_Radio* pR) {
+     swl_function_deferInit(&pR->callIdReqChanspec);
+ }
++
++#define DFS_NOL_TIMEOUT_SYSFS_PATH "/sys/module/cfg80211/parameters/dfs_nol_timeout"
++
++static int s_writeNOPPeriod(uint32_t timeout) {
++
++    FILE* f = fopen(DFS_NOL_TIMEOUT_SYSFS_PATH, "w");
++    if (!f) {
++        SAH_TRACEZ_INFO(ME, "NOPPeriod: Failed to open %s for writing: %s",
++                         DFS_NOL_TIMEOUT_SYSFS_PATH, strerror(errno));
++        return -1;
++    }
++
++    if (fprintf(f, "%u\n", timeout) < 0) {
++        SAH_TRACEZ_INFO(ME, "NOPPeriod: fprintf failed for value %u to %s",
++                         timeout, DFS_NOL_TIMEOUT_SYSFS_PATH);
++        fclose(f);
++        return -1;
++    }
++
++    fclose(f);
++    return 0;
++}
++
++void wld_chanmgt_setNOPPeriod_pwf(void* priv,
++                                   amxd_object_t* object,
++                                   amxd_param_t* param,
++                                   const amxc_var_t* const newValue) {
++    (void)priv;
++    (void)object;
++    (void)param;
++
++
++    uint32_t timeout = amxc_var_dyncast(uint32_t, newValue);
++    SAH_TRACEZ_WARNING(ME, "NOPPeriod: Requested value: %u seconds", timeout);
++
++    int result = s_writeNOPPeriod(timeout);
++    if (result < 0) {
++        SAH_TRACEZ_INFO(ME, "NOPPeriod: SET handler failed to write value %u", timeout);
++    }
++}
+diff --git a/src/nl80211/wld_rad_nl80211.c b/src/nl80211/wld_rad_nl80211.c
+index 55f7fa7..3bcd552 100644
+--- a/src/nl80211/wld_rad_nl80211.c
++++ b/src/nl80211/wld_rad_nl80211.c
+@@ -824,30 +824,38 @@ swl_rc_ne wld_rad_nl80211_sendVendorSubCmdAttr(T_Radio* pRadio, uint32_t oui, in
+ }
+ 
+ /* -------------------------------------------------------------------------
+- * WSI Bypass Device (PowerSaveEnable) — NL80211 vendor command
++ * QCA Vendor Command Infrastructure — NL80211 vendor command
+  * -------------------------------------------------------------------------
+ */
+-#define WSI_QCA_VENDOR_ID       0x001374u
+-#define WSI_BYPASS_SUBCMD       505
+-
+-/* Vendor data attribute IDs */
+-#define WSI_ATTR_RADIO_IDX      150u  /* QCA_WLAN_VENDOR_ATTR_CONFIG_RADIO_INDEX */
+-#define WSI_ATTR_DPARAM0        17u   /* QCA_NL80211_VENDOR_SUBCMD_WIFI_PARAMS */
+-#define WSI_ATTR_DPARAM1        18u   /* QCA_WLAN_VENDOR_RADIO_PARAM_WSI_BYPASS */
+-#define WSI_ATTR_VALUE0         19u   /* bypass value */
+-
+-/* Vendor data attribute values */
+-#define WSI_DPARAM0_WIFI_PARAMS 200u
+-#define WSI_DPARAM1_WSI_BYPASS  80u
++#define QCA_VENDOR_ID           0x001374u
++#define QCA_VENDOR_SUBCMD_SET   505
++#define QCA_VENDOR_SUBCMD_GET   506
++
++/* Common Vendor Attributes */
++#define QCA_ATTR_RADIO_IDX      150u  /* QCA_WLAN_VENDOR_ATTR_CONFIG_RADIO_INDEX */
++#define QCA_ATTR_DPARAM0        17u   /* QCA_NL80211_VENDOR_SUBCMD_WIFI_PARAMS */
++#define QCA_ATTR_DPARAM1        18u   /* Feature-specific parameter */
++#define QCA_ATTR_VALUE0         19u   /* Value for SET operations */
++#define QCA_ATTR_RESPONSE       1u    /* Response attribute for GET operations */
++
++/* Common dparam0 values */
++#define QCA_DPARAM0_WIFI_PARAMS 200u
++
++/* Feature-specific dparam1 values */
++#define QCA_DPARAM1_WSI_BYPASS          80u
++#define QCA_DPARAM1_RADAR_DETECT_COUNT  75u
++#define QCA_DPARAM1_MARK_SUBCHAN        74u
++
++/* WSI Bypass specific values */
+ #define WSI_VALUE0_BYPASS       1u    /* bypass / remove device (Power Save ON) */
+ #define WSI_VALUE0_READD        2u    /* re-add device (Power Save OFF) */
+ 
+-static uint32_t s_wsiGetRadioIdx(T_Radio* pRad) {
++uint32_t wld_rad_nl80211_getRadioIdx(T_Radio* pRad) {
+     if(pRad->pBus == NULL) {
+         return 0;
+     }
+     char* freqBand = amxd_object_get_cstring_t(pRad->pBus, "OperatingFrequencyBand", NULL);
+-    SAH_TRACEZ_WARNING(ME, "Radio idx value=%s",freqBand);
++    SAH_TRACEZ_INFO(ME, "Radio idx value=%s",freqBand);
+     uint32_t idx = 0;
+     if(freqBand != NULL) {
+         if(swl_str_matches(freqBand, "5GHz")) {
+@@ -864,7 +872,7 @@ swl_rc_ne wld_rad_nl80211_setWsiBypassDevice(T_Radio* pRad, bool enable) {
+     swl_rc_ne rc = SWL_RC_INVALID_PARAM;
+     ASSERT_NOT_NULL(pRad, rc, ME, "NULL radio");
+ 
+-    uint32_t radioIdx = s_wsiGetRadioIdx(pRad);
++    uint32_t radioIdx = wld_rad_nl80211_getRadioIdx(pRad);
+     uint32_t bypassVal = enable ? WSI_VALUE0_BYPASS : WSI_VALUE0_READD;
+ 
+     SAH_TRACEZ_WARNING(ME, "%s: setWsiBypassDevice enable=%d radioIdx=%u bypassVal=%u",
+@@ -876,17 +884,17 @@ swl_rc_ne wld_rad_nl80211_setWsiBypassDevice(T_Radio* pRad, bool enable) {
+     }
+ 
+     uint8_t radioIdxU8 = (uint8_t)radioIdx;
+-    uint32_t dparam0Val = WSI_DPARAM0_WIFI_PARAMS;
+-    uint32_t dparam1Val = WSI_DPARAM1_WSI_BYPASS;
++    uint32_t dparam0Val = QCA_DPARAM0_WIFI_PARAMS;
++    uint32_t dparam1Val = QCA_DPARAM1_WSI_BYPASS;
+     NL_ATTR_NESTED(vendorAttr, NL80211_ATTR_VENDOR_DATA);
+-    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(WSI_ATTR_RADIO_IDX, radioIdxU8));
+-    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(WSI_ATTR_DPARAM0, dparam0Val));
+-    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(WSI_ATTR_DPARAM1, dparam1Val));
+-    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(WSI_ATTR_VALUE0, bypassVal));
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_RADIO_IDX, radioIdxU8));
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_DPARAM0, dparam0Val));
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_DPARAM1, dparam1Val));
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_VALUE0, bypassVal));
+ 
+     uint32_t wiphy = pRad->wiphy;
+-    uint32_t vendorId = WSI_QCA_VENDOR_ID;
+-    uint32_t vendorSubcmd = WSI_BYPASS_SUBCMD;
++    uint32_t vendorId = QCA_VENDOR_ID;
++    uint32_t vendorSubcmd = QCA_VENDOR_SUBCMD_SET;
+     NL_ATTRS(attribs,
+              ARR(
+                  NL_ATTR_VAL(NL80211_ATTR_VENDOR_ID, vendorId),
+@@ -909,3 +917,217 @@ swl_rc_ne wld_rad_nl80211_setWsiBypassDevice(T_Radio* pRad, bool enable) {
+     }
+     return rc;
+ }
++
++/* -------------------------------------------------------------------------
++ * RadarDetectCount (READ-ONLY) — NL80211 vendor command
++ * -------------------------------------------------------------------------
++*/
++typedef struct {
++    uint32_t* pRadarCount;
++    swl_rc_ne rc;
++} s_radarCountCtx_t;
++
++static swl_rc_ne s_getRadarDetectCountCb(swl_rc_ne rc, struct nlmsghdr* nlh, void* priv) {
++    s_radarCountCtx_t* pCtx = (s_radarCountCtx_t*)priv;
++
++    if(rc < SWL_RC_OK) {
++        pCtx->rc = rc;
++        return rc;
++    }
++
++    void* data = NULL;
++    size_t dataLen = 0;
++    rc = wld_nl80211_getVendorDataFromVendorMsg(rc, nlh, &data, &dataLen);
++    if(rc < SWL_RC_OK || data == NULL) {
++        SAH_TRACEZ_ERROR(ME, "Failed to get vendor data, rc=%d", rc);
++        pCtx->rc = rc;
++        return rc;
++    }
++
++    if(dataLen >= 8) {
++        uint32_t value = *((uint32_t*)((uint8_t*)data + 4));
++        *pCtx->pRadarCount = value;
++        SAH_TRACEZ_INFO(ME, "Radar count: dataLen=%zu, value=%u", dataLen, value);
++        pCtx->rc = SWL_RC_OK;
++        return SWL_RC_OK;
++    }
++
++    SAH_TRACEZ_ERROR(ME, "Invalid vendor data length: %zu (expected >= 12)", dataLen);
++    pCtx->rc = SWL_RC_ERROR;
++    return SWL_RC_ERROR;
++}
++swl_rc_ne wld_rad_nl80211_getRadarDetectCount(T_Radio* pRad, uint32_t* pRadarCount) {
++    swl_rc_ne rc = SWL_RC_INVALID_PARAM;
++    ASSERT_NOT_NULL(pRad, rc, ME, "NULL radio");
++    ASSERT_NOT_NULL(pRadarCount, rc, ME, "NULL output");
++
++    uint32_t radioIdx = wld_rad_nl80211_getRadioIdx(pRad);
++
++    SAH_TRACEZ_INFO(ME, "%s: getRadarDetectCount radioIdx=%u", pRad->Name, radioIdx);
++
++    if(pRad->index <= 0 && pRad->wDevId == 0) {
++        SAH_TRACEZ_WARNING(ME, "%s: radio not available", pRad->Name);
++        return SWL_RC_ERROR;
++    }
++
++    uint8_t radioIdxU8 = (uint8_t)radioIdx;
++    uint32_t dparam0Val = QCA_DPARAM0_WIFI_PARAMS;
++    uint32_t dparam1Val = QCA_DPARAM1_RADAR_DETECT_COUNT;
++
++    NL_ATTR_NESTED(vendorAttr, NL80211_ATTR_VENDOR_DATA);
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_RADIO_IDX, radioIdxU8));
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_DPARAM0, dparam0Val));
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_DPARAM1, dparam1Val));
++
++    s_radarCountCtx_t ctx = {
++        .pRadarCount = pRadarCount,
++        .rc = SWL_RC_ERROR
++    };
++
++    rc = wld_rad_nl80211_sendVendorSubCmdAttr(pRad, QCA_VENDOR_ID, QCA_VENDOR_SUBCMD_GET,
++                                              &vendorAttr, true, false, 0,
++                                              s_getRadarDetectCountCb, &ctx);
++
++    NL_ATTRS_CLEAR(&vendorAttr.data.attribs);
++
++    if(rc != SWL_RC_OK) {
++        SAH_TRACEZ_ERROR(ME, "%s: getRadarDetectCount failed rc=%d", pRad->Name, rc);
++        return rc;
++    }
++
++    return ctx.rc;
++}
++
++/* -------------------------------------------------------------------------
++ * SubChannelMarking (READ/WRITE) — NL80211 vendor command
++ * -------------------------------------------------------------------------
++*/
++swl_rc_ne wld_rad_nl80211_setSubChannelMarking(T_Radio* pRad, bool enable) {
++    swl_rc_ne rc = SWL_RC_INVALID_PARAM;
++    ASSERT_NOT_NULL(pRad, rc, ME, "NULL radio");
++
++    uint32_t radioIdx = wld_rad_nl80211_getRadioIdx(pRad);
++    uint32_t markVal = enable ? 1u : 0u;
++
++    SAH_TRACEZ_INFO(ME, "%s: setSubChannelMarking enable=%d radioIdx=%u",
++                    pRad->Name, enable, radioIdx);
++
++    if(pRad->index <= 0 && pRad->wDevId == 0) {
++        SAH_TRACEZ_WARNING(ME, "%s: radio not available", pRad->Name);
++        return SWL_RC_ERROR;
++    }
++
++    uint8_t radioIdxU8 = (uint8_t)radioIdx;
++    uint32_t dparam0Val = QCA_DPARAM0_WIFI_PARAMS;
++    uint32_t dparam1Val = QCA_DPARAM1_MARK_SUBCHAN;
++
++    NL_ATTR_NESTED(vendorAttr, NL80211_ATTR_VENDOR_DATA);
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_RADIO_IDX, radioIdxU8));
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_DPARAM0, dparam0Val));
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_DPARAM1, dparam1Val));
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_VALUE0, markVal));
++
++    uint32_t wiphy = pRad->wiphy;
++    uint32_t vendorId = QCA_VENDOR_ID;
++    uint32_t vendorSubcmd = QCA_VENDOR_SUBCMD_SET;
++
++    NL_ATTRS(attribs,
++             ARR(
++                 NL_ATTR_VAL(NL80211_ATTR_VENDOR_ID, vendorId),
++                 NL_ATTR_VAL(NL80211_ATTR_VENDOR_SUBCMD, vendorSubcmd),
++                 NL_ATTR_VAL(NL80211_ATTR_WIPHY, wiphy)
++                 )
++             );
++    swl_unLiList_add(&attribs, &vendorAttr);
++
++    rc = wld_nl80211_sendCmdSyncWithAck(wld_nl80211_getSharedState(),
++                                        NL80211_CMD_VENDOR,
++                                        0,
++                                        0,
++                                        &attribs);
++    NL_ATTRS_CLEAR(&attribs);
++    NL_ATTRS_CLEAR(&vendorAttr.data.attribs);
++
++    if(rc != SWL_RC_OK) {
++        SAH_TRACEZ_ERROR(ME, "%s: setSubChannelMarking failed rc=%d", pRad->Name, rc);
++    }
++    return rc;
++}
++
++typedef struct {
++    bool* pEnabled;
++    swl_rc_ne rc;
++} s_subChanMarkCtx_t;
++
++static swl_rc_ne s_getSubChannelMarkingCb(swl_rc_ne rc, struct nlmsghdr* nlh, void* priv) {
++    s_subChanMarkCtx_t* pCtx = (s_subChanMarkCtx_t*)priv;
++
++    if(rc < SWL_RC_OK) {
++        pCtx->rc = rc;
++        return rc;
++    }
++
++    void* data = NULL;
++    size_t dataLen = 0;
++   rc = wld_nl80211_getVendorDataFromVendorMsg(rc, nlh, &data, &dataLen);
++    if(rc < SWL_RC_OK || data == NULL) {
++        SAH_TRACEZ_ERROR(ME, "Failed to get vendor data, rc=%d", rc);
++        pCtx->rc = rc;
++        return rc;
++    }
++
++    if(dataLen >= 12) {  
++        uint32_t value = *((uint32_t*)((uint8_t*)data + 8));
++        *pCtx->pEnabled = (value != 0);
++        SAH_TRACEZ_INFO(ME, "SubChannelMarking: dataLen=%zu, value=%u, enabled=%d", dataLen, value, *pCtx->pEnabled);
++       pCtx->rc = SWL_RC_OK;
++        return SWL_RC_OK;
++    }
++
++    SAH_TRACEZ_ERROR(ME, "Invalid vendor data length: %zu (expected >= 12)", dataLen);
++    pCtx->rc = SWL_RC_ERROR;
++    return SWL_RC_ERROR;
++}
++
++swl_rc_ne wld_rad_nl80211_getSubChannelMarking(T_Radio* pRad, bool* pEnabled) {
++    swl_rc_ne rc = SWL_RC_INVALID_PARAM;
++    ASSERT_NOT_NULL(pRad, rc, ME, "NULL radio");
++    ASSERT_NOT_NULL(pEnabled, rc, ME, "NULL output");
++
++    uint32_t radioIdx = wld_rad_nl80211_getRadioIdx(pRad);
++
++    SAH_TRACEZ_INFO(ME, "%s: getSubChannelMarking radioIdx=%u", pRad->Name, radioIdx);
++
++    if(pRad->index <= 0 && pRad->wDevId == 0) {
++        SAH_TRACEZ_WARNING(ME, "%s: radio not available", pRad->Name);
++        return SWL_RC_ERROR;
++    }
++
++    uint8_t radioIdxU8 = (uint8_t)radioIdx;
++    uint32_t dparam0Val = QCA_DPARAM0_WIFI_PARAMS;
++    uint32_t dparam1Val = QCA_DPARAM1_MARK_SUBCHAN;
++
++    NL_ATTR_NESTED(vendorAttr, NL80211_ATTR_VENDOR_DATA);
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_RADIO_IDX, radioIdxU8));
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_DPARAM0, dparam0Val));
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_DPARAM1, dparam1Val));
++
++    s_subChanMarkCtx_t ctx = {
++        .pEnabled = pEnabled,
++        .rc = SWL_RC_ERROR
++    };
++
++    rc = wld_rad_nl80211_sendVendorSubCmdAttr(pRad, QCA_VENDOR_ID, QCA_VENDOR_SUBCMD_GET,
++                                              &vendorAttr, true, false, 0,
++                                              s_getSubChannelMarkingCb, &ctx);
++
++    NL_ATTRS_CLEAR(&vendorAttr.data.attribs);
++
++    if(rc != SWL_RC_OK) {
++        SAH_TRACEZ_ERROR(ME, "%s: getSubChannelMarking failed rc=%d", pRad->Name, rc);
++        return rc;
++    }
++
++    return ctx.rc;
++}
++
+diff --git a/src/nl80211/wld_wpaCtrlInterface.c b/src/nl80211/wld_wpaCtrlInterface.c
+index f9efa1b..60526d1 100644
+--- a/src/nl80211/wld_wpaCtrlInterface.c
++++ b/src/nl80211/wld_wpaCtrlInterface.c
+@@ -316,6 +316,7 @@ static swl_rc_ne s_sendCmdFmtCheckResponseExt(wld_wpaCtrlInterface_t* pIface, ui
+     size_t maxMsgLen = wld_wpaCtrl_getMaxMsgLen();
+     char reply[maxMsgLen];
+     memset(reply, 0, sizeof(reply));
++    SAH_TRACEZ_WARNING(ME, "%s: Sending command to hostapd: [%s] wpaCtrlIfName=%s", wpaCtrlIfName, cmdStr,wpaCtrlIfName);
+     swl_rc_ne rc = s_sendCmdFmtGetResponseExt(pIface, reply, sizeof(reply) - 1, tmOutMSec, cmdStr);
+     if(swl_rc_isOk(rc)) {
+         ASSERT_TRUE(swl_str_matches(reply, expectedResponse), SWL_RC_ERROR, ME, "%s: query (%s) reply(%s): unmatch expect(%s)",
