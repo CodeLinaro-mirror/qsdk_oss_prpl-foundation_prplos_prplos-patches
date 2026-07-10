@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+Date: Thu, 10 Jul 2026 00:00:00 +0000
+Subject: [PATCH] pwhm: fix WiFi.Reset() EndPoint re-created at wrong indices
+ (4,5,6 instead of 1,2,3)
+
+After WiFi.Reset(), EndPoint instances are deleted and the defaults ODL
+re-creates them via "instance add (alias)" with no explicit index. amxd
+auto-assigns the next index as (template->last_index + 1). Since
+last_index is a high-water mark that is never reset on instance deletion,
+after the first boot where EndPoints 1,2,3 were created, last_index stays
+at 3. The next auto-assign gives 4, 5, 6.
+
+Fix: after s_deleteAllInstances(EndPoint), reset epTmpl->last_index = 0.
+With last_index = 0, the next auto-assign starts from 1, restoring the
+correct WiFi.EndPoint.1/2/3 indices after reset.
+
+Signed-off-by: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+---
+diff --git a/src/wld.c b/src/wld.c
+--- a/src/wld.c
++++ b/src/wld.c
+@@ -1208,7 +1208,15 @@
+             pEP->index = 0;
+         }
+     }
+-    s_deleteAllInstances(amxd_object_findf(get_wld_object(), "EndPoint"));
++    amxd_object_t* epTmpl = amxd_object_findf(get_wld_object(), "EndPoint");
++    s_deleteAllInstances(epTmpl);
++    /* Reset the template's last_index to 0. amxd uses last_index as a
++     * high-water mark and never decrements it on deletion. Auto-assigned
++     * indices (index arg == 0) are computed as last_index+1, so without
++     * this reset the re-created EndPoints land at 4,5,6 instead of 1,2,3. */
++    if(epTmpl != NULL) {
++        epTmpl->last_index = 0;
++    }
+
+     /*
+      * Walk the entire WiFi object tree and remove all registered action
