@@ -1,0 +1,37 @@
+From: Kartheek E <karte@qti.qualcomm.com>
+Date: Mon, 14 Jul 2026 00:00:00 +0530
+Subject: [PATCH] pwhm: Fix Clone1_VAPs crash on MLO state change (NON-MLO<->SLO)
+
+  When mld_ap changes (0->1 or 1->0), the FSM issues REMOVE via the
+  hostapd global wpactrl socket. The ath12k driver holds the interface
+  in EBUSY state during MLO mode transitions, causing NL80211_CMD_DEL_INTERFACE
+  to time out. This triggers a full group-hostapd restart, disconnecting
+  all clients on all radios (wlan0+wlan1+wlan2 share one instance).
+
+  Add STOP_AP before REMOVE in wld_rad_hostapd_removeConf(). STOP_AP causes
+  hostapd to execute NL80211_CMD_STOP_AP which flushes driver operations and
+  releases interface locks. The subsequent REMOVE then succeeds without timing
+  out and no restart is needed.
+
+Signed-off-by: Kartheek E <karte@qti.qualcomm.com>
+---
+ src/nl80211/wld_rad_hostapd_api.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/nl80211/wld_rad_hostapd_api.c b/src/nl80211/wld_rad_hostapd_api.c
+--- a/src/nl80211/wld_rad_hostapd_api.c
++++ b/src/nl80211/wld_rad_hostapd_api.c
+@@ -515,6 +515,11 @@ swl_rc_ne wld_rad_hostapd_removeConf(T_Radio* pR) {
+     swl_rc_ne rc;
+     const char* skname = wld_wpaCtrlInterface_getConnectionSockName(pIface);
+     const char* ifname = wld_wpaCtrlInterface_getName(pIface);
++    if(wld_wpaCtrlInterface_isReady(pIface)) {
++        SAH_TRACEZ_INFO(ME, "%s: stop AP before REMOVE to release driver locks",
++                        wld_wpaCtrlInterface_getName(pIface));
++        wld_wpaCtrl_sendCmdFmtCheckResponse(pIface, "OK", "STOP_AP");
++    }
+     if(!swl_str_matches(skname, ifname)) {
+         rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pIface, "OK", "SET interface %s", skname);
+         ASSERT_TRUE(swl_rc_isOk(rc), rc, ME, "%s: fail to restore main iface name (%s->%s)", pR->Name, ifname, skname);
+-- 
+2.43.0
