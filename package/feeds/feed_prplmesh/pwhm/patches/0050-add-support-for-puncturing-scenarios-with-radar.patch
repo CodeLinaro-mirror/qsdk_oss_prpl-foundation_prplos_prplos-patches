@@ -1,0 +1,509 @@
+From 3086766ed62b014a0038507c40f73d22155db657 Mon Sep 17 00:00:00 2001
+From: Atchaya R <ratchaya@qti.qualcomm.com>
+Date: Sun, 19 Jul 2026 22:58:31 +0530
+Subject: [PATCH] pwhm: add support for puncturing scenarios with radar
+
+Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
+---
+ include/wld/wld.h                   |   4 +
+ include/wld/wld_chanmgt.h           |  15 ++
+ include/wld/wld_radio.h             |   1 +
+ src/ChannelManagement/wld_chanmgt.c |  34 ++++
+ src/Plugin/wifiGen_eventHandlers.c  |  14 ++
+ src/wld_radio.c                     | 280 +++++++++++++++++++++++-----
+ 6 files changed, 299 insertions(+), 49 deletions(-)
+
+diff --git a/include/wld/wld.h b/include/wld/wld.h
+index 7523103..7b704d2 100644
+--- a/include/wld/wld.h
++++ b/include/wld/wld.h
+@@ -1743,6 +1743,10 @@ struct WLD_RADIO {
+     uint8_t mLReconfigurationCount;                         /** Number of beacons with ML Reconfiguration IE before link removal */
+     bool discardAwgnEvent;                                  /* When true, add discard_6g_awgn_event=1 to hostapd config (6GHz only) */
+     bool useRuPunctureDfs;                                  /* When true, add use_ru_puncture_dfs=1 to hostapd config (11be only) */
++   swl_channel_t userPuncturedSubchannels[SWL_BW_CHANNELS_MAX]; /* User-punctured sub-channels (set by user, not by radar) */
++   uint32_t nrUserPuncturedSubChannels;                         /* Nr of user-punctured sub channels */
++   bool radarUpdatingDisabledSubChannels;                       /* True while radar path is updating DisabledSubChannels DM */
++   bool pendingUserPuncturingReapply;                           /* True when a re-apply CSA for user puncturing is pending (deferred until current CSA completes) */
+ };
+ 
+ typedef struct {
+diff --git a/include/wld/wld_chanmgt.h b/include/wld/wld_chanmgt.h
+index 3959c59..7fead4e 100644
+--- a/include/wld/wld_chanmgt.h
++++ b/include/wld/wld_chanmgt.h
+@@ -114,4 +114,19 @@ swl_radBw_e wld_chanmgt_getHighestApplicableRadBw(T_Radio* pRad);
+ swl_bandwidth_e wld_chanmgt_getHighestApplicableBw(T_Radio* pRad);
+ void wld_chanmgt_setNOPPeriod_pwf(void* priv, amxd_object_t* object, amxd_param_t* param, const amxc_var_t* const newValue);
+ 
++/**
++ * @brief Called when a CSA has fully completed (AP-CSA-FINISHED / CTRL-EVENT-CHANNEL-SWITCH).
++ *
++ * At this point the hardware has been updated to the new chanspec (without puncturing).
++ * If the user had punctured channels and the bitmap was cleared by the CAC-completion CSA,
++ * this function triggers a new direct CSA to re-apply the user puncturing.
++ *
++ * Must be called from s_chanSwitchCb (not s_chanSwitchStartedCb) so that the hardware
++ * state reflects the completed CSA before we attempt the re-apply.
++ *
++ * @param pR pointer to radio context
++ * @param chanspec the chanspec reported by the completed CSA
++ */
++void wld_chanmgt_onCsaCompleted(T_Radio* pR, swl_chanspec_t chanspec);
++
+ #endif /* _WLD_CHANMGT_PCB_H_ */
+diff --git a/include/wld/wld_radio.h b/include/wld/wld_radio.h
+index 14a37ce..8f5e20c 100644
+--- a/include/wld/wld_radio.h
++++ b/include/wld/wld_radio.h
+@@ -396,6 +396,7 @@ amxd_status_t wld_rad_validateDisabledSubChannels(T_Radio* pRad, swl_channel_t*
+  *                        amxd_status_unknown_error otherwise
+  */
+ amxd_status_t wld_rad_validateDisabledSubChannelsList(T_Radio* pRad, const char* newValue);
++void wld_rad_captureUserPuncturedSubChannels(T_Radio* pRad);
+ 
+ /**
+  * @brief update EHT Operation IE in the datamodel
+diff --git a/src/ChannelManagement/wld_chanmgt.c b/src/ChannelManagement/wld_chanmgt.c
+index ad3fb30..f7bde3b 100644
+--- a/src/ChannelManagement/wld_chanmgt.c
++++ b/src/ChannelManagement/wld_chanmgt.c
+@@ -418,6 +418,19 @@ static swl_rc_ne s_refreshCurrentChanspec(T_Radio* pR, swl_chanspec_t chanspec,
+     pR->channel = chanspec.channel;
+     pR->runningChannelBandwidth = swl_chanspec_toRadBw(&chanspec);
+ 
++    /* When UseRuPunctureDfs is enabled and the punctBitmap changes, update DisabledSubChannels.
++     * This handles the case where s_dfsRadarDetectedCb fires BEFORE the chanspec bitmap is
++     * available (bitmap=0 at that point), so wld_rad_addDisabledSubChannel cannot determine
++     * the correct sub-channel. Here pR->channel and pR->runningChannelBandwidth are already
++     * updated, so wld_rad_getSwlChanspec() returns the correct chanspec (e.g. 5_100/80#0x2)
++     * and wld_rad_updateDisabledSubChannelsFromPunctBitmap correctly maps bit1 → channel 104. */
++    if(pR->useRuPunctureDfs && (chanspec.punctBitmap != oldSpec.punctBitmap)) {
++        wld_rad_updateDisabledSubChannelsFromPunctBitmap(pR, &chanspec);
++        if((chanspec.punctBitmap == 0) && (pR->nrUserPuncturedSubChannels > 0)) {
++            pR->pendingUserPuncturingReapply = true;
++        }
++    }
++
+     if((reason == pR->targetChanspec.reason) && swl_typeChanspec_equals(pR->targetChanspec.chanspec, pR->currentChanspec.chanspec)) {
+         swl_str_cat(pR->currentChanspec.reasonExt, sizeof(pR->currentChanspec.reasonExt), pR->targetChanspec.reasonExt);
+     } else {
+@@ -1366,3 +1379,24 @@ void wld_chanmgt_setNOPPeriod_pwf(void* priv,
+         SAH_TRACEZ_INFO(ME, "NOPPeriod: SET handler failed to write value %u", timeout);
+     }
+ }
++
++void wld_chanmgt_onCsaCompleted(T_Radio* pR, swl_chanspec_t chanspec) {
++    ASSERT_NOT_NULL(pR, , ME, "NULL");
++    if(!pR->useRuPunctureDfs) {
++        return;
++    }
++    if(!pR->pendingUserPuncturingReapply) {
++        return;
++    }
++    if((chanspec.punctBitmap != 0) || (pR->nrUserPuncturedSubChannels == 0)) {
++        pR->pendingUserPuncturingReapply = false;
++        return;
++    }
++    /* CSA completed without puncturing but user has punctured channels.
++     * The hardware now has the unpunctured chanspec, so mfn_wrad_setChanspec will
++     * see the mismatch and send a new CSA with the puncturing bitmap. */
++    SAH_TRACEZ_INFO(ME, "%s: CSA completed: re-applying user puncturing (%u channels)",
++                    pR->Name, pR->nrUserPuncturedSubChannels);
++    pR->pendingUserPuncturingReapply = false;
++    wld_chanmgt_setTargetChanspec(pR, chanspec, true, CHAN_REASON_MANUAL, NULL);
++}
+diff --git a/src/Plugin/wifiGen_eventHandlers.c b/src/Plugin/wifiGen_eventHandlers.c
+index a1aa060..fe12963 100644
+--- a/src/Plugin/wifiGen_eventHandlers.c
++++ b/src/Plugin/wifiGen_eventHandlers.c
+@@ -385,6 +385,11 @@ static void s_chanSwitchCb(void* userData, char* ifName _UNUSED, swl_chanspec_t*
+     }
+ 
+     s_saveChanChanged(pRad, chanSpec, reason);
++    /* Notify chanmgt that the CSA has fully completed so it can re-apply user puncturing
++     * if the bitmap was cleared by the CAC-completion CSA (UseRuPunctureDfs scenario).
++     * Must be called AFTER s_saveChanChanged so the pendingUserPuncturingReapply flag
++     * (set in s_refreshCurrentChanspec during s_chanSwitchStartedCb) is already set. */
++    wld_chanmgt_onCsaCompleted(pRad, *chanSpec);
+ }
+ 
+ /*
+@@ -747,6 +752,15 @@ static void s_dfsNopFinishedCb(void* userData _UNUSED, char* ifName, swl_chanspe
+     wld_channel_mark_passive_channel(*chanSpec);
+     T_Radio* pRad = (T_Radio*) userData;
+     ASSERT_NOT_NULL(pRad, , ME, "NULL");
++
++    /* At NOP expiry, re-sync userPuncturedSubchannels from the DM value.
++     * If no user puncturing happened (nrUserPuncturedSubChannels == 0), the function
++     * returns early without capturing, so radar-only puncturing is correctly cleared
++     * after NOP+CAC. */
++    if(pRad->useRuPunctureDfs) {
++        wld_rad_captureUserPuncturedSubChannels(pRad);
++    }
++
+     wld_chanmgt_writeDfsChannels(pRad);
+ }
+ 
+diff --git a/src/wld_radio.c b/src/wld_radio.c
+index 9abdce8..030df1d 100644
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -6850,21 +6850,6 @@ static void s_saveDisabledSubChannels(T_Radio* pRad, swl_channel_t* pPunctChans,
+     }
+ }
+ 
+-/**
+- * @brief Add a single sub-channel to the DisabledSubChannels list (radar puncturing path).
+- *
+- * Called from s_dfsRadarDetectedCb when UseRuPunctureDfs is enabled.
+- * Updates the internal pRad->disabledSubchannels[] array FIRST, then commits
+- * the new value to the DisabledSubChannels data model parameter via transaction.
+- *
+- * Updating the internal array before the transaction prevents a re-entrant
+- * call to s_setChannelSpec from s_setDisabledSubChannels_pwf:
+- * s_getNewDisabledSubChannels() will see no change and skip the channel
+- * reconfiguration.
+- *
+- * @param pRad  radio context
+- * @param channel  20MHz sub-channel number that was hit by radar
+- */
+ /**
+  * @brief Update DisabledSubChannels from a puncturing bitmap (NOP-finished path).
+  *
+@@ -6876,6 +6861,9 @@ static void s_saveDisabledSubChannels(T_Radio* pRad, swl_channel_t* pPunctChans,
+  * Updates the internal disabledSubchannels[] array FIRST to prevent the
+  * write handler from triggering a channel reconfiguration.
+  *
++ * Scenarios 2 & 3: userPuncturedSubchannels are merged with bitmap-derived
++ * channels so user-punctured channels survive NOP expiry.
++ *
+  * @param pRad      radio context
+  * @param pChanSpec chanspec carrying the new punctBitmap
+  */
+@@ -6884,36 +6872,61 @@ void wld_rad_updateDisabledSubChannelsFromPunctBitmap(T_Radio* pRad, swl_chanspe
+     ASSERTS_NOT_NULL(pChanSpec, , ME, "NULL");
+     ASSERTS_NOT_NULL(pRad->pBus, , ME, "NULL");
+ 
+-    /* Convert punctBitmap to list of disabled sub-channels */
++    SAH_TRACEZ_INFO(ME, "%s: updateDisabledSubChannelsFromPunctBitmap: ch=%d bw=%d bitmap=0x%x radCh=%d userPunct=%u",
++                    pRad->Name, pChanSpec->channel, pChanSpec->bandwidth, pChanSpec->punctBitmap, pRad->channel,
++                    pRad->nrUserPuncturedSubChannels);
++
++    /* Convert punctBitmap to list of bitmap-derived sub-channels */
+     swl_channel_t chanList[SWL_BW_CHANNELS_MAX] = {0};
+     int nChans = swl_chanspec_getChannelsInChanspec(pChanSpec, chanList, SWL_BW_CHANNELS_MAX);
+-    swl_channel_t newPunctChans[SWL_BW_CHANNELS_MAX] = {0};
+-    size_t nNewPunctChans = 0;
++    swl_channel_t bitmapChans[SWL_BW_CHANNELS_MAX] = {0};
++    size_t nBitmapChans = 0;
+     for(int i = 0; i < nChans; i++) {
+         if(pChanSpec->punctBitmap & (1u << i)) {
+-            newPunctChans[nNewPunctChans++] = chanList[i];
++            bitmapChans[nBitmapChans++] = chanList[i];
++        }
++    }
++
++    /* Merge: userPuncturedSubchannels + bitmap-derived channels (no duplicates).
++     * Scenario 2: user punctures ch104, radar hits ch104, NOP expires → ch104 stays
++     * Scenario 3: user punctures ch104, radar hits ch108, NOP expires for ch108 → ch104 stays */
++    swl_channel_t mergedChans[SWL_BW_CHANNELS_MAX * 2] = {0};
++    size_t nMergedChans = 0;
++
++    for(uint32_t i = 0; i < pRad->nrUserPuncturedSubChannels; i++) {
++        mergedChans[nMergedChans++] = pRad->userPuncturedSubchannels[i];
++    }
++    for(size_t i = 0; i < nBitmapChans; i++) {
++        if(!swl_typeUInt8_arrayContains(mergedChans, nMergedChans, bitmapChans[i])) {
++            mergedChans[nMergedChans++] = bitmapChans[i];
+         }
+     }
++    if(nMergedChans > 1) {
++        qsort(mergedChans, nMergedChans, sizeof(swl_channel_t), s_cmpChanUInt8);
++    }
+ 
+     /* No-op if value hasn't changed */
+-    if((nNewPunctChans == pRad->nrDisabledSubChannels) &&
++    if((nMergedChans == pRad->nrDisabledSubChannels) &&
+        swl_typeUInt8_arrayMatches(pRad->disabledSubchannels, pRad->nrDisabledSubChannels,
+-                                   newPunctChans, nNewPunctChans)) {
+-        SAH_TRACEZ_INFO(ME, "%s: DisabledSubChannels unchanged from punctBitmap 0x%x",
+-                        pRad->Name, pChanSpec->punctBitmap);
++                                   mergedChans, nMergedChans)) {
++        SAH_TRACEZ_INFO(ME, "%s: DisabledSubChannels unchanged (bitmap=0x%x userPunct=%u)",
++                        pRad->Name, pChanSpec->punctBitmap, pRad->nrUserPuncturedSubChannels);
+         return;
+     }
+ 
+     /* Update internal state FIRST (prevents re-entrant s_setChannelSpec call) */
+-    s_saveDisabledSubChannels(pRad, newPunctChans, nNewPunctChans);
++    s_saveDisabledSubChannels(pRad, mergedChans, nMergedChans);
+ 
+-    /* Build comma-separated string for data model */
+     char disabledStr[256] = {0};
+-    swl_typeUInt8_arrayToChar(disabledStr, sizeof(disabledStr), newPunctChans, nNewPunctChans);
+-    SAH_TRACEZ_INFO(ME, "%s: UseRuPunctureDfs: updating DisabledSubChannels to (%s) from punctBitmap 0x%x",
+-                    pRad->Name, disabledStr, pChanSpec->punctBitmap);
+-
+-    /* Commit to data model via transaction */
++    swl_typeUInt8_arrayToChar(disabledStr, sizeof(disabledStr), mergedChans, nMergedChans);
++    SAH_TRACEZ_INFO(ME, "%s: UseRuPunctureDfs: updating DisabledSubChannels to (%s) from bitmap=0x%x userPunct=%u",
++                    pRad->Name, disabledStr, pChanSpec->punctBitmap, pRad->nrUserPuncturedSubChannels);
++
++    /* Set flag so s_setDisabledSubChannels_pwf knows this is a radar-initiated update
++     * and must NOT update userPuncturedSubchannels.
++     * NOTE: do NOT clear the flag here — the write handler fires asynchronously (next
++     * event-loop iteration), so the flag must remain set until the handler reads it. */
++    pRad->radarUpdatingDisabledSubChannels = true;
+     amxd_object_t* staticPuncObj = amxd_object_get(pRad->pBus, "StaticPuncturing");
+     if(staticPuncObj != NULL) {
+         amxd_trans_t trans;
+@@ -6923,35 +6936,114 @@ void wld_rad_updateDisabledSubChannelsFromPunctBitmap(T_Radio* pRad, swl_chanspe
+     }
+ }
+ 
++/**
++ * @brief Add a single sub-channel to the DisabledSubChannels list (radar puncturing path).
++ *
++ * Called from s_dfsRadarDetectedCb when UseRuPunctureDfs is enabled.
++ * Updates the internal pRad->disabledSubchannels[] array FIRST, then commits
++ * the new value to the DisabledSubChannels data model parameter via transaction.
++ *
++ * @param pRad  radio context
++ * @param channel  20MHz sub-channel number that was hit by radar
++ */
+ void wld_rad_addDisabledSubChannel(T_Radio* pRad, swl_channel_t channel) {
+     ASSERTS_NOT_NULL(pRad, , ME, "NULL");
+ 
+-    /* Skip if channel is already in the disabled list */
+-    if(swl_typeUInt8_arrayContains(pRad->disabledSubchannels, pRad->nrDisabledSubChannels, channel)) {
+-        SAH_TRACEZ_INFO(ME, "%s: sub-channel %d already in DisabledSubChannels, skipping", pRad->Name, channel);
++    SAH_TRACEZ_INFO(ME, "%s: addDisabledSubChannel called with channel=%d", pRad->Name, channel);
++
++    /* Try the current chanspec bitmap first (set by driver after channel switch) */
++    swl_chanspec_t curChspec = wld_rad_getSwlChanspec(pRad);
++    SAH_TRACEZ_INFO(ME, "%s: curChspec: ch=%d bw=%d bitmap=0x%x lastRadarAdded=%u",
++                    pRad->Name, curChspec.channel, curChspec.bandwidth, curChspec.punctBitmap,
++                    pRad->nrLastRadarChannelsAdded);
++
++    if(curChspec.punctBitmap != 0) {
++        /* Bitmap already updated by driver — use it to map bits → sub-channels */
++        wld_rad_updateDisabledSubChannelsFromPunctBitmap(pRad, &curChspec);
+         return;
+     }
+ 
+-    /* Update internal state first (prevents re-entrant s_setChannelSpec call) */
+-    if(pRad->nrDisabledSubChannels < SWL_BW_CHANNELS_MAX) {
+-        pRad->disabledSubchannels[pRad->nrDisabledSubChannels++] = channel;
+-    } else {
+-        SAH_TRACEZ_WARNING(ME, "%s: DisabledSubChannels array full, cannot add channel %d", pRad->Name, channel);
++    /* Bitmap not yet updated (s_dfsRadarDetectedCb fires before the channel-switch
++     * event that carries the new punctBitmap).  Fall back to lastRadarChannelsAdded
++     * which wld_chanmgt_radarDetected() already computed correctly via
++     * wld_channel_get_radartriggered_channels() — e.g. [104] not [100]. */
++    if(pRad->nrLastRadarChannelsAdded > 0) {
++        SAH_TRACEZ_INFO(ME, "%s: bitmap=0, using lastRadarChannelsAdded (nr=%u)",
++                        pRad->Name, pRad->nrLastRadarChannelsAdded);
++        for(uint32_t i = 0; i < pRad->nrLastRadarChannelsAdded; i++) {
++            swl_channel_t radarChan = pRad->lastRadarChannelsAdded[i];
++            SAH_TRACEZ_INFO(ME, "%s: adding radar channel %d", pRad->Name, radarChan);
++            if(!swl_typeUInt8_arrayContains(pRad->disabledSubchannels, pRad->nrDisabledSubChannels, radarChan)) {
++                if(pRad->nrDisabledSubChannels < SWL_BW_CHANNELS_MAX) {
++                    pRad->disabledSubchannels[pRad->nrDisabledSubChannels++] = radarChan;
++                }
++            }
++        }
++        char disabledStr[256] = {0};
++        swl_typeUInt8_arrayToChar(disabledStr, sizeof(disabledStr), pRad->disabledSubchannels, pRad->nrDisabledSubChannels);
++        SAH_TRACEZ_INFO(ME, "%s: DisabledSubChannels -> (%s)", pRad->Name, disabledStr);
++        /* Same async-flag rule: do NOT clear here; write handler clears it. */
++        pRad->radarUpdatingDisabledSubChannels = true;
++        amxd_object_t* staticPuncObj = amxd_object_get(pRad->pBus, "StaticPuncturing");
++        if(staticPuncObj != NULL) {
++            amxd_trans_t trans;
++            ASSERT_TRANSACTION_INIT(staticPuncObj, &trans, , ME, "%s: trans init failure", pRad->Name);
++            amxd_trans_set_cstring_t(&trans, "DisabledSubChannels", disabledStr);
++            ASSERT_TRANSACTION_LOCAL_DM_END(&trans, , ME, "%s: trans apply failure", pRad->Name);
++        }
+         return;
+     }
+ 
+-    /* Build the comma-separated string for the data model */
+-    char disabledStr[256] = {0};
+-    swl_typeUInt8_arrayToChar(disabledStr, sizeof(disabledStr), pRad->disabledSubchannels, pRad->nrDisabledSubChannels);
+-    SAH_TRACEZ_INFO(ME, "%s: UseRuPunctureDfs: updating DisabledSubChannels to (%s)", pRad->Name, disabledStr);
++    SAH_TRACEZ_WARNING(ME, "%s: bitmap=0 and no lastRadarChannelsAdded, cannot determine punctured channel",
++                       pRad->Name);
++}
++
++/**
++ * @brief Capture the current DisabledSubChannels DM value as userPuncturedSubchannels.
++ *
++ * Called at NOP expiry (s_dfsNopFinishedCb) to capture any user intent that was set
++ * during NOP.  The AMX DM framework skips the ENTIRE action chain (validate + write
++ * handler) when the new value equals the current value, so if radar set "104" and the
++ * user also sets "104" during NOP, the write handler is never called and
++ * userPuncturedSubchannels is never updated.
++ *
++ * Reading the DM value at NOP expiry is the only reliable way to capture this intent.
++ */
++void wld_rad_captureUserPuncturedSubChannels(T_Radio* pRad) {
++    ASSERTS_NOT_NULL(pRad, , ME, "NULL");
++    ASSERTS_NOT_NULL(pRad->pBus, , ME, "NULL");
++
++    /* Only capture if the user explicitly set DisabledSubChannels (nrUserPuncturedSubChannels > 0).
++     * If the user never set it during NOP (only radar set it), nrUserPuncturedSubChannels stays 0
++     * and we should NOT capture — otherwise radar-set values would be incorrectly treated as
++     * user intent and re-applied after NOP+CAC even when no user puncturing happened.
++     *
++     * Note: nrUserPuncturedSubChannels is reset to 0 when radar sets DisabledSubChannels
++     * (in wld_rad_updateDisabledSubChannelsFromPunctBitmap via the write handler's radar path).
++     * It is only set > 0 when the user explicitly writes DisabledSubChannels. */
++    if(pRad->nrUserPuncturedSubChannels == 0) {
++        SAH_TRACEZ_INFO(ME, "%s: NOP finished: no user puncturing during NOP (userPunct=0), skipping capture",
++                        pRad->Name);
++        return;
++    }
+ 
+-    /* Commit to data model via transaction */
+     amxd_object_t* staticPuncObj = amxd_object_get(pRad->pBus, "StaticPuncturing");
+-    if(staticPuncObj != NULL) {
+-        amxd_trans_t trans;
+-        ASSERT_TRANSACTION_INIT(staticPuncObj, &trans, , ME, "%s: trans init failure", pRad->Name);
+-        amxd_trans_set_cstring_t(&trans, "DisabledSubChannels", disabledStr);
+-        ASSERT_TRANSACTION_LOCAL_DM_END(&trans, , ME, "%s: trans apply failure", pRad->Name);
++    ASSERTI_NOT_NULL(staticPuncObj, , ME, "%s: no StaticPuncturing object", pRad->Name);
++
++    const char* dmVal = amxc_var_constcast(cstring_t,
++        amxd_object_get_param_value(staticPuncObj, "DisabledSubChannels"));
++    ASSERTI_NOT_NULL(dmVal, , ME, "%s: no DisabledSubChannels param", pRad->Name);
++
++    swl_channel_t aPunctChans[SWL_BW_CHANNELS_MAX] = {0};
++    size_t nPunctChans = 0;
++    if(s_parseDisabledSubChannels(dmVal, SWL_BW_CHANNELS_MAX, aPunctChans, &nPunctChans)) {
++        pRad->nrUserPuncturedSubChannels = nPunctChans;
++        memset(pRad->userPuncturedSubchannels, 0, sizeof(pRad->userPuncturedSubchannels));
++        if(nPunctChans > 0) {
++            memcpy(pRad->userPuncturedSubchannels, aPunctChans, nPunctChans * sizeof(swl_channel_t));
++        }
++        SAH_TRACEZ_INFO(ME, "%s: NOP finished: captured userPuncturedSubchannels from DM (nr=%zu val=%s)",
++                        pRad->Name, nPunctChans, dmVal);
+     }
+ }
+ 
+@@ -6961,6 +7053,38 @@ amxd_status_t wld_rad_validateDisabledSubChannels(T_Radio* pRad, swl_channel_t*
+     char punctChansStr[256] = {0};
+     swl_typeUInt8_arrayToChar(punctChansStr, sizeof(punctChansStr), pPunctChans, nPunctChans);
+     swl_chanspec_t baseChspec = SWL_CHANSPEC_EMPTY;
++
++    /* Scenario 4: reject unpuncturing a radar-triggered channel during NOP.
++     * When UseRuPunctureDfs is enabled and the current chanspec has a non-zero punctBitmap,
++     * the user must not remove any currently-punctured (radar-triggered) channel from
++     * DisabledSubChannels while the NOP is still active.
++     *
++     * IMPORTANT: after NOP expires and CAC completes without a new radar detection, the
++     * hardware still has punctBitmap != 0 because the user-requested puncturing was
++     * re-applied by wld_chanmgt_onCsaCompleted.  In that case the channel is no longer
++     * radar-detected, so the user MUST be allowed to unpuncture.
++     * Only block when the sub-channel is CURRENTLY radar-detected (i.e. NOP is active). */
++    if(pRad->useRuPunctureDfs) {
++        swl_chanspec_t curChspec = wld_rad_getSwlChanspec(pRad);
++        if(curChspec.punctBitmap != 0) {
++            swl_channel_t chanList[SWL_BW_CHANNELS_MAX] = {0};
++            int nChans = swl_chanspec_getChannelsInChanspec(&curChspec, chanList, SWL_BW_CHANNELS_MAX);
++            for(int i = 0; i < nChans; i++) {
++                if(curChspec.punctBitmap & (1u << i)) {
++                    swl_channel_t punctChan = chanList[i];
++                    if(!swl_typeUInt8_arrayContains(pPunctChans, nPunctChans, punctChan)) {
++                        swl_chanspec_t subChanSpec = SWL_CHANSPEC_NEW(punctChan, SWL_BW_20MHZ, pRad->operatingFrequencyBand);
++                        if(wld_channel_is_radar_detected(subChanSpec)) {
++                            SAH_TRACEZ_ERROR(ME, "%s: [Scenario4] cannot remove radar-triggered channel %d from DisabledSubChannels during NOP (bitmap=0x%x)",
++                                             pRad->Name, punctChan, curChspec.punctBitmap);
++                            return amxd_status_invalid_value;
++                        }
++                    }
++                }
++            }
++        }
++    }
++
+     if(!nPunctChans) {
+         SAH_TRACEZ_INFO(ME, "%s: no DisabledSubChannels in (%s)", pRad->Name, punctChansStr);
+         status = amxd_status_ok;
+@@ -7017,6 +7141,29 @@ amxd_status_t _wld_rad_validateDisabledSubChannels_pvf(amxd_object_t* object _UN
+ 
+     status = wld_rad_validateDisabledSubChannelsList(pRad, newValue);
+ 
++    /* Record user intent HERE in the validate function, not only in the write handler.
++     * The AMX DM framework skips the write handler (s_setDisabledSubChannels_pwf) when
++     * the parameter value hasn't changed (e.g. user sets "104" during NOP when radar
++     * already set it to "104").  The validate function is ALWAYS called, so this is the
++     * only reliable place to capture user intent when the value is unchanged.
++     *
++     * Only update when:
++     *   - validation passed (status == amxd_status_ok)
++     *   - this is a user-initiated write (radarUpdatingDisabledSubChannels is false) */
++    if((status == amxd_status_ok) && !pRad->radarUpdatingDisabledSubChannels) {
++        swl_channel_t aPunctChans[SWL_BW_CHANNELS_MAX] = {0};
++        size_t nPunctChans = 0;
++        if(s_parseDisabledSubChannels(newValue, SWL_BW_CHANNELS_MAX, aPunctChans, &nPunctChans)) {
++            pRad->nrUserPuncturedSubChannels = nPunctChans;
++            memset(pRad->userPuncturedSubchannels, 0, sizeof(pRad->userPuncturedSubchannels));
++            if(nPunctChans > 0) {
++                memcpy(pRad->userPuncturedSubchannels, aPunctChans, nPunctChans * sizeof(swl_channel_t));
++            }
++            SAH_TRACEZ_INFO(ME, "%s: userPuncturedSubchannels updated in validate (nr=%zu)",
++                            pRad->Name, nPunctChans);
++        }
++    }
++
+     free(newValue);
+ 
+     SAH_TRACEZ_OUT(ME);
+@@ -7034,7 +7181,42 @@ static void s_setDisabledSubChannels_pwf(void* priv _UNUSED, amxd_object_t* obje
+ 
+     size_t count = 0;
+     swl_channel_t disabledSubchannels[SWL_BW_CHANNELS_MAX] = {0};
+-    if(s_getNewDisabledSubChannels(pRad, valStr, SWL_BW_CHANNELS_MAX, disabledSubchannels, &count)) {
++    bool hasChanged = s_getNewDisabledSubChannels(pRad, valStr, SWL_BW_CHANNELS_MAX, disabledSubchannels, &count);
++
++    /* Differentiate radar-initiated vs user-initiated DisabledSubChannels writes.
++     *
++     * The radar path (wld_rad_updateDisabledSubChannelsFromPunctBitmap /
++     * wld_rad_addDisabledSubChannel) sets radarUpdatingDisabledSubChannels=true before
++     * the DM transaction and does NOT clear it — because this write handler fires
++     * asynchronously (next event-loop iteration).  The flag is cleared HERE so it is
++     * still set when the handler reads it, then reset for the next write.
++     *
++     * User path: radarUpdatingDisabledSubChannels is false → record as user-punctured.
++     * Radar path: radarUpdatingDisabledSubChannels is true → clear flag, skip update.
++     *
++     * Key: even if hasChanged=false, the user may be explicitly re-asserting the same
++     * value (e.g. "104" during NOP when radar already set it to "104").  We must still
++     * record it as user-punctured so it survives NOP expiry. */
++    if(pRad->radarUpdatingDisabledSubChannels) {
++        /* Radar-initiated: clear the flag and do NOT touch userPuncturedSubchannels. */
++        pRad->radarUpdatingDisabledSubChannels = false;
++        SAH_TRACEZ_INFO(ME, "%s: radar-initiated DisabledSubChannels update, skipping userPuncturedSubchannels (nr=%u)",
++                        pRad->Name, pRad->nrUserPuncturedSubChannels);
++    } else {
++        /* User-initiated: record the new value as user-punctured. */
++        if(!hasChanged) {
++            /* Re-parse since s_getNewDisabledSubChannels may have returned false without filling count */
++            s_parseDisabledSubChannels(valStr, SWL_BW_CHANNELS_MAX, disabledSubchannels, &count);
++        }
++        pRad->nrUserPuncturedSubChannels = count;
++        memset(pRad->userPuncturedSubchannels, 0, sizeof(pRad->userPuncturedSubchannels));
++        if(count > 0) {
++            memcpy(pRad->userPuncturedSubchannels, disabledSubchannels, count * sizeof(swl_channel_t));
++        }
++        SAH_TRACEZ_INFO(ME, "%s: userPuncturedSubchannels updated (nr=%zu)", pRad->Name, count);
++    }
++
++    if(hasChanged) {
+         char punctChansStr[256] = {0};
+         swl_typeUInt8_arrayToChar(punctChansStr, sizeof(punctChansStr), disabledSubchannels, count);
+         SAH_TRACEZ_INFO(ME, "%s: process new disabled sub channels list (%s)", pRad->Name, punctChansStr);
+-- 
+2.34.1
+
