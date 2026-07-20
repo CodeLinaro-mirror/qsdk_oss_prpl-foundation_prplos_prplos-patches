@@ -1,0 +1,183 @@
+From: Kartheek E <karte@qti.qualcomm.com>
+Date: Mon, 20 Jul 2026 00:00:00 +0530
+Subject: [PATCH] pwhm: use NL vendor cmd for displayBandChans and displaySuperChanList
+
+  QCA_WLAN_VENDOR_RADIO_PARAM_DISPLAY_BAND_CHANS       = 82
+  QCA_WLAN_VENDOR_RADIO_PARAM_DISPLAY_SUPER_CHANNEL_LIST = 83
+
+Both commands trigger the kernel to print band/channel info to the kernel
+log (dmesg). The NL response carries only a status value (0 on success).
+
+Signed-off-by: Kartheek E <karte@qti.qualcomm.com>
+---
+ include/wld/wld_rad_nl80211.h  | 28 +++++++++++++
+ src/nl80211/wld_rad_nl80211.c  | 86 +++++++++++++++++++++++++++++++++++++++++++
+ src/wld_radio.c                | 36 +++++++-----------
+ 3 files changed, 124 insertions(+), 30 deletions(-)
+
+--- a/include/wld/wld_rad_nl80211.h
++++ b/include/wld/wld_rad_nl80211.h
+@@ -601,5 +601,7 @@
+  * @return SWL_RC_OK in case of success
+  *         <= SWL_RC_ERROR otherwise
+  */
+ swl_rc_ne wld_rad_nl80211_setSubChannelMarking(T_Radio* pRad, bool enable);
++swl_rc_ne wld_rad_nl80211_displayBandChans(T_Radio* pRad);
++swl_rc_ne wld_rad_nl80211_displaySuperChanList(T_Radio* pRad);
+ #endif /* INCLUDE_WLD_WLD_RAD_NL80211_H_ */
+--- a/src/nl80211/wld_rad_nl80211.c
++++ b/src/nl80211/wld_rad_nl80211.c
+@@ -845,6 +845,8 @@
+ #define QCA_DPARAM1_WSI_BYPASS          80u
+ #define QCA_DPARAM1_RADAR_DETECT_COUNT  75u
+ #define QCA_DPARAM1_MARK_SUBCHAN        74u
++#define QCA_DPARAM1_DISPLAY_BAND_CHANS      82u  /* QCA_WLAN_VENDOR_RADIO_PARAM_DISPLAY_BAND_CHANS */
++#define QCA_DPARAM1_DISPLAY_SUPER_CHAN_LIST 83u  /* QCA_WLAN_VENDOR_RADIO_PARAM_DISPLAY_SUPER_CHANNEL_LIST */
+
+ /* WSI Bypass specific values */
+ #define WSI_VALUE0_BYPASS       1u    /* bypass / remove device (Power Save ON) */
+@@ -1131,3 +1133,78 @@
+     return ctx.rc;
+ }
+ 
++static swl_rc_ne s_displayVendorCmdCb(swl_rc_ne rc, struct nlmsghdr* nlh _UNUSED, void* priv) {
++    swl_rc_ne* pRc = (swl_rc_ne*)priv;
++    *pRc = rc;
++    return rc;
++}
++
++swl_rc_ne wld_rad_nl80211_displayBandChans(T_Radio* pRad) {
++    swl_rc_ne rc = SWL_RC_INVALID_PARAM;
++    ASSERT_NOT_NULL(pRad, rc, ME, "NULL radio");
++
++    uint32_t radioIdx = wld_rad_nl80211_getRadioIdx(pRad);
++
++    SAH_TRACEZ_INFO(ME, "%s: displayBandChans radioIdx=%u", pRad->Name, radioIdx);
++
++    if(pRad->index <= 0 && pRad->wDevId == 0) {
++        SAH_TRACEZ_WARNING(ME, "%s: radio not available", pRad->Name);
++        return SWL_RC_ERROR;
++    }
++
++    uint8_t radioIdxU8 = (uint8_t)radioIdx;
++    uint32_t dparam0Val = QCA_DPARAM0_WIFI_PARAMS;
++    uint32_t dparam1Val = QCA_DPARAM1_DISPLAY_BAND_CHANS;
++
++    NL_ATTR_NESTED(vendorAttr, NL80211_ATTR_VENDOR_DATA);
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_RADIO_IDX, radioIdxU8));
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_DPARAM0, dparam0Val));
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_DPARAM1, dparam1Val));
++
++    swl_rc_ne cbRc = SWL_RC_ERROR;
++    rc = wld_rad_nl80211_sendVendorSubCmdAttr(pRad, QCA_VENDOR_ID, QCA_VENDOR_SUBCMD_GET,
++                                              &vendorAttr, true, false, 0,
++                                              s_displayVendorCmdCb, &cbRc);
++    NL_ATTRS_CLEAR(&vendorAttr.data.attribs);
++
++    if(rc != SWL_RC_OK) {
++        SAH_TRACEZ_ERROR(ME, "%s: displayBandChans failed rc=%d", pRad->Name, rc);
++        return rc;
++    }
++    return cbRc;
++}
++
++swl_rc_ne wld_rad_nl80211_displaySuperChanList(T_Radio* pRad) {
++    swl_rc_ne rc = SWL_RC_INVALID_PARAM;
++    ASSERT_NOT_NULL(pRad, rc, ME, "NULL radio");
++
++    uint32_t radioIdx = wld_rad_nl80211_getRadioIdx(pRad);
++
++    SAH_TRACEZ_INFO(ME, "%s: displaySuperChanList radioIdx=%u", pRad->Name, radioIdx);
++
++    if(pRad->index <= 0 && pRad->wDevId == 0) {
++        SAH_TRACEZ_WARNING(ME, "%s: radio not available", pRad->Name);
++        return SWL_RC_ERROR;
++    }
++
++    uint8_t radioIdxU8 = (uint8_t)radioIdx;
++    uint32_t dparam0Val = QCA_DPARAM0_WIFI_PARAMS;
++    uint32_t dparam1Val = QCA_DPARAM1_DISPLAY_SUPER_CHAN_LIST;
++
++    NL_ATTR_NESTED(vendorAttr, NL80211_ATTR_VENDOR_DATA);
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_RADIO_IDX, radioIdxU8));
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_DPARAM0, dparam0Val));
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_DPARAM1, dparam1Val));
++
++    swl_rc_ne cbRc = SWL_RC_ERROR;
++    rc = wld_rad_nl80211_sendVendorSubCmdAttr(pRad, QCA_VENDOR_ID, QCA_VENDOR_SUBCMD_GET,
++                                              &vendorAttr, true, false, 0,
++                                              s_displayVendorCmdCb, &cbRc);
++    NL_ATTRS_CLEAR(&vendorAttr.data.attribs);
++
++    if(rc != SWL_RC_OK) {
++        SAH_TRACEZ_ERROR(ME, "%s: displaySuperChanList failed rc=%d", pRad->Name, rc);
++        return rc;
++    }
++    return cbRc;
++}
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -4507,53 +4507,33 @@
+     T_Radio* pR = wld_rad_fromObj(object);
+     ASSERT_NOT_NULL(pR, amxd_status_unknown_error, ME, "NULL");
+
+-    char cmd[256];
+-    char out[QCA_POPEN_OUT_MAX];
+-    char phyName[IFNAMSIZ];
+-    s_get_phy_name(pR->wiphyName, phyName, sizeof(phyName));
+-    uint32_t radio_idx = (wld_rad_countWiphyRads(pR->wiphy) > 1)
+-                         ? s_band_to_radio_idx(pR->operatingFrequencyBand)
+-                         : 0;
+-    snprintf(cmd, sizeof(cmd),
+-             "cfg80211tool %s radio_idx %u display_band_chans 2>&1",
+-             phyName, radio_idx);
+-
+-    SAH_TRACEZ_INFO(ME, "%s: displayBandChans cmd='%s'", pR->Name, cmd);
+-    if(s_cfg80211tool_run(cmd, out, sizeof(out)) != SWL_RC_OK) {
+-        SAH_TRACEZ_ERROR(ME, "%s: displayBandChans: popen failed", pR->Name);
++    SAH_TRACEZ_INFO(ME, "%s: displayBandChans via NL vendor cmd", pR->Name);
++    swl_rc_ne rc = wld_rad_nl80211_displayBandChans(pR);
++    if(rc != SWL_RC_OK) {
++        SAH_TRACEZ_ERROR(ME, "%s: displayBandChans: NL vendor cmd failed rc=%d", pR->Name, rc);
+         amxc_var_set(cstring_t, retval, "");
+         return amxd_status_unknown_error;
+     }
+-    amxc_var_set(cstring_t, retval, out);
++    amxc_var_set(cstring_t, retval, "display_band_chans:0");
+     return amxd_status_ok;
+ }
+
+ /* ---- displaySuperChanList ---- */
+ amxd_status_t _displaySuperChanList(amxd_object_t* object,
+                                      amxd_function_t* func _UNUSED,
+                                      amxc_var_t* args _UNUSED,
+                                      amxc_var_t* retval) {
+     T_Radio* pR = wld_rad_fromObj(object);
+     ASSERT_NOT_NULL(pR, amxd_status_unknown_error, ME, "NULL");
+
+-    char cmd[256];
+-    char out[QCA_POPEN_OUT_MAX];
+-    char phyName[IFNAMSIZ];
+-    s_get_phy_name(pR->wiphyName, phyName, sizeof(phyName));
+-    uint32_t radio_idx = (wld_rad_countWiphyRads(pR->wiphy) > 1)
+-                         ? s_band_to_radio_idx(pR->operatingFrequencyBand)
+-                         : 0;
+-    snprintf(cmd, sizeof(cmd),
+-             "cfg80211tool %s radio_idx %u display_super_chan_list 2>&1",
+-             phyName, radio_idx);
+-
+-    SAH_TRACEZ_INFO(ME, "%s: displaySuperChanList cmd='%s'", pR->Name, cmd);
+-    if(s_cfg80211tool_run(cmd, out, sizeof(out)) != SWL_RC_OK) {
+-        SAH_TRACEZ_ERROR(ME, "%s: displaySuperChanList: popen failed", pR->Name);
++    SAH_TRACEZ_INFO(ME, "%s: displaySuperChanList via NL vendor cmd", pR->Name);
++    swl_rc_ne rc = wld_rad_nl80211_displaySuperChanList(pR);
++    if(rc != SWL_RC_OK) {
++        SAH_TRACEZ_ERROR(ME, "%s: displaySuperChanList: NL vendor cmd failed rc=%d", pR->Name, rc);
+         amxc_var_set(cstring_t, retval, "");
+         return amxd_status_unknown_error;
+     }
+-    amxc_var_set(cstring_t, retval, out);
++    amxc_var_set(cstring_t, retval, "display_super_chan_list:0");
+     return amxd_status_ok;
+ }
+
