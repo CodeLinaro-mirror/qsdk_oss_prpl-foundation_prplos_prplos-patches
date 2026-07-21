@@ -1,0 +1,81 @@
+From: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+Date: Thu, 17 Jul 2026
+Subject: [PATCH] fix: persist RegulatoryDomain and apply PowerType live on 6 GHz
+
+Signed-off-by: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+---
+ src/nl80211/wld_hostapd_cfgFile.c    |  1 +
+ src/nl80211/wld_hostapd_cfgManager.c |  1 +
+ src/nl80211/wld_rad_hostapd_api.c   |  5 +++++
+ src/Plugin/wifiGen_fsm.c            |  1 +
+ src/wld_radio.c                     |  6 ++++--
+ 5 files changed, 12 insertions(+), 2 deletions(-)
+
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -1387,7 +1387,10 @@ static swl_rc_ne s_setCountryCode(T_Radio* pR, const char* countryCode, bool di
+     pR->regulatoryDomainIdx = idx;
+     if(direct && (pR->pFA->mfn_wrad_regdomain(pR, NULL, 0, SET | DIRECT) == SWL_RC_OK)) {
+         pR->pFA->mfn_wrad_poschans(pR, NULL, 0);
+-        return SWL_RC_OK;
++        /* Also schedule a hostapd config write so country_code is persisted to
++         * hostapd.conf, even though the kernel was updated directly above. */
++        pR->pFA->mfn_wrad_regdomain(pR, NULL, 0, SET);
++        return SWL_RC_OK;
+     }
+     pR->pFA->mfn_wrad_regdomain(pR, NULL, 0, SET);
+     return rc;
+@@ -2306,9 +2306,7 @@ void syncData_Radio2OBJ(amxd_object_t* object, T_Radio* pR, int set) {
+
+
+
+-        TBuf[0] = '\0';
+-        pR->pFA->mfn_wrad_regdomain(pR, TBuf, sizeof(TBuf), GET);
+-        amxd_trans_set_cstring_t(&trans, "RegulatoryDomain", TBuf);
++        amxd_trans_set_cstring_t(&trans, "RegulatoryDomain", pR->regulatoryDomain);
+
+         amxd_trans_set_bool(&trans, "MultiUserMIMOSupported", pR->multiUserMIMOSupported);
+         amxd_trans_set_bool(&trans, "ImplicitBeamFormingSupported", pR->implicitBeamFormingSupported);
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -570,6 +570,7 @@ static void s_setRadioConfig(T_Radio* pRad, swl_mapChar_t* radConfigMap) {
+              */
+             SAH_TRACEZ_INFO(ME, "%s: Adding 6GHz regulatory power type to %d", pRad->Name, pRad->PowerType);
+             swl_mapCharFmt_addValInt32(radConfigMap, "he_6ghz_reg_pwr_type", pRad->PowerType);
++            swl_mapCharFmt_addValInt32(radConfigMap, "enable_best_power_mode", 0);
+         }
+     }
+     if(SWL_BIT_IS_SET(pRad->supportedStandards, SWL_RADSTD_BE)) {
+--- a/src/nl80211/wld_hostapd_cfgManager.c
++++ b/src/nl80211/wld_hostapd_cfgManager.c
+@@ -219,6 +219,7 @@ bool wld_hostapd_createBssConfig(wld_hostapd_bssConfig_t** ppbssConfig, swl_map
+         "eht_oper_chwidth", "eht_oper_centr_freq_seg0_idx",
+         "eht_su_beamformer", "eht_su_beamformee", "eht_mu_beamformer",
+         "op_class", "noscan", "ht_coex", "preamble",
++        "he_6ghz_reg_pwr_type",
+     };
+
+     for(uint32_t i = 0; i < SWL_ARRAY_SIZE(minimalRadioParamsForBssConfig); i++) {
+--- a/src/nl80211/wld_rad_hostapd_api.c
++++ b/src/nl80211/wld_rad_hostapd_api.c
+@@ -384,6 +384,11 @@ wld_secDmn_action_rc_ne wld_rad_hostapd_setMiscParams(T_Radio* pRad) {
+         wld_ap_hostapd_setParamValue(primaryVap, miscRadParams[i], swl_mapChar_get(&radParams, (char*) miscRadParams[i]), "");
+     }
+     swl_mapChar_cleanup(&radParams);
++    if(wld_rad_is_6ghz(pRad)) {
++        char pwrCmd[64];
++        snprintf(pwrCmd, sizeof(pwrCmd), "set_6ghz_power_mode %d", (int) pRad->PowerType);
++        wld_ap_hostapd_sendCommand(primaryVap, pwrCmd, "PowerType");
++    }
+
+     swl_mapChar_t vapParams;
+     swl_mapChar_init(&vapParams);
+--- a/src/Plugin/wifiGen_fsm.c
++++ b/src/Plugin/wifiGen_fsm.c
+@@ -2297,6 +2297,7 @@ static void s_radioChange(wld_rad_changeEvent_t* event) {
+                 char savedRegDom[8] = {0};
+                 if(!(swl_rc_isOk(wifiGen_hapd_getConfiguredCountryCode(pTmpRad, savedRegDom, sizeof(savedRegDom))) &&
+                      swl_str_matches(savedRegDom, regDom)) &&
++                   !(!swl_str_isEmpty(pTmpRad->regulatoryDomain) && !swl_str_matches(pTmpRad->regulatoryDomain, regDom)) &&
+                    (getCountryParam(regDom, 0, &pTmpRad->regulatoryDomainIdx) != -1)) {
+                     SAH_TRACEZ_INFO(ME, "%s: applying country %s (wiphy %d)", pTmpRad->Name, regDom, pTmpRad->wiphy);
