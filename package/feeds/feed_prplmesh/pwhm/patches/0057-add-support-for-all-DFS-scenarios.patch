@@ -1,0 +1,1812 @@
+From b3b87d94fadc8d16acf8dfcb6a2322f48dd63efd Mon Sep 17 00:00:00 2001
+From: Atchaya R <ratchaya@qti.qualcomm.com>
+Date: Thu, 23 Jul 2026 23:50:43 +0530
+Subject: [PATCH] pwhm: add support for all DFS scenarios in PWHM
+
+Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
+---
+ include/wld/wld.h                   |   1 +
+ include/wld/wld_rad_nl80211.h       | 106 ++++++
+ odl/wld_endpoint.odl                |  21 ++
+ odl/wld_radio.odl                   | 166 ++++++++-
+ src/ChannelManagement/wld_bgdfs.c   | 244 +++++++++++++
+ src/ChannelManagement/wld_chanmgt.c | 137 +++++++-
+ src/Plugin/wifiGen_eventHandlers.c  | 131 ++++++-
+ src/Plugin/wifiGen_hapd.c           |  59 ++++
+ src/Plugin/wifiGen_wpaSupp.c        |  35 ++
+ src/nl80211/wld_hostapd_cfgFile.c   |  33 ++
+ src/nl80211/wld_rad_nl80211.c       | 528 ++++++++++++++++++++++++++++
+ src/wld_radio.c                     | 100 ++++--
+ 12 files changed, 1507 insertions(+), 54 deletions(-)
+
+--- a/include/wld/wld.h
++++ b/include/wld/wld.h
+@@ -1051,6 +1051,7 @@ typedef enum {
+     CHAN_REASON_OBSS_COEX, //coexistence activated
+     CHAN_REASON_EP_MOVE,   // Endpoint moving
+     CHAN_REASON_RESET,     // plugin reset channel if an invalid change occurred
++    CHAN_REASON_AWGN,      // AWGN noise detected (6GHz), reported by QCA_NL80211_VENDOR_SUBCMD_CH_SWITCH_REASON
+     CHAN_REASON_MAX
+ } wld_channelChangeReason_e;
+ extern const char* g_wld_channelChangeReason_str[];
+--- a/include/wld/wld_rad_nl80211.h
++++ b/include/wld/wld_rad_nl80211.h
+@@ -602,6 +602,106 @@ swl_rc_ne wld_rad_nl80211_getRadarDetect
+  *         <= SWL_RC_ERROR otherwise
+  */
+ swl_rc_ne wld_rad_nl80211_setSubChannelMarking(T_Radio* pRad, bool enable);
++
++/*
++ * @brief Set DFS CAC timeout via NL80211 vendor command.
++ *
++ * Sends vendor SET command (subcmd=505) with dparam1=QCA_WLAN_VENDOR_RADIO_PARAM_CAC_TIMEOUT
++ * to override the CAC duration for the current radio / frequency range.
++ * Range: 1–86400 seconds (0 is rejected).
++ */
++
++swl_rc_ne wld_rad_nl80211_setCacTimeout(T_Radio* pRad, uint32_t timeoutSec);
++
++/*
++ * @brief Get DFS CAC timeout via NL80211 vendor command.
++ *
++ * Sends vendor GET command (subcmd=506) with dparam1=QCA_WLAN_VENDOR_RADIO_PARAM_CAC_TIMEOUT
++ * to read the current CAC timeout override (or derive from active channel).
++ *
++ * @param pRad pointer to radio context
++ * @param pTimeoutSec pointer to store the CAC timeout in seconds
++ *
++ * @return SWL_RC_OK in case of success
++ *         <= SWL_RC_ERROR otherwise
++ */
++swl_rc_ne wld_rad_nl80211_getCacTimeout(T_Radio* pRad, uint32_t* pTimeoutSec);
++
++/*
++ * @brief Get CAC state (in-progress or not) via NL80211 vendor command.
++ *
++ * Sends vendor GET command (subcmd=506) with dparam1=QCA_WLAN_VENDOR_RADIO_PARAM_CAC_STATE.
++ * Returns true if CAC is currently in progress, false if completed or not running.
++ *
++ * @param pRad pointer to radio context
++ * @param pInProgress pointer to store the CAC state (true = in progress)
++ *
++ * @return SWL_RC_OK in case of success
++ *         <= SWL_RC_ERROR otherwise
++ */
++swl_rc_ne wld_rad_nl80211_getCacState(T_Radio* pRad, bool* pInProgress);
++
++/*
++ * @brief List per-channel information for all 5GHz channels via NL80211 vendor command.
++ *
++ * Sends vendor GET command (subcmd=506) with dparam1=QCA_WLAN_VENDOR_RADIO_PARAM_LIST_5GHZ_CHAN_INFO (88).
++ * Returns raw response data as a hex string in buf.
++ * For each 5GHz channel the response contains:
++ *   channel number, operating class, DFS state, remaining CAC time,
++ *   CAC completion time, remaining NOP time.
++ *
++ * @param pRad pointer to radio context
++ * @param buf output buffer to store the hex-encoded response
++ * @param bufSize size of the output buffer
++ *
++ * @return SWL_RC_OK in case of success
++ *         <= SWL_RC_ERROR otherwise
++ */
++swl_rc_ne wld_rad_nl80211_list5GhzChanInfo(T_Radio* pRad, char* buf, size_t bufSize);
++
++/*
++ * @brief Set Background CAC timeout multiplier via NL80211 vendor command.
++ *
++ * Sends vendor SET command (subcmd=505) with dparam1=QCA_WLAN_VENDOR_RADIO_PARAM_BGCAC_TIMEOUT (89).
++ * The multiplier is applied to the background CAC timer duration.
++ * Value 0 means use the standard timer.
++ *
++ * @param pRad pointer to radio context
++ * @param multiplier background CAC timeout multiplier (0 = use default)
++ *
++ * @return SWL_RC_OK in case of success
++ *         <= SWL_RC_ERROR otherwise
++ */
++swl_rc_ne wld_rad_nl80211_setBgCacTimeout(T_Radio* pRad, uint32_t multiplier);
++
++/*
++ * @brief Set BlockDfsList (block/unblock DFS channels) via NL80211 vendor command.
++ *
++ * Sends vendor SET command (subcmd=505) with dparam1=QCA_WLAN_VENDOR_RADIO_PARAM_BLOCK_DFS_LIST (90).
++ * When block=1, DFS channels are blocked from ACS and manual configuration.
++ * When block=0, DFS channels are allowed.
++ *
++ * @param pRad pointer to radio context
++ * @param block 1 to block DFS channels, 0 to allow
++ *
++ * @return SWL_RC_OK in case of success
++ *         <= SWL_RC_ERROR otherwise
++ */
++
++swl_rc_ne wld_rad_nl80211_setBlockDfsList(T_Radio* pRad, uint32_t block);
++
++/*
++ * @brief Get BlockDfsList state via NL80211 vendor command.
++ *
++ * Sends vendor GET command (subcmd=506) with dparam1=QCA_WLAN_VENDOR_RADIO_PARAM_BLOCK_DFS_LIST (90).
++ *
++ * @param pRad pointer to radio context
++ * @param pBlock pointer to store the current block state (1=blocked, 0=allowed)
++ *
++ * @return SWL_RC_OK in case of success
++ *         <= SWL_RC_ERROR otherwise
++ */
++swl_rc_ne wld_rad_nl80211_getBlockDfsList(T_Radio* pRad, uint32_t* pBlock);
+ swl_rc_ne wld_rad_nl80211_displayBandChans(T_Radio* pRad);
+ swl_rc_ne wld_rad_nl80211_displaySuperChanList(T_Radio* pRad);
+ #endif /* INCLUDE_WLD_WLD_RAD_NL80211_H_ */
+--- a/odl/wld_endpoint.odl
++++ b/odl/wld_endpoint.odl
+@@ -864,6 +864,27 @@
+ 			%read-only uint32 DisassocTime;
+ 		}
+ 
++		/**
++		 * Enable or disable STA DFS (Station Dynamic Frequency Selection).
++		 *
++		 * When true (default), wpa_supplicant uses the driver's sta_dfs_en
++		 * capability (reported via NL80211_ATTR_STA_DFS_EN) to:
++		 *   - Track NOL (Non-Occupancy List) history for DFS channels
++		 *   - Perform pre-association CAC when connecting to a channel in NOL history
++		 *   - Send RCSA to the uplink AP on radar detection (requires
++		 *     Radio.CSwOpts bits 0x10 and/or 0x20 to be set)
++		 *
++		 * When false, cswopts=0 is written to wpa_supplicant.conf, disabling
++		 * all channel-switch options regardless of the Radio.CSwOpts setting.
++		 *
++		 * Note: The underlying sta_dfs_en capability is reported by the kernel
++		 * driver (QCA NL80211_ATTR_STA_DFS_EN). This parameter controls whether
++		 * PWHM enables the STA DFS feature by writing the cswopts config key.
++		 */
++		%persistent bool STADfsEnable {
++			default true;
++		}
++
+ 		/** When this is toggled, we must check for updating the full
+ 		 *  config!
+ 		 *  <p>Enables or disables this Profile.
+--- a/odl/wld_radio.odl
++++ b/odl/wld_radio.odl
+@@ -155,6 +155,7 @@ define probelist_t{
+ 		event 'ChannelSwitchComplete!';
+ 		event 'Channel change event!';
+ 		event 'DFS Done!';
++		event 'ChannelSwitchReason!';
+ 		
+ 		/**
+ 		 * getSpectrumInfo() returns a list of channels the radio
+@@ -505,6 +506,24 @@ define probelist_t{
+ 		string displaySuperChanList();
+ 
+ 		/**
++		 * @brief List per-channel information for all 5GHz channels.
++		 *
++		 * Queries the driver via cfg80211tool list_5ghz_chan_info.
++		 * Uses QCA_WLAN_VENDOR_RADIO_PARAM_GET_5GHZ_CHAN_INFO.
++		 *
++		 * For each 5GHz channel the output contains:
++		 *   - Channel number
++		 *   - Operating class
++		 *   - DFS state
++		 *   - Remaining CAC time
++		 *   - CAC completion time
++		 *   - Remaining NOP time
++		 *
++		 * @return string  Driver output, or empty string on failure.
++		 */
++		string list5GhzChanInfo();
++
++		/**
+ 		 * Get the maximum TX Power value for the given channel
+ 		 * @param channel: target channel.
+ 		 */
+@@ -1215,6 +1234,29 @@ define probelist_t{
+ 			}
+ 		}
+ 
++		/**
++		 * Channel Switch Options bitmap for DFS repeater / STA-DFS operation.
++		 *
++		 * Written to hostapd.conf as:       CSwOpts=<value>  (AP side)
++		 * Written to wpa_supplicant.conf as: cswopts=<value>  (STA side)
++		 *
++		 * Bitmap definition (from hostapd qcn_extns/cmn.h):
++		 *   Bit 0 (0x01): Random non-DFS channel selection on radar
++		 *   Bit 1 (0x02): Ignore CSA from Root AP on DFS channel
++		 *   Bit 2 (0x04): CAC before joining Root AP (STA CAC)
++		 *   Bit 3 (0x08): Repeater AP propagates CSA received from Root AP
++		 *   Bit 4 (0x10): Send RCSA to uplink AP on radar detection
++		 *   Bit 5 (0x20): Process received RCSA from downstream
++		 *   Bit 6 (0x40): Apriori next channel propagation
++		 *
++		 * Default 0 = all options disabled.
++		 * Maximum valid value is 0x7F (all 7 bits set).
++		 */
++		%persistent uint32 CSwOpts {
++			on action validate call check_maximum 127;
++			default 0;
++		}
++
+ 		/** <p>The current radio channel used by the connection. To
+ 			 request automatic channel selection, set AutoChannelEnable
+ 			 to true. Whenever AutoChannelEnable is true, the value of
+@@ -2799,6 +2841,39 @@ define probelist_t{
+ 			}
+ 
+ 			/**
++			 * Custom CAC timeout in seconds.
++			 * When set to a non-zero value, this overrides the default CAC duration.
++			 * Set to 0 to use the driver default CAC timeout
++			 * (driver default: 60 s for regular DFS channels,
++			 *                   600 s for weather radar channels).
++			 * Range: 0 (use driver default) or 1–86400 seconds.
++			 */
++			%persistent uint32 CacTimeout {
++				on action validate call check_range { min = 0, max = 86400 };
++				default 0;
++			}
++
++			/**
++			 * Returns true if CAC is currently in progress on this radio.
++			 * Queries driver via: QCA_NL80211_VENDOR_SUBCMD_GET_WIPHY_CONFIGURATION (506)
++			 *                     → QCA_WLAN_VENDOR_RADIO_PARAM_CAC_STATE
++			 */
++			%read-only bool CacState {
++				on action read call wld_chanmgt_getCacState_prf;
++				default false;
++			}
++
++			/**
++			 * Block DFS channels from being selected by ACS or manual configuration.
++			 * When set to 1, DFS channels are blocked.
++			 * When set to 0, DFS channels are allowed.
++			 */
++			%persistent uint32 BlockDfsList {
++				on action validate call check_range { min = 0, max = 1 };
++				default 0;
++			}
++
++			/**
+ 			 * IEEE Channel number to be used at boot.
+ 			 * Only applied when AutoChannelEnable is active.
+ 			 * Possible value :
+@@ -2873,12 +2948,45 @@ define probelist_t{
+ 				 * Set BgDfs enable on this radio
+ 				 * This parameter will allow the system to preclear DFS channels
+ 				 */
+-				%persistent bool PreclearEnable{
+-					default false;
+-				}
++			%persistent bool PreclearEnable{
++				default false;
++			}
+ 
+-				/**
+-				 * Set BgDfs allow provider on this radio
++			/**
++			 * Background CAC multiplier (reserved, not linked to driver).
++			 * Default value of 0 means use the standard timer.
++			 */
++			%persistent uint32 BgCacMultiplier {
++				on action validate call check_range { min = 0, max = 100 };
++				default 0;
++			}
++
++			/**
++			 * Background CAC timeout.
++			 * Sets the background CAC timeout via NL80211 vendor command
++			 * (QCA_WLAN_VENDOR_RADIO_PARAM_BGCAC_TIMEOUT = 89).
++			 * Value 0 = use default timer.
++			 */
++			%persistent uint32 BgCacTimeout {
++				on action validate call check_range { min = 0, max = 86400 };
++				default 0;
++			}
++
++			/**
++			 * Enable DFS bandwidth reduction for Agile CAC.
++			 * When enabled, Agile CAC runs at half the configured bandwidth:
++			 *   - Radio at 80MHz  → Agile CAC runs at 40MHz
++			 *   - Radio at 160MHz → Agile CAC runs at 80MHz
++			 * Written to hostapd.conf as: dfs_bw_reduce_en=1
++			 * Corresponds to hostapd conf->dfs_bw_reduce_en.
++			 * Required for SA domain testing where Agile must run in half BW.
++			 */
++			%persistent bool BwReduceEnable {
++				default false;
++			}
++
++			/**
++			 * Set BgDfs allow provider on this radio
+ 				 * This parameter will allow the system to use an external bgdfs provider
+ 				 * to do its bgdfs clear
+ 				 */
+@@ -2971,12 +3079,48 @@ define probelist_t{
+ 				 */
+ 				void startBgDfsClear(%in %mandatory uint8 channel, %in uint32 bandwidth);
+ 
+-				/**
+-				 * Stop BgDfs
+-				 * Stop any active BgDFS clearing. This can be both due to manual trigger, as automatic trigger.
+-				 */
+-				void stopBgDfsClear();
+-			}
++			/**
++			 * Stop BgDfs
++			 * Stop any active BgDFS clearing. This can be both due to manual trigger, as automatic trigger.
++			 */
++			void stopBgDfsClear();
++
++			/**
++			 * Set the rolling CAC (rCAC) frequency.
++			 * Sends: SET_RCAC_FREQ channel <chan> [<bw>] via hostapd wpa_ctrl.
++			 * Equivalent to: hostapd_cli -i <ifname> set_rcac_freq channel <chan> <bw>
++			 * If BgDfs is running via iw dev, it is stopped first (PRD constraint).
++			 * @param channel: target channel number (mandatory)
++			 * @param bw: bandwidth in MHz (optional, 0 = auto)
++			 * @return true on success, false on failure
++			 */
++			bool setRcacFreq(%in %mandatory uint32 channel, %in uint32 bw);
++
++			/**
++			 * Switch to the rCAC channel.
++			 * Sends: SWITCH_TO_RCAC via hostapd wpa_ctrl.
++			 * Equivalent to: hostapd_cli -i <ifname> switch_to_rcac
++			 * If BgDfs is running via iw dev, it is stopped first (PRD constraint).
++			 * @return true on success, false on failure
++			 */
++			bool switchToRcac();
++
++			/**
++			 * Get the current rCAC frequency.
++			 * Sends: GET_RCAC_FREQ via hostapd wpa_ctrl.
++			 * Equivalent to: hostapd_cli -i <ifname> get_rcac_freq
++			 * @return string with rCAC frequency info, or empty string on failure
++			 */
++			string getRcacFreq();
++
++			/**
++			 * Reset the preCAC list.
++			 * Sends: PRECAC_RESET_LIST via hostapd wpa_ctrl.
++			 * Equivalent to: hostapd_cli -i <ifname> precac_reset_list
++			 * @return true on success, false on failure
++			 */
++			bool resetPreCacList();
++		}
+ 
+ 		}
+ 
+--- a/src/ChannelManagement/wld_bgdfs.c
++++ b/src/ChannelManagement/wld_bgdfs.c
+@@ -73,6 +73,9 @@
+ #include "wld_chanmgt.h"
+ #include "wld_bgdfs.h"
+ #include "wld_channel.h"
++#include "wld_accesspoint.h"
++#include "wld_wpaCtrl_api.h"
++#include "wld_rad_nl80211.h"
+ 
+ #define ME "chanDfs"
+ 
+@@ -408,9 +411,39 @@ static void s_setBgdfsProvider_pwf(void*
+     SAH_TRACEZ_OUT(ME);
+ }
+ 
++/**
++ * @brief Write handler for ChannelMgt.BgDfs.BgCacTimeout
++ *
++ * Sets the background CAC timeout via NL80211 vendor command.
++ * Sends: QCA_NL80211_VENDOR_SUBCMD_SET_WIPHY_CONFIGURATION (505)
++ *        → QCA_WLAN_VENDOR_RADIO_PARAM_BGCAC_TIMEOUT (dparam1=89)
++ * Value 0 = use default timer.
++ *
++ * Test: ubus-cli Device.WiFi.Radio.2.ChannelMgt.BgDfs.BgCacTimeout=65
++ */
++static void s_setBgCacTimeout_pwf(void* priv _UNUSED, amxd_object_t* object,
++                                   amxd_param_t* param _UNUSED,
++                                   const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_Radio* pR = wld_rad_fromObj(amxd_object_get_parent(amxd_object_get_parent(object)));
++    ASSERT_NOT_NULL(pR, , ME, "NULL");
++
++    uint32_t timeout = amxc_var_dyncast(uint32_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set BgCacTimeout %u", pR->Name, timeout);
++
++    int ret = wld_rad_nl80211_setBgCacTimeout(pR, timeout);
++    if(ret != 0) {
++        SAH_TRACEZ_ERROR(ME, "%s: setBgCacTimeout(%u) failed ret=%d", pR->Name, timeout, ret);
++    }
++
++    SAH_TRACEZ_OUT(ME);
++}
++
+ SWLA_DM_HDLRS(sRadBgDfsDmHdlrs,
+               ARR(SWLA_DM_PARAM_HDLR("PreclearEnable", s_setEnable_pwf),
+                   SWLA_DM_PARAM_HDLR("AllowProvider", s_setBgdfsProvider_pwf),
++                  SWLA_DM_PARAM_HDLR("BgCacTimeout", s_setBgCacTimeout_pwf),
+                   ));
+ 
+ void _wld_radBgDfs_setConf_ocf(const char* const sig_name,
+@@ -510,3 +543,214 @@ amxd_status_t _stopBgDfsClear(amxd_objec
+ 
+     return status;
+ }
++
++/**
++ * @brief Helper: get the first active (or enabled) AP on a radio for wpa_ctrl commands.
++ */
++static T_AccessPoint* s_bgdfs_getAp(T_Radio* pRad) {
++    T_AccessPoint* pAP = wld_rad_getFirstActiveAp(pRad);
++    if(pAP == NULL) {
++        pAP = wld_rad_getFirstEnabledVap(pRad);
++    }
++    return pAP;
++}
++
++/**
++ * @brief Set the rolling CAC (rCAC) frequency.
++ *
++ * Sends: SET_RCAC_FREQ channel <chan> [<bw>] via hostapd wpa_ctrl.
++ * Equivalent to: hostapd_cli -i <ifname> set_rcac_freq channel <chan> <bw>
++ *
++ * PRD constraint: "Simultaneous use of hostapd_cli and iw dev for starting
++ * Background CAC is not supported. If Background CAC is started using iw dev,
++ * it must be stopped using iw dev before initiating it again via hostapd_cli."
++ *
++ * If a BgDfs clear is currently running via iw dev (bgdfs_config.channel != 0),
++ * it is stopped first before sending the hostapd_cli command.
++ *
++ * @param channel: target channel number (mandatory)
++ * @param bw: bandwidth in MHz (optional, 0 = omit from command)
++ * @return true on success, false on failure
++ */
++amxd_status_t _setRcacFreq(amxd_object_t* object,
++                            amxd_function_t* func _UNUSED,
++                            amxc_var_t* args,
++                            amxc_var_t* retval) {
++    SAH_TRACEZ_IN(ME);
++
++    T_Radio* pR = wld_rad_fromObj(amxd_object_get_parent(amxd_object_get_parent(object)));
++    ASSERT_NOT_NULL(pR, amxd_status_ok, ME, "No mapped radio ctx");
++
++    uint32_t channel = GET_UINT32(args, "channel");
++    uint32_t bw = GET_UINT32(args, "bw");
++
++    /*
++     * PRD constraint: if BgDfs is currently running via iw dev (ZWDFS/NL80211),
++     * stop it first before using hostapd_cli. Mixing the two mechanisms
++     * simultaneously is not supported.
++     */
++    if(wld_bgdfs_isRunning(pR)) {
++        SAH_TRACEZ_WARNING(ME, "%s: setRcacFreq: iw dev BgDfs is running (ch=%u), "
++                           "stopping it first before using hostapd_cli",
++                           pR->Name, pR->bgdfs_config.channel);
++        pR->pFA->mfn_wrad_bgdfs_stop(pR);
++        pR->bgdfs_stats.nrClearStopChange[pR->bgdfs_config.type]++;
++        pR->bgdfs_config.channel = 0;
++        pR->bgdfs_config.bandwidth = SWL_BW_AUTO;
++        s_resetStatus(pR);
++    }
++
++    T_AccessPoint* pAP = s_bgdfs_getAp(pR);
++    if(pAP == NULL) {
++        SAH_TRACEZ_ERROR(ME, "%s: setRcacFreq: no AP available", pR->Name);
++        amxc_var_set(bool, retval, false);
++        SAH_TRACEZ_OUT(ME);
++        return amxd_status_ok;
++    }
++
++    SAH_TRACEZ_INFO(ME, "%s: setRcacFreq channel=%u bw=%u", pR->Name, channel, bw);
++    swl_rc_ne rc;
++    if(bw > 0) {
++        rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pAP->wpaCtrlInterface, "OK",
++                                                  "SET_RCAC_FREQ channel %u %u", channel, bw);
++    } else {
++        rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pAP->wpaCtrlInterface, "OK",
++                                                  "SET_RCAC_FREQ channel %u", channel);
++    }
++
++    amxc_var_set(bool, retval, swl_rc_isOk(rc));
++    SAH_TRACEZ_OUT(ME);
++    return amxd_status_ok;
++}
++
++/**
++ * @brief Switch to the rCAC channel.
++ *
++ * Sends: SWITCH_TO_RCAC via hostapd wpa_ctrl.
++ * Equivalent to: hostapd_cli -i <ifname> switch_to_rcac
++ *
++ * PRD constraint: if BgDfs is currently running via iw dev (ZWDFS/NL80211),
++ * it is stopped first before sending the hostapd_cli command.
++ *
++ * @return true on success, false on failure
++ */
++amxd_status_t _switchToRcac(amxd_object_t* object,
++                             amxd_function_t* func _UNUSED,
++                             amxc_var_t* args _UNUSED,
++                             amxc_var_t* retval) {
++    SAH_TRACEZ_IN(ME);
++
++    T_Radio* pR = wld_rad_fromObj(amxd_object_get_parent(amxd_object_get_parent(object)));
++    ASSERT_NOT_NULL(pR, amxd_status_ok, ME, "No mapped radio ctx");
++
++    /*
++     * PRD constraint: if BgDfs is currently running via iw dev (ZWDFS/NL80211),
++     * stop it first before using hostapd_cli. Mixing the two mechanisms
++     * simultaneously is not supported.
++     */
++    if(wld_bgdfs_isRunning(pR)) {
++        SAH_TRACEZ_WARNING(ME, "%s: switchToRcac: iw dev BgDfs is running (ch=%u), "
++                           "stopping it first before using hostapd_cli",
++                           pR->Name, pR->bgdfs_config.channel);
++        pR->pFA->mfn_wrad_bgdfs_stop(pR);
++        pR->bgdfs_stats.nrClearStopChange[pR->bgdfs_config.type]++;
++        pR->bgdfs_config.channel = 0;
++        pR->bgdfs_config.bandwidth = SWL_BW_AUTO;
++        s_resetStatus(pR);
++    }
++
++    T_AccessPoint* pAP = s_bgdfs_getAp(pR);
++    if(pAP == NULL) {
++        SAH_TRACEZ_ERROR(ME, "%s: switchToRcac: no AP available", pR->Name);
++        amxc_var_set(bool, retval, false);
++        SAH_TRACEZ_OUT(ME);
++        return amxd_status_ok;
++    }
++
++    SAH_TRACEZ_INFO(ME, "%s: switchToRcac", pR->Name);
++    swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pAP->wpaCtrlInterface, "OK",
++                                                        "SWITCH_TO_RCAC");
++
++    amxc_var_set(bool, retval, swl_rc_isOk(rc));
++    SAH_TRACEZ_OUT(ME);
++    return amxd_status_ok;
++}
++
++/**
++ * @brief Get the current rCAC frequency.
++ *
++ * Sends: GET_RCAC_FREQ via hostapd wpa_ctrl.
++ * Equivalent to: hostapd_cli -i <ifname> get_rcac_freq
++ *
++ * @return string with rCAC frequency info, or empty string on failure
++ */
++amxd_status_t _getRcacFreq(amxd_object_t* object,
++                            amxd_function_t* func _UNUSED,
++                            amxc_var_t* args _UNUSED,
++                            amxc_var_t* retval) {
++    SAH_TRACEZ_IN(ME);
++
++    T_Radio* pR = wld_rad_fromObj(amxd_object_get_parent(amxd_object_get_parent(object)));
++    ASSERT_NOT_NULL(pR, amxd_status_ok, ME, "No mapped radio ctx");
++
++    T_AccessPoint* pAP = s_bgdfs_getAp(pR);
++    if(pAP == NULL) {
++        SAH_TRACEZ_ERROR(ME, "%s: getRcacFreq: no AP available", pR->Name);
++        amxc_var_set(cstring_t, retval, "");
++        SAH_TRACEZ_OUT(ME);
++        return amxd_status_ok;
++    }
++
++    char reply[256] = {0};
++    swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtGetResponse(pAP->wpaCtrlInterface, reply,
++                                                      sizeof(reply), "GET_RCAC_FREQ");
++    if(swl_rc_isOk(rc)) {
++        /* strip trailing newline/carriage return */
++        size_t len = strlen(reply);
++        while(len > 0 && (reply[len - 1] == '\n' || reply[len - 1] == '\r')) {
++            reply[--len] = '\0';
++        }
++        SAH_TRACEZ_INFO(ME, "%s: getRcacFreq reply: '%s'", pR->Name, reply);
++        amxc_var_set(cstring_t, retval, reply);
++    } else {
++        SAH_TRACEZ_ERROR(ME, "%s: getRcacFreq failed (rc=%d)", pR->Name, rc);
++        amxc_var_set(cstring_t, retval, "");
++    }
++
++    SAH_TRACEZ_OUT(ME);
++    return amxd_status_ok;
++}
++
++/**
++ * @brief Reset the preCAC list.
++ *
++ * Sends: PRECAC_RESET_LIST via hostapd wpa_ctrl.
++ * Equivalent to: hostapd_cli -i <ifname> precac_reset_list
++ *
++ * @return true on success, false on failure
++ */
++amxd_status_t _resetPreCacList(amxd_object_t* object,
++                                amxd_function_t* func _UNUSED,
++                                amxc_var_t* args _UNUSED,
++                                amxc_var_t* retval) {
++    SAH_TRACEZ_IN(ME);
++
++    T_Radio* pR = wld_rad_fromObj(amxd_object_get_parent(amxd_object_get_parent(object)));
++    ASSERT_NOT_NULL(pR, amxd_status_ok, ME, "No mapped radio ctx");
++
++    T_AccessPoint* pAP = s_bgdfs_getAp(pR);
++    if(pAP == NULL) {
++        SAH_TRACEZ_ERROR(ME, "%s: resetPreCacList: no AP available", pR->Name);
++        amxc_var_set(bool, retval, false);
++        SAH_TRACEZ_OUT(ME);
++        return amxd_status_ok;
++    }
++
++    SAH_TRACEZ_INFO(ME, "%s: resetPreCacList", pR->Name);
++    swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pAP->wpaCtrlInterface, "OK",
++                                                        "PRECAC_RESET_LIST");
++
++    amxc_var_set(bool, retval, swl_rc_isOk(rc));
++    SAH_TRACEZ_OUT(ME);
++    return amxd_status_ok;
++}
+--- a/src/ChannelManagement/wld_chanmgt.c
++++ b/src/ChannelManagement/wld_chanmgt.c
+@@ -494,6 +494,10 @@ static swl_rc_ne s_checkTargetChanspec(T
+         return wld_chanmgt_setTargetChanspec(pR, chanspec, false, reason, "DFS radar detected");
+     }
+ 
++    if((reason == CHAN_REASON_AWGN) && !swl_typeChanspec_equals(pR->targetChanspec.chanspec, chanspec)) {
++        return wld_chanmgt_setTargetChanspec(pR, chanspec, false, reason, "AWGN interference detected");
++    }
++
+     if((reason == CHAN_REASON_INITIAL) && (pR->targetChanspec.chanspec.channel == 0)) {
+         return wld_chanmgt_setTargetChanspec(pR, chanspec, false, CHAN_REASON_INITIAL, NULL);
+     }
+@@ -1260,20 +1264,49 @@ static void s_setSubChannelMarking_pwf(v
+     SAH_TRACEZ_OUT(ME);
+ }
+ 
+-SWLA_DM_HDLRS(sChanMgtDmHdlrs,
+-              ARR(SWLA_DM_PARAM_HDLR("ChangeLogSize", s_setChannelChangeLogSize_pwf),
+-                  SWLA_DM_PARAM_HDLR("AcsBootChannel", s_setAcsBootChannel_pwf),
+-                  SWLA_DM_PARAM_HDLR("DFSWeatherRadarExclude", s_setDfsNoWradar_pwf),
+-                  SWLA_DM_PARAM_HDLR("IgnoreCAC", s_setIgnoreCac_pwf),
+-                  SWLA_DM_PARAM_HDLR("SubChannelMarkingEnable", s_setSubChannelMarking_pwf),
+-                  SWLA_DM_PARAM_HDLR("NOPPeriod", wld_chanmgt_setNOPPeriod_pwf),
+-                  ));
++/**
++ * @brief Write handler for ChannelMgt.BlockDfsList
++ *
++ * Blocks or unblocks DFS channels from ACS and manual configuration.
++ * Sends: QCA_NL80211_VENDOR_SUBCMD_SET_WIPHY_CONFIGURATION (505)
++ *        → QCA_WLAN_VENDOR_RADIO_PARAM_BLOCK_DFS_LIST (dparam1=90)
++ * Value: 1 = block DFS channels, 0 = allow DFS channels
++ *
++ * Test: ubus-cli Device.WiFi.Radio.2.ChannelMgt.BlockDfsList=1
++ */
++static void s_setBlockDfsList_pwf(void* priv _UNUSED, amxd_object_t* object,
++                                   amxd_param_t* param _UNUSED,
++                                   const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_Radio* pRad = wld_rad_fromObj(amxd_object_get_parent(object));
++    ASSERTI_NOT_NULL(pRad, , ME, "No radio mapped");
++
++    uint32_t block = amxc_var_dyncast(uint32_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set BlockDfsList %u", pRad->Name, block);
++
++    int ret = wld_rad_nl80211_setBlockDfsList(pRad, block);
++    if(ret != 0) {
++        SAH_TRACEZ_ERROR(ME, "%s: setBlockDfsList(%u) failed ret=%d", pRad->Name, block, ret);
++        SAH_TRACEZ_OUT(ME);
++        return;
++    }
++
++    /*
++     * After blocking/unblocking DFS channels, the driver's channel list changes.
++     * Re-read PossibleChannels from the driver so PWHM stays in sync.
++     * Without this, PossibleChannels keeps the stale list from before the change.
++     */
++    SAH_TRACEZ_INFO(ME, "%s: BlockDfsList=%u applied, refreshing PossibleChannels from driver",
++                    pRad->Name, block);
++    pRad->pFA->mfn_wrad_poschans(pRad, NULL, 0);
++
++    SAH_TRACEZ_OUT(ME);
++}
+ 
+ void _wld_chanmgt_setConf_ocf(const char* const sig_name,
+                               const amxc_var_t* const data,
+-                              void* const priv) {
+-    swla_dm_procObjEvtOfLocalDm(&sChanMgtDmHdlrs, sig_name, data, priv);
+-}
++                              void* const priv);
+ 
+ amxd_status_t _wld_chanmgt_validateAcsBootChannel_pvf(amxd_object_t* object,
+                                                       amxd_param_t* param _UNUSED,
+@@ -1314,6 +1347,88 @@ amxd_status_t _wld_chanmgt_getRadarDetec
+     return amxd_status_ok;  
+ }
+ 
++/**
++ * @brief Write handler for ChannelMgt.CacTimeout
++ *
++ * Overrides the DFS CAC timeout for the current radio / frequency range.
++ * Sends: QCA_NL80211_VENDOR_SUBCMD_SET_WIPHY_CONFIGURATION (505)
++ *        → QCA_WLAN_VENDOR_RADIO_PARAM_CAC_TIMEOUT
++ * Range: 1–86400 seconds (0 = use default, skips driver call)
++ *
++ * Test: ubus-cli Device.WiFi.Radio.2.ChannelMgt.CacTimeout=15
++ */
++static void s_setCacTimeout_pwf(void* priv _UNUSED, amxd_object_t* object,
++                                 amxd_param_t* param _UNUSED,
++                                 const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_Radio* pRad = wld_rad_fromObj(amxd_object_get_parent(object));
++    ASSERTI_NOT_NULL(pRad, , ME, "No radio mapped");
++
++    uint32_t timeoutSec = amxc_var_dyncast(uint32_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set CacTimeout %u seconds", pRad->Name, timeoutSec);
++
++    if(timeoutSec == 0) {
++        SAH_TRACEZ_INFO(ME, "%s: CacTimeout=0 means use default, skipping driver call", pRad->Name);
++        SAH_TRACEZ_OUT(ME);
++        return;
++    }
++
++    int ret = wld_rad_nl80211_setCacTimeout(pRad, timeoutSec);
++    if(ret != 0) {
++        SAH_TRACEZ_ERROR(ME, "%s: setCacTimeout(%u) failed ret=%d", pRad->Name, timeoutSec, ret);
++    }
++
++    SAH_TRACEZ_OUT(ME);
++}
++
++SWLA_DM_HDLRS(sChanMgtDmHdlrs,
++              ARR(SWLA_DM_PARAM_HDLR("ChangeLogSize", s_setChannelChangeLogSize_pwf),
++                  SWLA_DM_PARAM_HDLR("AcsBootChannel", s_setAcsBootChannel_pwf),
++                  SWLA_DM_PARAM_HDLR("DFSWeatherRadarExclude", s_setDfsNoWradar_pwf),
++                  SWLA_DM_PARAM_HDLR("IgnoreCAC", s_setIgnoreCac_pwf),
++                  SWLA_DM_PARAM_HDLR("SubChannelMarkingEnable", s_setSubChannelMarking_pwf),
++                  SWLA_DM_PARAM_HDLR("NOPPeriod", wld_chanmgt_setNOPPeriod_pwf),
++                  SWLA_DM_PARAM_HDLR("CacTimeout", s_setCacTimeout_pwf),
++                  SWLA_DM_PARAM_HDLR("BlockDfsList", s_setBlockDfsList_pwf),
++                  ));
++
++void _wld_chanmgt_setConf_ocf(const char* const sig_name,
++                              const amxc_var_t* const data,
++                              void* const priv) {
++    swla_dm_procObjEvtOfLocalDm(&sChanMgtDmHdlrs, sig_name, data, priv);
++}
++
++/**
++ * @brief Read handler for ChannelMgt.CacState
++ *
++ * Returns true if CAC is currently in progress on this radio.
++ * Sends: QCA_NL80211_VENDOR_SUBCMD_GET_WIPHY_CONFIGURATION (506)
++ *        → QCA_WLAN_VENDOR_RADIO_PARAM_CAC_STATE
++ *
++ * Test: ubus-cli Device.WiFi.Radio.2.ChannelMgt.CacState?
++ */
++amxd_status_t wld_chanmgt_getCacState_prf(amxd_object_t* object,
++                                           amxd_param_t* param _UNUSED,
++                                           amxd_action_t reason _UNUSED,
++                                           const amxc_var_t* const args _UNUSED,
++                                           amxc_var_t* const retval,
++                                           void* priv _UNUSED) {
++    T_Radio* pRad = wld_rad_fromObj(amxd_object_get_parent(object));
++    ASSERTI_NOT_NULL(pRad, amxd_status_ok, ME, "No radio mapped");
++
++    bool inProgress = false;
++    int ret = wld_rad_nl80211_getCacState(pRad, &inProgress);
++    if(ret == 0) {
++        SAH_TRACEZ_INFO(ME, "%s: CacState=%d", pRad->Name, inProgress);
++        amxc_var_set(bool, retval, inProgress);
++        return amxd_status_ok;
++    }
++
++    SAH_TRACEZ_ERROR(ME, "%s: getCacState failed ret=%d", pRad->Name, ret);
++    return amxd_status_ok;
++}
++
+ amxd_status_t _wld_chanmgt_setSubChannelMarking_pwf(amxd_object_t* object,
+                                                       amxd_param_t* param _UNUSED,
+                                                       amxd_action_t reason _UNUSED,
+--- a/src/Plugin/wifiGen_eventHandlers.c
++++ b/src/Plugin/wifiGen_eventHandlers.c
+@@ -93,6 +93,7 @@
+ #include "swla/swla_chanspec.h"
+ #include <amxc/amxc.h>
+ #include <errno.h>
++#include <netlink/attr.h>
+ 
+ #define ME "genEvt"
+ #define ACLDENY_EVENT_STR "<3>ACL-DENY"
+@@ -273,7 +274,12 @@ static void s_saveChanChanged(T_Radio* p
+     ASSERTS_NOT_NULL(pRad, , ME, "NULL");
+     ASSERTS_NOT_NULL(pChanSpec, , ME, "NULL");
+     ASSERTS_TRUE(pChanSpec->channel > 0, , ME, "invalid chan");
+-    if((reason != CHAN_REASON_EP_MOVE) && (pRad->targetChanspec.reason == reason)) {
++    /*
++     * CHAN_REASON_AWGN: the driver autonomously selects a new channel — there is no
++     * PWHM-initiated target chanspec. Skip the target-mismatch check so the reason
++     * is not overwritten to CHAN_REASON_INITIAL.
++     */
++    if((reason != CHAN_REASON_EP_MOVE) && (reason != CHAN_REASON_AWGN) && (pRad->targetChanspec.reason == reason)) {
+         swl_chanspec_t chSpec = *pChanSpec;
+         if(pRad->targetChanspec.chanspec.extensionHigh == SWL_CHANSPEC_EXT_AUTO) {
+             chSpec.extensionHigh = SWL_CHANSPEC_EXT_AUTO;
+@@ -418,7 +424,12 @@ static void s_chanSwitchStartedCb(void*
+                        swl_freqBandExt_str[chanSpec->band]);
+ 
+     if(!wld_rad_hasRunningEndpoint(pRad)) {
+-        s_saveChanChanged(pRad, chanSpec, pRad->targetChanspec.reason);
++        /*
++         * Defer to s_chanSwitchCb so the QCA vendor event (e.g. AWGN reason)
++         * can set targetChanspec.reason before the chanspec is committed.
++         */
++        SAH_TRACEZ_WARNING(ME, "%s: no EP running, deferring chanspec update to channel-switch completion event",
++                           pRad->Name);
+         return;
+     }
+ 
+@@ -833,6 +844,14 @@ static void s_awgnInterferenceDetectedCb
+     T_Radio* pRad = (T_Radio*) userData;
+     ASSERT_NOT_NULL(pRad, , ME, "NULL");
+ 
++    /* For AWGN: set reason immediately so s_chanSwitchCb picks it up. */
++    char typeStrAwgn[32] = {0};
++    if(wld_wpaCtrl_getValueStr(params, "type", typeStrAwgn, sizeof(typeStrAwgn)) > 0 &&
++       swl_str_matches(typeStrAwgn, "AWGN")) {
++        pRad->targetChanspec.reason = CHAN_REASON_AWGN;
++        SAH_TRACEZ_INFO(ME, "%s: AWGN interference — set targetChanspec.reason=CHAN_REASON_AWGN", pRad->Name);
++    }
++
+     /*
+      * Explicitly trigger the wpaCtrlEvents AMX signal on the Radio object so that
+      * prplmesh and other bus subscribers receive the INTERFERENCE-DETECTED event.
+@@ -1322,6 +1341,113 @@ static bool s_chechTgtRadListener(void*
+     return false;
+ }
+ 
++/*
++ * QCA vendor OUI and subcmd for channel switch reason notification.
++ * QCA_NL80211_VENDOR_SUBCMD_CH_SWITCH_REASON = 74 (0x4A)
++ * This event is sent by the driver when a channel switch occurs,
++ * carrying the reason for the switch (radar, user request, AWGN, etc.).
++ *
++ * Vendor data attributes (QCA_WLAN_VENDOR_ATTR_CH_SWITCH_REASON):
++ *   Attribute 1 = reason code (uint32)
++ *
++ * Reason codes (QCA_WLAN_VENDOR_ATTR_CH_SWITCH_REASON values):
++ *   0 = RADAR
++ *   1 = USER_REQUEST
++ *   2 = AWGN
++ */
++#define QCA_OUI                             0x001374
++#define QCA_NL80211_VENDOR_SUBCMD_CH_SWITCH_REASON  74
++#define QCA_WLAN_VENDOR_ATTR_CH_SWITCH_REASON       1
++
++static const char* s_chSwitchReasonToStr(uint32_t reason) {
++    switch(reason) {
++    case 0: return "RADAR";
++    case 1: return "USER_REQUEST";
++    case 2: return "AWGN";
++    default: return "UNKNOWN";
++    }
++}
++
++/**
++ * @brief Handle QCA_NL80211_VENDOR_SUBCMD_CH_SWITCH_REASON vendor event.
++ *
++ * This event is sent by the QCA driver when a channel switch occurs.
++ * It carries the reason for the channel switch (radar detection, user
++ * request, AWGN noise, etc.).
++ *
++ * When received, this function:
++ * 1. Parses the vendor subcmd and reason from the nl80211 message
++ * 2. Emits a 'ChannelSwitchReason!' event on the Radio data model object
++ *    with the reason string as event data
++ */
++static void s_vendorEvtCb(void* pRef, void* pData _UNUSED, struct nlmsghdr* nlh, struct nlattr* tb[]) {
++    T_Radio* pRad = (T_Radio*) pRef;
++    ASSERT_NOT_NULL(pRad, , ME, "NULL");
++    ASSERT_NOT_NULL(nlh, , ME, "NULL");
++    ASSERT_NOT_NULL(tb, , ME, "NULL");
++
++    /* Extract vendor OUI and subcmd from nl80211 attributes */
++    if(!tb[NL80211_ATTR_VENDOR_ID] || !tb[NL80211_ATTR_VENDOR_SUBCMD]) {
++        return;
++    }
++
++    uint32_t vendorId = nla_get_u32(tb[NL80211_ATTR_VENDOR_ID]);
++    uint32_t subcmd   = nla_get_u32(tb[NL80211_ATTR_VENDOR_SUBCMD]);
++
++    /* Only handle QCA CH_SWITCH_REASON events */
++    if((vendorId != QCA_OUI) || (subcmd != QCA_NL80211_VENDOR_SUBCMD_CH_SWITCH_REASON)) {
++        return;
++    }
++
++    uint32_t reason = 0;
++
++    /* Parse vendor data to extract the reason attribute */
++    if(tb[NL80211_ATTR_VENDOR_DATA]) {
++        struct nlattr* vendorData = tb[NL80211_ATTR_VENDOR_DATA];
++        struct nlattr* attr;
++        int rem;
++        nla_for_each_nested(attr, vendorData, rem) {
++            if(nla_type(attr) == QCA_WLAN_VENDOR_ATTR_CH_SWITCH_REASON) {
++                reason = nla_get_u32(attr);
++                break;
++            }
++        }
++    }
++
++    const char* reasonStr = s_chSwitchReasonToStr(reason);
++    SAH_TRACEZ_WARNING(ME, "%s: QCA CH_SWITCH_REASON event: reason=%u (%s)",
++                       pRad->Name, reason, reasonStr);
++
++    /*
++     * For AWGN (reason=2): set targetChanspec.reason = CHAN_REASON_AWGN so that
++     * when the subsequent channel switch event fires, s_chanSwitchCb uses
++     * CHAN_REASON_AWGN and wld_rad_chan_update_model() writes "AWGN"
++     */
++    if(reason == 2 /* AWGN */) {
++        pRad->targetChanspec.reason = CHAN_REASON_AWGN;
++        SAH_TRACEZ_INFO(ME, "%s: AWGN detected — set targetChanspec.reason=CHAN_REASON_AWGN",
++                        pRad->Name);
++    }
++
++    /* Emit ChannelSwitchReason! event on the Radio data model object
++     * and update ChannelChangeReason DM parameter with the vendor reason string.
++     * ChannelChangeReason is set here immediately so it is visible before the
++     * channel switch completes. For AWGN it will persist because targetChanspec.reason
++     * is now CHAN_REASON_AWGN, so wld_rad_chan_update_model() will also write "AWGN". */
++    if(pRad->pBus != NULL) {
++        amxc_var_t evtData;
++        amxc_var_init(&evtData);
++        amxc_var_set_type(&evtData, AMXC_VAR_ID_HTABLE);
++        amxc_var_add_key(uint32_t, &evtData, "reason", reason);
++        amxc_var_add_key(cstring_t, &evtData, "reason_str", reasonStr);
++        amxd_object_emit_signal(pRad->pBus, "ChannelSwitchReason!", &evtData);
++        amxc_var_clean(&evtData);
++
++        /* Update ChannelChangeReason DM parameter with the vendor reason string */
++        swl_typeCharPtr_commitObjectParam(pRad->pBus, "ChannelChangeReason", (char*) reasonStr);
++    }
++}
++
+ swl_rc_ne wifiGen_setRadEvtHandlers(T_Radio* pRad) {
+     ASSERT_NOT_NULL(pRad, SWL_RC_INVALID_PARAM, ME, "NULL");
+     ASSERTS_NOT_NULL(pRad->hostapd, SWL_RC_ERROR, ME, "NULL");
+@@ -1339,6 +1465,7 @@ swl_rc_ne wifiGen_setRadEvtHandlers(T_Ra
+     nl80211RadEvtHandlers.fMgtFrameEvtCb = s_frameReceivedCb;
+     nl80211RadEvtHandlers.fRadarEventCb = s_radarEvtCb;
+     nl80211RadEvtHandlers.fCheckTgtCb = s_chechTgtRadListener;
++    nl80211RadEvtHandlers.fVendorEvtCb = s_vendorEvtCb;
+     wld_rad_nl80211_setEvtListener(pRad, NULL, &nl80211RadEvtHandlers);
+ 
+     return SWL_RC_OK;
+--- a/src/Plugin/wifiGen_hapd.c
++++ b/src/Plugin/wifiGen_hapd.c
+@@ -525,6 +525,65 @@ void wifiGen_hapd_writeConfig(T_Radio* p
+      * also write op_class into every neighbor MLO link's config file so that
+      * whichever interface ends up as primary, the 6GHz op_class is present.
+      */
++    /* Write CSwOpts to hostapd config if non-zero (AP side DFS repeater/RCSA support) */
++    {
++        uint32_t cswopts = (uint32_t) amxd_object_get_uint32_t(pRad->pBus, "CSwOpts", NULL);
++        if(cswopts > 0) {
++            char cswopts_conf_path[128] = {0};
++            swl_str_catFormat(cswopts_conf_path, sizeof(cswopts_conf_path),
++                              HOSTAPD_CONF_FILE_PATH_FORMAT, pRad->Name);
++            const char* cswopts_iface = s_getMainIface(pRad);
++            char cswopts_str[16] = {0};
++            snprintf(cswopts_str, sizeof(cswopts_str), "%u", cswopts);
++            wld_hostapd_cfgFile_update(cswopts_conf_path, cswopts_iface, "CSwOpts", cswopts_str);
++            SAH_TRACEZ_WARNING(ME, "%s: STA DFS: added CSwOpts=0x%02x to hostapd config",
++                               pRad->Name, cswopts);
++        }
++    }
++
++    /*
++     * Write CacTimeout to hostapd config if non-zero.
++     * When set, this overrides the default CAC duration.
++     * Sent as: set_cactimeout <seconds>
++     * Corresponds to hostapd conf->cac_time_override.
++     */
++    if(pRad->pBus) {
++        amxd_object_t* chanMgtObj = amxd_object_findf(pRad->pBus, "ChannelMgt");
++        if(chanMgtObj != NULL) {
++            uint32_t cacTimeout = amxd_object_get_uint32_t(chanMgtObj, "CacTimeout", NULL);
++            if(cacTimeout > 0) {
++                char cac_conf_path[128] = {0};
++                swl_str_catFormat(cac_conf_path, sizeof(cac_conf_path),
++                                  HOSTAPD_CONF_FILE_PATH_FORMAT, pRad->Name);
++                const char* cac_iface = s_getMainIface(pRad);
++                char cac_str[16] = {0};
++                snprintf(cac_str, sizeof(cac_str), "%u", cacTimeout);
++                wld_hostapd_cfgFile_update(cac_conf_path, cac_iface, "set_cactimeout", cac_str);
++                SAH_TRACEZ_WARNING(ME, "%s: DFS: added set_cactimeout=%u to hostapd config",
++                                   pRad->Name, cacTimeout);
++            }
++
++            /*
++             * Write BlockDfsList to hostapd config if non-zero.
++             * When set to 1, DFS channels are blocked from ACS and manual selection.
++             * Sent as: blockdfslist <0|1>
++             * Corresponds to hostapd conf->blockdfslist.
++             */
++            uint32_t blockDfsList = amxd_object_get_uint32_t(chanMgtObj, "BlockDfsList", NULL);
++            if(blockDfsList > 0) {
++                char bdfs_conf_path[128] = {0};
++                swl_str_catFormat(bdfs_conf_path, sizeof(bdfs_conf_path),
++                                  HOSTAPD_CONF_FILE_PATH_FORMAT, pRad->Name);
++                const char* bdfs_iface = s_getMainIface(pRad);
++                char bdfs_str[4] = {0};
++                snprintf(bdfs_str, sizeof(bdfs_str), "%u", blockDfsList);
++                wld_hostapd_cfgFile_update(bdfs_conf_path, bdfs_iface, "blockdfslist", bdfs_str);
++                SAH_TRACEZ_WARNING(ME, "%s: DFS: added blockdfslist=%u to hostapd config",
++                                   pRad->Name, blockDfsList);
++            }
++        }
++    }
++
+     if(pRad->autoChannelEnable && wld_rad_is_6ghz(pRad)) {
+         uint8_t op_class = s_get6GhzAcsOpClass(pRad);
+         char op_class_str[8] = {0};
+--- a/src/Plugin/wifiGen_wpaSupp.c
++++ b/src/Plugin/wifiGen_wpaSupp.c
+@@ -193,6 +193,41 @@ swl_rc_ne wifiGen_wpaSupp_reloadDaemon(T
+ void wifiGen_wpaSupp_writeConfig(T_EndPoint* pEP) {
+     ASSERTS_NOT_NULL(pEP, , ME, "NULL");
+     wld_wpaSupp_cfgFile_createExt(pEP);
++
++    /*
++     * Write cswopts to wpa_supplicant global config (STA side DFS/RCSA support).
++     *
++     * cswopts is a global config key in wpa_supplicant.conf (struct wpa_config.cswopts).
++     * It controls channel-switch-handler behaviour when the STA detects radar:
++     *   Bit 4 (0x10): Send RCSA to uplink AP on radar detection
++     *   Bit 5 (0x20): Process received RCSA from downstream
++     *   (other bits: see Radio.CSwOpts documentation)
++     *
++     * If STADfsEnable is false, write cswopts=0 to disable all STA DFS behaviour
++     * regardless of the Radio.CSwOpts setting.
++     */
++    T_Radio* pRad = pEP->pRadio;
++    if(pRad && pRad->pBus && pEP->pBus && pEP->wpaSupp && !swl_str_isEmpty(pEP->wpaSupp->cfgFile)) {
++        bool staDfsEnable = amxd_object_get_bool(pEP->pBus, "STADfsEnable", NULL);
++        uint32_t cswopts = staDfsEnable ?
++            (uint32_t) amxd_object_get_uint32_t(pRad->pBus, "CSwOpts", NULL) : 0;
++        /*
++         * Only write cswopts when non-zero. Writing cswopts=0 causes wpa_supplicant
++         * to fail config parsing on builds that do not support this parameter.
++         * When cswopts=0 (default / STADfsEnable=false), omit the key entirely —
++         * wpa_supplicant defaults to 0 internally.
++         */
++        if(cswopts > 0) {
++            char cswopts_str[16] = {0};
++            snprintf(cswopts_str, sizeof(cswopts_str), "%u", cswopts);
++            wld_wpaSupp_cfgFile_globalConfigUpdate(pEP->wpaSupp->cfgFile, "cswopts", cswopts_str);
++            SAH_TRACEZ_WARNING(ME, "%s: STA DFS: wrote cswopts=%u (STADfsEnable=%d) to wpa_supplicant config",
++                               pEP->Name, cswopts, staDfsEnable);
++        } else {
++            SAH_TRACEZ_INFO(ME, "%s: STA DFS: cswopts=0 (STADfsEnable=%d), not writing to wpa_supplicant config",
++                            pEP->Name, staDfsEnable);
++        }
++    }
+ }
+ 
+ bool wifiGen_wpaSupp_isRunning(T_EndPoint* pEP) {
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -858,6 +858,39 @@ void wld_hostapd_cfgFile_setRadioConfig(
+                             dwellSplit, totalDwell);
+         }
+     }
++
++    /*
++     * Write BgDfs (Background DFS) parameters to the hostapd config file.
++     *
++     * enable_background_radar: written when BgDfs.Available is true.
++     * bgcac_en: written when BgDfs.PreclearEnable is true.
++     * dfs_bw_reduce_en: written when BgDfs.BwReduceEnable is true.
++     *
++     * Note: BgCacTimeout is applied via NL80211 vendor command, not hostapd config.
++     */
++    if(pRad->pBus) {
++        amxd_object_t* bgDfsObj = amxd_object_findf(pRad->pBus, "ChannelMgt.BgDfs");
++        if(bgDfsObj != NULL) {
++            bool bgDfsAvailable = amxd_object_get_bool(bgDfsObj, "Available", NULL);
++            bool preclearEnable = amxd_object_get_bool(bgDfsObj, "PreclearEnable", NULL);
++            bool bwReduceEnable = amxd_object_get_bool(bgDfsObj, "BwReduceEnable", NULL);
++
++            if(bgDfsAvailable) {
++                swl_mapCharFmt_addValInt32(radConfigMap, "enable_background_radar", 1);
++            }
++            if(preclearEnable) {
++                swl_mapCharFmt_addValInt32(radConfigMap, "bgcac_en", 1);
++            }
++            if(bwReduceEnable) {
++                swl_mapCharFmt_addValInt32(radConfigMap, "dfs_bw_reduce_en", 1);
++            }
++
++            SAH_TRACEZ_INFO(ME, "%s: BgDfs config file params written "
++                            "(enable_background_radar=%d, bgcac_en=%d, dfs_bw_reduce_en=%d)",
++                            pRad->Name, bgDfsAvailable ? 1 : 0,
++                            preclearEnable ? 1 : 0, bwReduceEnable ? 1 : 0);
++        }
++    }
+ }
+ 
+ /**
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -182,6 +182,7 @@ const char* g_wld_channelChangeReason_st
+     "OBSS_COEX",
+     "EP_MOVE",
+     "RESET",
++    "AWGN",
+     NULL
+ };
+ 
+@@ -4538,6 +4539,73 @@ amxd_status_t _displaySuperChanList(amxd
+     return amxd_status_ok;
+ }
+ 
++/* ---- list5GhzChanInfo ----
++ *
++ * Queries the driver for per-channel information for all 5GHz channels.
++ * Uses the QCA_WLAN_VENDOR_RADIO_PARAM_GET_5GHZ_CHAN_INFO vendor parameter.
++ *
++ * For each 5GHz channel the output contains:
++ *   - Channel number
++ *   - Operating class
++ *   - DFS state
++ *   - Remaining CAC time
++ *   - CAC completion time
++ *   - Remaining NOP time
++ *
++ * The driver writes the channel info to the kernel log (dmesg), not to stdout.
++ * This function:
++ *   1. Triggers the driver via cfg80211tool list_5ghz_chan_info
++ *   2. Reads the kernel log (dmesg) to capture the output
++ *
++ * Equivalent to:
++ *   cfg80211tool <phyX> radio_idx 0 list_5ghz_chan_info
++ *   dmesg | tail -50
++ *
++ * @return kernel log lines containing 5GHz channel info, or empty string on failure.
++ */
++amxd_status_t _list5GhzChanInfo(amxd_object_t* object,
++                                 amxd_function_t* func _UNUSED,
++                                 amxc_var_t* args _UNUSED,
++                                 amxc_var_t* retval) {
++    T_Radio* pR = wld_rad_fromObj(object);
++    ASSERT_NOT_NULL(pR, amxd_status_unknown_error, ME, "NULL");
++
++    /*
++     * Step 1: trigger the driver via NL80211 vendor command
++     * QCA_NL80211_VENDOR_SUBCMD_GET_WIPHY_CONFIGURATION (506)
++     * → QCA_WLAN_VENDOR_RADIO_PARAM_LIST_5GHZ_CHAN_INFO (dparam1=88)
++     *
++     * This causes the driver to write per-channel info to the kernel log.
++     * The NL80211 response also contains raw binary data (returned as hex).
++     */
++    char hexBuf[4096] = {0};
++    swl_rc_ne rc = wld_rad_nl80211_list5GhzChanInfo(pR, hexBuf, sizeof(hexBuf));
++    if(rc != SWL_RC_OK) {
++        SAH_TRACEZ_WARNING(ME, "%s: list5GhzChanInfo NL80211 command failed rc=%d, falling back to dmesg",
++                           pR->Name, rc);
++    } else {
++        SAH_TRACEZ_INFO(ME, "%s: list5GhzChanInfo NL80211 response: %s", pR->Name, hexBuf);
++    }
++
++    /*
++     * Step 2: read the kernel log to get the human-readable channel info.
++     * The driver writes lines starting with "5GHz channel info" to dmesg
++     * when the vendor command is processed.
++     */
++    char out[QCA_POPEN_OUT_MAX];
++    char dmesg_cmd[256];
++    snprintf(dmesg_cmd, sizeof(dmesg_cmd),
++             "dmesg | grep -A 200 '5GHz channel info' | tail -200 2>&1");
++    SAH_TRACEZ_INFO(ME, "%s: list5GhzChanInfo reading dmesg", pR->Name);
++    if(s_cfg80211tool_run(dmesg_cmd, out, sizeof(out)) != SWL_RC_OK) {
++        SAH_TRACEZ_ERROR(ME, "%s: list5GhzChanInfo: dmesg read failed", pR->Name);
++        amxc_var_set(cstring_t, retval, "");
++        return amxd_status_unknown_error;
++    }
++    amxc_var_set(cstring_t, retval, out);
++    return amxd_status_ok;
++}
++
+ 
+ /* Find first vap from radio */
+ T_AccessPoint* wld_rad_getFirstVap(T_Radio* pR) {
+@@ -7207,37 +7275,8 @@ static void s_setDisabledSubChannels_pwf
+     SAH_TRACEZ_OUT(ME);
+ }
+ 
+-/**
+- * @brief Handler for UseRuPunctureDfs parameter change on the StaticPuncturing object.
+- *
+- * When enabled, sends: USE_RU_PUNCTURE_DFS 1 to hostapd via wpa_ctrl (takes effect
+- * without restart). When disabled, sends: USE_RU_PUNCTURE_DFS 0.
+- * The value is also written to hostapd.conf (use_ru_puncture_dfs) so it persists
+- * across hostapd restarts.
+- */
+-static void s_setUseRuPunctureDfs_pwf(void* priv _UNUSED, amxd_object_t* object,
+-                                       amxd_param_t* param _UNUSED,
+-                                       const amxc_var_t* const newValue) {
+-    SAH_TRACEZ_IN(ME);
+-    T_Radio* pRad = wld_rad_fromObj(amxd_object_get_parent(object));
+-    ASSERTI_NOT_NULL(pRad, , ME, "INVALID");
+-
+-    bool enable = amxc_var_dyncast(bool, newValue);
+-    SAH_TRACEZ_INFO(ME, "%s: set UseRuPunctureDfs %d", pRad->Name, enable);
+-    pRad->useRuPunctureDfs = enable;
+-
+-    ASSERTI_TRUE(wld_rad_isActive(pRad), , ME, "%s: UseRuPunctureDfs: radio not active", pRad->Name);
+-    T_AccessPoint* pAP = s_getAcsAp(pRad);
+-    ASSERTI_NOT_NULL(pAP, , ME, "%s: UseRuPunctureDfs: no AP available", pRad->Name);
+-    wld_wpaCtrl_sendCmdFmtCheckResponse(pAP->wpaCtrlInterface, "OK",
+-                                        "USE_RU_PUNCTURE_DFS %d", enable ? 1 : 0);
+-
+-    SAH_TRACEZ_OUT(ME);
+-}
+-
+ SWLA_DM_HDLRS(sStaticPuncturingDmHdlrs,
+-              ARR(SWLA_DM_PARAM_HDLR("DisabledSubChannels", s_setDisabledSubChannels_pwf),
+-                  SWLA_DM_PARAM_HDLR("UseRuPunctureDfs", s_setUseRuPunctureDfs_pwf)));
++              ARR(SWLA_DM_PARAM_HDLR("DisabledSubChannels", s_setDisabledSubChannels_pwf)));
+ 
+ void _wld_rad_setStaticPuncturing_ocf(const char* const sig_name,
+                                       const amxc_var_t* const data,
+@@ -7280,3 +7319,4 @@ amxd_status_t _getEHTOperations(amxd_obj
+     SAH_TRACEZ_OUT(ME);
+     return amxd_status_ok;
+ }
++
+--- a/src/nl80211/wld_rad_nl80211.c
++++ b/src/nl80211/wld_rad_nl80211.c
+@@ -845,6 +845,11 @@ swl_rc_ne wld_rad_nl80211_sendVendorSubC
+ #define QCA_DPARAM1_WSI_BYPASS          80u
+ #define QCA_DPARAM1_RADAR_DETECT_COUNT  75u
+ #define QCA_DPARAM1_MARK_SUBCHAN        74u
++#define QCA_DPARAM1_CAC_TIMEOUT         87u  /* QCA_WLAN_VENDOR_RADIO_PARAM_CAC_TIMEOUT = 87 */
++#define QCA_DPARAM1_LIST_5GHZ_CHAN_INFO 88u  /* QCA_WLAN_VENDOR_RADIO_PARAM_LIST_5GHZ_CHAN_INFO = 88 */
++#define QCA_DPARAM1_BGCAC_TIMEOUT       89u  /* QCA_WLAN_VENDOR_RADIO_PARAM_BGCAC_TIMEOUT = 89 */
++#define QCA_DPARAM1_BLOCK_DFS_LIST      90u  /* QCA_WLAN_VENDOR_RADIO_PARAM_BLOCK_DFS_LIST = 90 */
++#define QCA_DPARAM1_CAC_STATE           92u  /* QCA_WLAN_VENDOR_RADIO_PARAM_GET_CAC_STATE = 92 */
+ #define QCA_DPARAM1_DISPLAY_BAND_CHANS      82u  /* QCA_WLAN_VENDOR_RADIO_PARAM_DISPLAY_BAND_CHANS */
+ #define QCA_DPARAM1_DISPLAY_SUPER_CHAN_LIST 83u  /* QCA_WLAN_VENDOR_RADIO_PARAM_DISPLAY_SUPER_CHANNEL_LIST */
+ 
+@@ -1130,6 +1135,529 @@ swl_rc_ne wld_rad_nl80211_getSubChannelM
+         return rc;
+     }
+ 
++    return ctx.rc;
++}
++
++/* -------------------------------------------------------------------------
++ * CacTimeout (READ/WRITE) — NL80211 vendor command
++ *
++ * SET: QCA_NL80211_VENDOR_SUBCMD_SET_WIPHY_CONFIGURATION (505)
++ *      → QCA_NL80211_VENDOR_SUBCMD_WIFI_PARAMS (dparam0=200)
++ *      → QCA_WLAN_VENDOR_RADIO_PARAM_CAC_TIMEOUT (dparam1=76)
++ *      → value in seconds (1–86400)
++ *
++ * GET: QCA_NL80211_VENDOR_SUBCMD_GET_WIPHY_CONFIGURATION (506)
++ *      → QCA_WLAN_VENDOR_RADIO_PARAM_CAC_TIMEOUT (dparam1=76)
++ * -------------------------------------------------------------------------
++ */
++swl_rc_ne wld_rad_nl80211_setCacTimeout(T_Radio* pRad, uint32_t timeoutSec) {
++    swl_rc_ne rc = SWL_RC_INVALID_PARAM;
++    ASSERT_NOT_NULL(pRad, rc, ME, "NULL radio");
++
++    if(timeoutSec == 0 || timeoutSec > 86400) {
++        SAH_TRACEZ_ERROR(ME, "%s: setCacTimeout: invalid value %u (range 1-86400)", pRad->Name, timeoutSec);
++        return SWL_RC_INVALID_PARAM;
++    }
++
++    uint32_t radioIdx = wld_rad_nl80211_getRadioIdx(pRad);
++    SAH_TRACEZ_INFO(ME, "%s: setCacTimeout timeoutSec=%u radioIdx=%u", pRad->Name, timeoutSec, radioIdx);
++
++    if(pRad->index <= 0 && pRad->wDevId == 0) {
++        SAH_TRACEZ_WARNING(ME, "%s: radio not available", pRad->Name);
++        return SWL_RC_ERROR;
++    }
++
++    uint8_t radioIdxU8 = (uint8_t)radioIdx;
++    uint32_t dparam0Val = QCA_DPARAM0_WIFI_PARAMS;
++    uint32_t dparam1Val = QCA_DPARAM1_CAC_TIMEOUT;
++
++    NL_ATTR_NESTED(vendorAttr, NL80211_ATTR_VENDOR_DATA);
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_RADIO_IDX, radioIdxU8));
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_DPARAM0, dparam0Val));
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_DPARAM1, dparam1Val));
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_VALUE0, timeoutSec));
++
++    uint32_t wiphy = pRad->wiphy;
++    uint32_t vendorId = QCA_VENDOR_ID;
++    uint32_t vendorSubcmd = QCA_VENDOR_SUBCMD_SET;
++
++    NL_ATTRS(attribs,
++             ARR(
++                 NL_ATTR_VAL(NL80211_ATTR_VENDOR_ID, vendorId),
++                 NL_ATTR_VAL(NL80211_ATTR_VENDOR_SUBCMD, vendorSubcmd),
++                 NL_ATTR_VAL(NL80211_ATTR_WIPHY, wiphy)
++                 )
++             );
++    swl_unLiList_add(&attribs, &vendorAttr);
++
++    rc = wld_nl80211_sendCmdSyncWithAck(wld_nl80211_getSharedState(),
++                                        NL80211_CMD_VENDOR,
++                                        0,
++                                        0,
++                                        &attribs);
++    NL_ATTRS_CLEAR(&attribs);
++    NL_ATTRS_CLEAR(&vendorAttr.data.attribs);
++
++    if(rc != SWL_RC_OK) {
++        SAH_TRACEZ_ERROR(ME, "%s: setCacTimeout failed rc=%d", pRad->Name, rc);
++    }
++    return rc;
++}
++
++typedef struct {
++    uint32_t* pTimeout;
++    swl_rc_ne rc;
++} s_cacTimeoutCtx_t;
++
++static swl_rc_ne s_getCacTimeoutCb(swl_rc_ne rc, struct nlmsghdr* nlh, void* priv) {
++    s_cacTimeoutCtx_t* pCtx = (s_cacTimeoutCtx_t*)priv;
++
++    if(rc < SWL_RC_OK) {
++        pCtx->rc = rc;
++        return rc;
++    }
++
++    void* data = NULL;
++    size_t dataLen = 0;
++    rc = wld_nl80211_getVendorDataFromVendorMsg(rc, nlh, &data, &dataLen);
++    if(rc < SWL_RC_OK || data == NULL) {
++        SAH_TRACEZ_ERROR(ME, "getCacTimeout: failed to get vendor data, rc=%d", rc);
++        pCtx->rc = rc;
++        return rc;
++    }
++
++    if(dataLen >= 8) {
++        uint32_t value = *((uint32_t*)((uint8_t*)data + 4));
++        *pCtx->pTimeout = value;
++        SAH_TRACEZ_INFO(ME, "getCacTimeout: dataLen=%zu, value=%u", dataLen, value);
++        pCtx->rc = SWL_RC_OK;
++        return SWL_RC_OK;
++    }
++
++    SAH_TRACEZ_ERROR(ME, "getCacTimeout: invalid vendor data length: %zu (expected >= 8)", dataLen);
++    pCtx->rc = SWL_RC_ERROR;
++    return SWL_RC_ERROR;
++}
++
++swl_rc_ne wld_rad_nl80211_getCacTimeout(T_Radio* pRad, uint32_t* pTimeoutSec) {
++    swl_rc_ne rc = SWL_RC_INVALID_PARAM;
++    ASSERT_NOT_NULL(pRad, rc, ME, "NULL radio");
++    ASSERT_NOT_NULL(pTimeoutSec, rc, ME, "NULL output");
++
++    uint32_t radioIdx = wld_rad_nl80211_getRadioIdx(pRad);
++    SAH_TRACEZ_INFO(ME, "%s: getCacTimeout radioIdx=%u", pRad->Name, radioIdx);
++
++    if(pRad->index <= 0 && pRad->wDevId == 0) {
++        SAH_TRACEZ_WARNING(ME, "%s: radio not available", pRad->Name);
++        return SWL_RC_ERROR;
++    }
++
++    uint8_t radioIdxU8 = (uint8_t)radioIdx;
++    uint32_t dparam0Val = QCA_DPARAM0_WIFI_PARAMS;
++    uint32_t dparam1Val = QCA_DPARAM1_CAC_TIMEOUT;
++
++    NL_ATTR_NESTED(vendorAttr, NL80211_ATTR_VENDOR_DATA);
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_RADIO_IDX, radioIdxU8));
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_DPARAM0, dparam0Val));
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_DPARAM1, dparam1Val));
++
++    s_cacTimeoutCtx_t ctx = {
++        .pTimeout = pTimeoutSec,
++        .rc = SWL_RC_ERROR
++    };
++
++    rc = wld_rad_nl80211_sendVendorSubCmdAttr(pRad, QCA_VENDOR_ID, QCA_VENDOR_SUBCMD_GET,
++                                              &vendorAttr, true, false, 0,
++                                              s_getCacTimeoutCb, &ctx);
++
++    NL_ATTRS_CLEAR(&vendorAttr.data.attribs);
++
++    if(rc != SWL_RC_OK) {
++        SAH_TRACEZ_ERROR(ME, "%s: getCacTimeout failed rc=%d", pRad->Name, rc);
++        return rc;
++    }
++
++    return ctx.rc;
++}
++
++/* -------------------------------------------------------------------------
++ * CacState (READ-ONLY) — NL80211 vendor command
++ *
++ * GET: QCA_NL80211_VENDOR_SUBCMD_GET_WIPHY_CONFIGURATION (506)
++ *      → QCA_WLAN_VENDOR_RADIO_PARAM_CAC_STATE (dparam1=77)
++ *      Returns: 1 = CAC in progress, 0 = CAC completed/not running
++ * -------------------------------------------------------------------------
++ */
++typedef struct {
++    bool* pInProgress;
++    swl_rc_ne rc;
++} s_cacStateCtx_t;
++
++static swl_rc_ne s_getCacStateCb(swl_rc_ne rc, struct nlmsghdr* nlh, void* priv) {
++    s_cacStateCtx_t* pCtx = (s_cacStateCtx_t*)priv;
++
++    if(rc < SWL_RC_OK) {
++        pCtx->rc = rc;
++        return rc;
++    }
++
++    void* data = NULL;
++    size_t dataLen = 0;
++    rc = wld_nl80211_getVendorDataFromVendorMsg(rc, nlh, &data, &dataLen);
++    if(rc < SWL_RC_OK || data == NULL) {
++        SAH_TRACEZ_ERROR(ME, "getCacState: failed to get vendor data, rc=%d", rc);
++        pCtx->rc = rc;
++        return rc;
++    }
++
++    if(dataLen >= 8) {
++        uint32_t value = *((uint32_t*)((uint8_t*)data + 4));
++        *pCtx->pInProgress = (value != 0);
++        SAH_TRACEZ_INFO(ME, "getCacState: dataLen=%zu, value=%u, inProgress=%d",
++                        dataLen, value, *pCtx->pInProgress);
++        pCtx->rc = SWL_RC_OK;
++        return SWL_RC_OK;
++    }
++
++    SAH_TRACEZ_ERROR(ME, "getCacState: invalid vendor data length: %zu (expected >= 8)", dataLen);
++    pCtx->rc = SWL_RC_ERROR;
++    return SWL_RC_ERROR;
++}
++
++/* -------------------------------------------------------------------------
++ * List5GhzChanInfo (READ-ONLY) — NL80211 vendor command
++ *
++ * GET: QCA_NL80211_VENDOR_SUBCMD_GET_WIPHY_CONFIGURATION (506)
++ *      → QCA_WLAN_VENDOR_RADIO_PARAM_LIST_5GHZ_CHAN_INFO (dparam1=88)
++ *
++ * Returns per-channel info: channel, opclass, DFS state, CAC time,
++ * CAC completion time, NOP time.
++ * Corresponds to: QCA_WLAN_VENDOR_RADIO_PARAM_GET_5GHZ_CHAN_INFO
++ * -------------------------------------------------------------------------
++ */
++#define LIST_5GHZ_CHAN_INFO_BUF_SIZE 4096
++
++typedef struct {
++    char* buf;
++    size_t bufSize;
++    swl_rc_ne rc;
++} s_list5GhzChanInfoCtx_t;
++
++static swl_rc_ne s_list5GhzChanInfoCb(swl_rc_ne rc, struct nlmsghdr* nlh, void* priv) {
++    s_list5GhzChanInfoCtx_t* pCtx = (s_list5GhzChanInfoCtx_t*)priv;
++
++    if(rc < SWL_RC_OK) {
++        pCtx->rc = rc;
++        return rc;
++    }
++
++    void* data = NULL;
++    size_t dataLen = 0;
++    rc = wld_nl80211_getVendorDataFromVendorMsg(rc, nlh, &data, &dataLen);
++    if(rc < SWL_RC_OK || data == NULL) {
++        SAH_TRACEZ_ERROR(ME, "list5GhzChanInfo: failed to get vendor data, rc=%d", rc);
++        pCtx->rc = rc;
++        return rc;
++    }
++
++    SAH_TRACEZ_INFO(ME, "list5GhzChanInfo: dataLen=%zu", dataLen);
++
++    /* Format raw data as hex string for caller to parse */
++    size_t hexLen = dataLen * 3 + 1;
++    if(hexLen > pCtx->bufSize) {
++        hexLen = pCtx->bufSize;
++    }
++    size_t pos = 0;
++    for(size_t i = 0; i < dataLen && pos + 3 < pCtx->bufSize; i++) {
++        pos += snprintf(pCtx->buf + pos, pCtx->bufSize - pos,
++                        "%02x ", ((uint8_t*)data)[i]);
++    }
++    if(pos > 0 && pCtx->buf[pos - 1] == ' ') {
++        pCtx->buf[pos - 1] = '\0';
++    }
++
++    pCtx->rc = SWL_RC_OK;
++    return SWL_RC_OK;
++}
++
++swl_rc_ne wld_rad_nl80211_list5GhzChanInfo(T_Radio* pRad, char* buf, size_t bufSize) {
++    swl_rc_ne rc = SWL_RC_INVALID_PARAM;
++    ASSERT_NOT_NULL(pRad, rc, ME, "NULL radio");
++    ASSERT_NOT_NULL(buf, rc, ME, "NULL output");
++
++    if(bufSize > 0) {
++        buf[0] = '\0';
++    }
++
++    uint32_t radioIdx = wld_rad_nl80211_getRadioIdx(pRad);
++    SAH_TRACEZ_INFO(ME, "%s: list5GhzChanInfo radioIdx=%u", pRad->Name, radioIdx);
++
++    if(pRad->index <= 0 && pRad->wDevId == 0) {
++        SAH_TRACEZ_WARNING(ME, "%s: radio not available", pRad->Name);
++        return SWL_RC_ERROR;
++    }
++
++    uint8_t radioIdxU8 = (uint8_t)radioIdx;
++    uint32_t dparam0Val = QCA_DPARAM0_WIFI_PARAMS;
++    uint32_t dparam1Val = QCA_DPARAM1_LIST_5GHZ_CHAN_INFO;
++
++    NL_ATTR_NESTED(vendorAttr, NL80211_ATTR_VENDOR_DATA);
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_RADIO_IDX, radioIdxU8));
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_DPARAM0, dparam0Val));
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_DPARAM1, dparam1Val));
++
++    s_list5GhzChanInfoCtx_t ctx = {
++        .buf = buf,
++        .bufSize = bufSize,
++        .rc = SWL_RC_ERROR
++    };
++
++    rc = wld_rad_nl80211_sendVendorSubCmdAttr(pRad, QCA_VENDOR_ID, QCA_VENDOR_SUBCMD_GET,
++                                              &vendorAttr, true, false, 0,
++                                              s_list5GhzChanInfoCb, &ctx);
++
++    NL_ATTRS_CLEAR(&vendorAttr.data.attribs);
++
++    if(rc != SWL_RC_OK) {
++        SAH_TRACEZ_ERROR(ME, "%s: list5GhzChanInfo failed rc=%d", pRad->Name, rc);
++        return rc;
++    }
++
++    return ctx.rc;
++}
++
++/* -------------------------------------------------------------------------
++ * BgCacTimeout (WRITE) — NL80211 vendor command
++ *
++ * SET: QCA_NL80211_VENDOR_SUBCMD_SET_WIPHY_CONFIGURATION (505)
++ *      → QCA_WLAN_VENDOR_RADIO_PARAM_BGCAC_TIMEOUT (dparam1=89)
++ *      → value: background CAC timeout multiplier (0 = use default)
++ * -------------------------------------------------------------------------
++ */
++swl_rc_ne wld_rad_nl80211_setBgCacTimeout(T_Radio* pRad, uint32_t multiplier) {
++    swl_rc_ne rc = SWL_RC_INVALID_PARAM;
++    ASSERT_NOT_NULL(pRad, rc, ME, "NULL radio");
++
++    uint32_t radioIdx = wld_rad_nl80211_getRadioIdx(pRad);
++    SAH_TRACEZ_INFO(ME, "%s: setBgCacTimeout multiplier=%u radioIdx=%u", pRad->Name, multiplier, radioIdx);
++
++    if(pRad->index <= 0 && pRad->wDevId == 0) {
++        SAH_TRACEZ_WARNING(ME, "%s: radio not available", pRad->Name);
++        return SWL_RC_ERROR;
++    }
++
++    uint8_t radioIdxU8 = (uint8_t)radioIdx;
++    uint32_t dparam0Val = QCA_DPARAM0_WIFI_PARAMS;
++    uint32_t dparam1Val = QCA_DPARAM1_BGCAC_TIMEOUT;
++
++    NL_ATTR_NESTED(vendorAttr, NL80211_ATTR_VENDOR_DATA);
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_RADIO_IDX, radioIdxU8));
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_DPARAM0, dparam0Val));
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_DPARAM1, dparam1Val));
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_VALUE0, multiplier));
++
++    uint32_t wiphy = pRad->wiphy;
++    uint32_t vendorId = QCA_VENDOR_ID;
++    uint32_t vendorSubcmd = QCA_VENDOR_SUBCMD_SET;
++
++    NL_ATTRS(attribs,
++             ARR(
++                 NL_ATTR_VAL(NL80211_ATTR_VENDOR_ID, vendorId),
++                 NL_ATTR_VAL(NL80211_ATTR_VENDOR_SUBCMD, vendorSubcmd),
++                 NL_ATTR_VAL(NL80211_ATTR_WIPHY, wiphy)
++                 )
++             );
++    swl_unLiList_add(&attribs, &vendorAttr);
++
++    rc = wld_nl80211_sendCmdSyncWithAck(wld_nl80211_getSharedState(),
++                                        NL80211_CMD_VENDOR,
++                                        0,
++                                        0,
++                                        &attribs);
++    NL_ATTRS_CLEAR(&attribs);
++    NL_ATTRS_CLEAR(&vendorAttr.data.attribs);
++
++    if(rc != SWL_RC_OK) {
++        SAH_TRACEZ_ERROR(ME, "%s: setBgCacTimeout failed rc=%d", pRad->Name, rc);
++    }
++    return rc;
++}
++
++/* -------------------------------------------------------------------------
++ * BlockDfsList (READ/WRITE) — NL80211 vendor command
++ *
++ * SET: QCA_NL80211_VENDOR_SUBCMD_SET_WIPHY_CONFIGURATION (505)
++ *      → QCA_WLAN_VENDOR_RADIO_PARAM_BLOCK_DFS_LIST (dparam1=90)
++ *      → value: 1 = block DFS channels, 0 = allow DFS channels
++ *
++ * GET: QCA_NL80211_VENDOR_SUBCMD_GET_WIPHY_CONFIGURATION (506)
++ *      → QCA_WLAN_VENDOR_RADIO_PARAM_BLOCK_DFS_LIST (dparam1=90)
++ * -------------------------------------------------------------------------
++ */
++swl_rc_ne wld_rad_nl80211_setBlockDfsList(T_Radio* pRad, uint32_t block) {
++    swl_rc_ne rc = SWL_RC_INVALID_PARAM;
++    ASSERT_NOT_NULL(pRad, rc, ME, "NULL radio");
++
++    uint32_t radioIdx = wld_rad_nl80211_getRadioIdx(pRad);
++    SAH_TRACEZ_INFO(ME, "%s: setBlockDfsList block=%u radioIdx=%u", pRad->Name, block, radioIdx);
++
++    if(pRad->index <= 0 && pRad->wDevId == 0) {
++        SAH_TRACEZ_WARNING(ME, "%s: radio not available", pRad->Name);
++        return SWL_RC_ERROR;
++    }
++
++    uint8_t radioIdxU8 = (uint8_t)radioIdx;
++    uint32_t dparam0Val = QCA_DPARAM0_WIFI_PARAMS;
++    uint32_t dparam1Val = QCA_DPARAM1_BLOCK_DFS_LIST;
++    uint32_t blockVal = block ? 1u : 0u;
++
++    NL_ATTR_NESTED(vendorAttr, NL80211_ATTR_VENDOR_DATA);
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_RADIO_IDX, radioIdxU8));
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_DPARAM0, dparam0Val));
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_DPARAM1, dparam1Val));
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_VALUE0, blockVal));
++
++    uint32_t wiphy = pRad->wiphy;
++    uint32_t vendorId = QCA_VENDOR_ID;
++    uint32_t vendorSubcmd = QCA_VENDOR_SUBCMD_SET;
++
++    NL_ATTRS(attribs,
++             ARR(
++                 NL_ATTR_VAL(NL80211_ATTR_VENDOR_ID, vendorId),
++                 NL_ATTR_VAL(NL80211_ATTR_VENDOR_SUBCMD, vendorSubcmd),
++                 NL_ATTR_VAL(NL80211_ATTR_WIPHY, wiphy)
++                 )
++             );
++    swl_unLiList_add(&attribs, &vendorAttr);
++
++    rc = wld_nl80211_sendCmdSyncWithAck(wld_nl80211_getSharedState(),
++                                        NL80211_CMD_VENDOR,
++                                        0,
++                                        0,
++                                        &attribs);
++    NL_ATTRS_CLEAR(&attribs);
++    NL_ATTRS_CLEAR(&vendorAttr.data.attribs);
++
++    if(rc != SWL_RC_OK) {
++        SAH_TRACEZ_ERROR(ME, "%s: setBlockDfsList failed rc=%d", pRad->Name, rc);
++    }
++    return rc;
++}
++
++typedef struct {
++    uint32_t* pBlock;
++    swl_rc_ne rc;
++} s_blockDfsListCtx_t;
++
++static swl_rc_ne s_getBlockDfsListCb(swl_rc_ne rc, struct nlmsghdr* nlh, void* priv) {
++    s_blockDfsListCtx_t* pCtx = (s_blockDfsListCtx_t*)priv;
++
++    if(rc < SWL_RC_OK) {
++        pCtx->rc = rc;
++        return rc;
++    }
++
++    void* data = NULL;
++    size_t dataLen = 0;
++    rc = wld_nl80211_getVendorDataFromVendorMsg(rc, nlh, &data, &dataLen);
++    if(rc < SWL_RC_OK || data == NULL) {
++        SAH_TRACEZ_ERROR(ME, "getBlockDfsList: failed to get vendor data, rc=%d", rc);
++        pCtx->rc = rc;
++        return rc;
++    }
++
++    if(dataLen >= 8) {
++        uint32_t value = *((uint32_t*)((uint8_t*)data + 4));
++        *pCtx->pBlock = value;
++        SAH_TRACEZ_INFO(ME, "getBlockDfsList: dataLen=%zu, value=%u", dataLen, value);
++        pCtx->rc = SWL_RC_OK;
++        return SWL_RC_OK;
++    }
++
++    SAH_TRACEZ_ERROR(ME, "getBlockDfsList: invalid vendor data length: %zu (expected >= 8)", dataLen);
++    pCtx->rc = SWL_RC_ERROR;
++    return SWL_RC_ERROR;
++}
++
++swl_rc_ne wld_rad_nl80211_getBlockDfsList(T_Radio* pRad, uint32_t* pBlock) {
++    swl_rc_ne rc = SWL_RC_INVALID_PARAM;
++    ASSERT_NOT_NULL(pRad, rc, ME, "NULL radio");
++    ASSERT_NOT_NULL(pBlock, rc, ME, "NULL output");
++
++    uint32_t radioIdx = wld_rad_nl80211_getRadioIdx(pRad);
++    SAH_TRACEZ_INFO(ME, "%s: getBlockDfsList radioIdx=%u", pRad->Name, radioIdx);
++
++    if(pRad->index <= 0 && pRad->wDevId == 0) {
++        SAH_TRACEZ_WARNING(ME, "%s: radio not available", pRad->Name);
++        return SWL_RC_ERROR;
++    }
++
++    uint8_t radioIdxU8 = (uint8_t)radioIdx;
++    uint32_t dparam0Val = QCA_DPARAM0_WIFI_PARAMS;
++    uint32_t dparam1Val = QCA_DPARAM1_BLOCK_DFS_LIST;
++
++    NL_ATTR_NESTED(vendorAttr, NL80211_ATTR_VENDOR_DATA);
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_RADIO_IDX, radioIdxU8));
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_DPARAM0, dparam0Val));
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_DPARAM1, dparam1Val));
++
++    s_blockDfsListCtx_t ctx = {
++        .pBlock = pBlock,
++        .rc = SWL_RC_ERROR
++    };
++
++    rc = wld_rad_nl80211_sendVendorSubCmdAttr(pRad, QCA_VENDOR_ID, QCA_VENDOR_SUBCMD_GET,
++                                              &vendorAttr, true, false, 0,
++                                              s_getBlockDfsListCb, &ctx);
++
++    NL_ATTRS_CLEAR(&vendorAttr.data.attribs);
++
++    if(rc != SWL_RC_OK) {
++        SAH_TRACEZ_ERROR(ME, "%s: getBlockDfsList failed rc=%d", pRad->Name, rc);
++        return rc;
++    }
++
++    return ctx.rc;
++}
++
++swl_rc_ne wld_rad_nl80211_getCacState(T_Radio* pRad, bool* pInProgress) {
++    swl_rc_ne rc = SWL_RC_INVALID_PARAM;
++    ASSERT_NOT_NULL(pRad, rc, ME, "NULL radio");
++    ASSERT_NOT_NULL(pInProgress, rc, ME, "NULL output");
++
++    uint32_t radioIdx = wld_rad_nl80211_getRadioIdx(pRad);
++    SAH_TRACEZ_INFO(ME, "%s: getCacState radioIdx=%u", pRad->Name, radioIdx);
++
++    if(pRad->index <= 0 && pRad->wDevId == 0) {
++        SAH_TRACEZ_WARNING(ME, "%s: radio not available", pRad->Name);
++        return SWL_RC_ERROR;
++    }
++
++    uint8_t radioIdxU8 = (uint8_t)radioIdx;
++    uint32_t dparam0Val = QCA_DPARAM0_WIFI_PARAMS;
++    uint32_t dparam1Val = QCA_DPARAM1_CAC_STATE;
++
++    NL_ATTR_NESTED(vendorAttr, NL80211_ATTR_VENDOR_DATA);
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_RADIO_IDX, radioIdxU8));
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_DPARAM0, dparam0Val));
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_DPARAM1, dparam1Val));
++
++    s_cacStateCtx_t ctx = {
++        .pInProgress = pInProgress,
++        .rc = SWL_RC_ERROR
++    };
++
++    rc = wld_rad_nl80211_sendVendorSubCmdAttr(pRad, QCA_VENDOR_ID, QCA_VENDOR_SUBCMD_GET,
++                                              &vendorAttr, true, false, 0,
++                                              s_getCacStateCb, &ctx);
++
++    NL_ATTRS_CLEAR(&vendorAttr.data.attribs);
++
++    if(rc != SWL_RC_OK) {
++        SAH_TRACEZ_ERROR(ME, "%s: getCacState failed rc=%d", pRad->Name, rc);
++        return rc;
++    }
++
+     return ctx.rc;
+ }
+ 
