@@ -1,0 +1,73 @@
+From: Kartheek E <karte@qti.qualcomm.com>
+Date: Wed, 23 Jul 2026 00:00:00 +0000
+Subject: [PATCH] pwhm: fix MLO 3-link 2G VAP down and 6GHz VLP power mode in MLO
+
+  1. After issuing CHAN_SWITCH to the primary (FH) VAP in
+     wld_rad_hostapd_switchChannel, iterate over all other AP VAPs on the
+     same radio and send CHAN_SWITCH to each one so mac80211 finalises the
+     channel-context reservation atomically across all AP VAPs in the MLO set.
+
+  2. In wld_rad_hostapd_setMiscParams, fix the command string to uppercase
+     SET_6GHZ_PWR_MODE and expand the send to all VAPs via amxc_llist_for_each
+     so the backhaul 6GHz VAP also receives the power mode update.
+
+  3. In s_setPowerType_pwf, skip wld_rad_doSync on 6GHz radios and send
+     SET_6GHZ_PWR_MODE directly to every ready VAP to avoid the FSM
+     SYNC_RAD->NEED_TOGGLE->NEED_RE_ADD teardown chain.
+
+Signed-off-by: Kartheek E <karte@qti.qualcomm.com>
+---
+diff --git a/src/nl80211/wld_rad_hostapd_api.c b/src/nl80211/wld_rad_hostapd_api.c
+--- a/src/nl80211/wld_rad_hostapd_api.c
++++ b/src/nl80211/wld_rad_hostapd_api.c
+@@ -240,6 +240,16 @@
+     //send command
+     bool ret = wld_ap_hostapd_sendCommand(primaryVap, cmd, "switch channel");
+     ASSERTS_TRUE(ret, SWL_RC_ERROR, ME, "NULL");
++    T_AccessPoint* pAP = NULL;
++    wld_rad_forEachAp(pAP, pR) {
++        if(pAP == primaryVap) {
++            continue;
++        }
++        SAH_TRACEZ_WARNING(ME, "%s: issuing CHAN_SWITCH to secondary AP %s (MLO CSA sync)",
++                           pR->Name, pAP->alias);
++        wld_ap_hostapd_sendCommand(pAP, cmd, "switch channel (MLO CSA sync)");
++    }
++
+     SAH_TRACEZ_INFO(ME, "%s: Updating per-BSS configs after channel switch", pR->Name);
+     wld_hostapd_cfgFile_updatePerBssConfigs(pR);
+     return SWL_RC_OK;
+@@ -386,6 +396,11 @@
+     swl_mapChar_cleanup(&radParams);
+     if(wld_rad_is_6ghz(pRad)) {
+         char pwrCmd[64];
+-        snprintf(pwrCmd, sizeof(pwrCmd), "set_6ghz_power_mode %d", (int) pRad->PowerType);
+-        wld_ap_hostapd_sendCommand(primaryVap, pwrCmd, "PowerType");
++        snprintf(pwrCmd, sizeof(pwrCmd), "SET_6GHZ_PWR_MODE %d", (int) pRad->PowerType);
++        amxc_llist_for_each(it6g, &pRad->llAP) {
++            T_AccessPoint* pAP6g = amxc_llist_it_get_data(it6g, T_AccessPoint, it);
++            if(wld_wpaCtrlInterface_isReady(pAP6g->wpaCtrlInterface)) {
++                wld_ap_hostapd_sendCommand(pAP6g, pwrCmd, "PowerType");
++            }
++        }
+     }
+diff --git a/src/wld_radio.c b/src/wld_radio.c
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -682,4 +682,15 @@
+     swl_radpwr_e radPWR = swl_conv_charToEnum(OCPWR, swl_radpwr_str, SWL_RADPWR_MAX, SWL_RADPWR_MAX);
+     pRad->PowerType = radPWR;
+-    wld_rad_doSync(pRad);
++    if(wld_rad_is_6ghz(pRad)) {
++        char pwrCmd[64];
++        snprintf(pwrCmd, sizeof(pwrCmd), "SET_6GHZ_PWR_MODE %d", (int) pRad->PowerType);
++        amxc_llist_for_each(it6g, &pRad->llAP) {
++            T_AccessPoint* pAP6g = amxc_llist_it_get_data(it6g, T_AccessPoint, it);
++            if(wld_wpaCtrlInterface_isReady(pAP6g->wpaCtrlInterface)) {
++                wld_ap_hostapd_sendCommand(pAP6g, pwrCmd, "PowerType");
++            }
++        }
++    } else {
++        wld_rad_doSync(pRad);
++    }
+     SAH_TRACEZ_OUT(ME);
