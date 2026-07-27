@@ -1,0 +1,106 @@
+From: Kartheek E <karte@qti.qualcomm.com>
+Date: Mon, 27 Jul 2026 00:00:00 +0000
+Subject: [PATCH] pwhm: fix ACS bring-up failures for MLDUnit change and 6GHz
+
+Two ACS-related VAP bring-up failures fixed:
+
+1. VAP stuck down when MLDUnit changes after ACS
+
+   Replace the bool with a counter (s_pendingAcsReAddCount).
+   Incremented for each ACS-enabled radio in s_schedNextAction(NEED_RE_ADD),
+   decremented per s_doAddHostapd invocation. As long as the count > 0,
+   the ACS deferral is bypassed. This correctly handles multi-radio MLO
+   re-adds where all N radios need the deferral skipped.
+
+2. 6GHz VAPs fail to come up after ACS
+
+   write op_class to radConfigMap (the global/radio config section)
+   for 6GHz radios when ACS is active.
+
+Signed-off-by: Kartheek E <karte@qti.qualcomm.com>
+---
+ src/Plugin/wifiGen_fsm.c          | 40 ++++++++++++++++++++++++-------
+ src/nl80211/wld_hostapd_cfgFile.c |  7 ++++++
+ 2 files changed, 38 insertions(+), 9 deletions(-)
+
+--- a/src/Plugin/wifiGen_fsm.c
++++ b/src/Plugin/wifiGen_fsm.c
+@@ -450,5 +450,12 @@ static bool s_isLinkRemoveSupp(T_Radio* pRad) {
+     return (supp == SWL_TRL_TRUE);
+ }
+
++/* Counts ACS-enabled radios with a pending BSS re-add (NEED_RE_ADD path).
++ * Incremented per ACS radio in s_schedNextAction(NEED_RE_ADD), decremented
++ * in s_doAddHostapd. When > 0, the ACS deferral is bypassed: the radio is
++ * only temporarily down for reconfiguration, not in an initial ACS scan.
++ * Using a counter (not a bool) handles multi-radio MLO re-adds correctly. */
++static int s_pendingAcsReAddCount = 0;
++
+ /**
+  * @brief schedule next conf applying fsm action after setting a dynamic param
+@@ -495,5 +502,8 @@ static void s_schedNextAction(wld_secDmn_action_rc_ne action, T_AccessPoint* pA
+         //clear remaining dyn conf actions, as hostapd conf is up to be re-added
+         s_clearRadLowerApplyActions(pRad, GEN_FSM_ADD_HOSTAPD);
+         s_clearRadDynConfActions(pRad);
++        if(pRad->autoChannelEnable) {
++            s_pendingAcsReAddCount++;
++        }
+         break;
+     case SECDMN_ACTION_OK_NEED_RE_ADD_LINK:
+@@ -1226,18 +1236,27 @@ static bool s_doAddHostapd(T_Radio* pRad) {
+         SAH_TRACEZ_WARNING(ME, "%s: hostapd group is restarting: skip immediate adding conf", pRad->Name);
+         return true;
+     }
+-    /* If this radio has ACS enabled and is not yet up, ACS is likely in progress.
+-     * Attempting a warm apply (ADD bss_config) while hostapd is in ACS state causes
+-     * hostapd to reject the command, which triggers a full restart and aborts ACS.
+-     * Defer the warm apply by re-scheduling it for the next FSM commit (2s later).
+-     * The AP-ENABLED event after ACS completes will trigger a new commit. */
+-    if(pRad->autoChannelEnable && !wld_rad_isUpExt(pRad)) {
+-        SAH_TRACEZ_WARNING(ME, "%s: ACS in progress (autoChannelEnable=1, radio not up) — defer warm apply",
+-                           pRad->Name);
+-        setBitLongArray(pRad->fsmRad.FSM_BitActionArray, FSM_BW, GEN_FSM_ADD_HOSTAPD);
+-        pRad->fsmRad.timeout_msec = 2000;
+-        return true;
++    /* If this radio has ACS enabled and is not yet up, ACS is likely in progress.
++     * Attempting a warm apply (ADD bss_config) while hostapd is in ACS state causes
++     * hostapd to reject the command, which triggers a full restart and aborts ACS.
++     * Defer the warm apply by re-scheduling it for the next FSM commit (2s later).
++     * The AP-ENABLED event after ACS completes will trigger a new commit.
++     * Exception: s_pendingAcsReAddCount is incremented by s_schedNextAction(NEED_RE_ADD)
++     * for each ACS-enabled radio going down for reconfiguration. When > 0 the radio
++     * is only temporarily down — skip the deferral and proceed with warm apply. */
++    if(pRad->autoChannelEnable && !wld_rad_isUpExt(pRad)) {
++        if(s_pendingAcsReAddCount > 0) {
++            s_pendingAcsReAddCount--;
++            SAH_TRACEZ_WARNING(ME, "%s: ACS enabled, BSS re-add in progress — skip ACS deferral",
++                               pRad->Name);
++        } else {
++            SAH_TRACEZ_WARNING(ME, "%s: ACS in progress (autoChannelEnable=1, radio not up) — defer warm apply",
++                               pRad->Name);
++            setBitLongArray(pRad->fsmRad.FSM_BitActionArray, FSM_BW, GEN_FSM_ADD_HOSTAPD);
++            pRad->fsmRad.timeout_msec = 2000;
++            return true;
++        }
+     }
+     wld_wpaCtrlInterface_t* pgIface = wld_secDmn_getGlobalCtrlIface(pRad->hostapd);
+     ASSERTW_TRUE(wld_wpaCtrlInterface_isReady(pgIface), true, ME, "%s: gsock disconnected", pRad->Name);
+     wifiGen_hapd_restoreMainIface(pRad);
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -294,9 +294,16 @@ void wld_hostapd_cfgFile_setRadioConfig(T_Radio* pRad, swl_mapChar_t* radConfig
+      *   Without it, ACS defaults to 20/40 MHz and the radio never comes up on 80MHz. */
+     bool useAcs = (pRad->autoChannelEnable && !pRad->externalAcsMgmt);
+     if(useAcs) {
+         swl_mapChar_add(radConfigMap, "channel", "acs_survey");
++        /* For 6GHz ACS: write op_class to the radio section so hostapd's
++         * is_6ghz_op_class() directs ACS to scan 6GHz channels. Without it,
++         * hw_mode=a defaults to 5GHz and ACS returns a 5GHz channel. */
++        if(wld_rad_is_6ghz(pRad)) {
++            swl_mapCharFmt_addValInt32(radConfigMap, "op_class",
++                                       swl_chanspec_getOperClass(&tgtChspec));
++        }
+     } else {
+         swl_mapCharFmt_addValInt32(radConfigMap, "channel", tgtChan);
+         swl_mapCharFmt_addValInt32(radConfigMap, "op_class", swl_chanspec_getOperClass(&tgtChspec));
+     }
