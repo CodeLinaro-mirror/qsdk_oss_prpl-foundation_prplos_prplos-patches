@@ -1,0 +1,61 @@
+From: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+Date: Mon, 28 Jul 2026
+Subject: [PATCH] pwhm: skip RECONFIGURE on connected MLO bSTA link and reset reconnect state
+
+Two fixes for MLO backhaul STA stability:
+
+1. When s_updateAllEpMld processes neighbor endpoints that fall into
+   the else branch, calling wld_endpoint_sync_connection unconditionally
+   triggers a RECONFIGURE even when the neighbor endpoint is already
+   EPCS_CONNECTED. This causes unnecessary disruption on a connected
+   MLO backhaul STA link.
+
+   Guard the sync_connection call so it is skipped when the neighbor
+   endpoint is already in EPCS_CONNECTED state.
+
+2. On a successful station connect event, reset the endpoint's
+   reconnect_count and stop its reconnect timer before the endpoint
+   may be reassigned to the MLD main link. Without this, a secondary
+   link that never gets classified as EPCS_CONNECTED by s_updateAllEpMld
+   accumulates reconnect_count across individually-successful
+   connect/disconnect cycles until it crosses reconnect_rad_trigger
+   and forces a spurious radio toggle that tears the link down.
+
+Signed-off-by: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+---
+ src/Plugin/wifiGen_eventHandlers.c | 13 +++++++++++++
+ src/Plugin/wifiGen_fsm.c          |  2 +-
+ 2 files changed, 14 insertions(+), 1 deletion(-)
+
+--- a/src/Plugin/wifiGen_eventHandlers.c
++++ b/src/Plugin/wifiGen_eventHandlers.c
+@@ -1427,6 +1427,18 @@ static void s_stationConnectedEvt(void* pRef, char* ifName, swl_macBin_t* bBssi
+     ASSERT_NOT_NULL(pEP, , ME, "NULL");
+     ASSERT_NOT_NULL(ifName, , ME, "NULL");
+
++    /*
++     * this event's wpactrl interface itself just reported a successful connection:
++     * clear its own reconnect retry state now, before pEP may get reassigned to
++     * the MLD main link below. Otherwise a secondary link that never gets
++     * classified as EPCS_CONNECTED by s_updateAllEpMld() keeps accumulating
++     * reconnect_count across connect/disconnect cycles that are individually
++     * successful, until it crosses reconnect_rad_trigger and forces a spurious
++     * radio toggle that tears the link down.
++     */
++    pEP->reconnect_count = 0;
++    amxp_timer_stop(pEP->reconnectTimer);
++
+     wld_epConnectionInfo_t connInfo;
+     memset(&connInfo, 0, sizeof(connInfo));
+     connInfo.mldLinkId = NO_LINK_ID;
+--- a/src/Plugin/wifiGen_fsm.c
++++ b/src/Plugin/wifiGen_fsm.c
+@@ -1663,7 +1663,7 @@ static void s_updateAllEpMld(T_EndPoint* pEP, wld_nl80211_ifaceInfo_t* epIfInfo) {
+         } else if(wld_ssid_hasValidMLDRole(pNgSSID) && wld_ssid_hasValidMLDLinkID(pSSID)) {
+             // Set ConnectionStatus of all unlinked neighbor endpoints to passive mode
+             wld_endpoint_setConnectionStatus(pNgEp, EPCS_PASSIVE, EPE_NONE);
+-        } else {
++        } else if(pNgEp->connectionStatus != EPCS_CONNECTED) {
+             wld_endpoint_sync_connection(pNgEp, false, EPE_NONE);
+         }
+     }
