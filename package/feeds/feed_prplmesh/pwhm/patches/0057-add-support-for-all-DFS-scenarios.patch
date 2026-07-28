@@ -223,7 +223,7 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
  			 * IEEE Channel number to be used at boot.
  			 * Only applied when AutoChannelEnable is active.
  			 * Possible value :
-@@ -2873,12 +2938,45 @@ define probelist_t{
+@@ -2873,12 +2938,54 @@ define probelist_t{
  				 * Set BgDfs enable on this radio
  				 * This parameter will allow the system to preclear DFS channels
  				 */
@@ -257,6 +257,15 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
 +			}
 +
 +			/**
++			 * Enable hostapd Agile CAC (bgcac_en=1 in hostapd.conf).
++			 * Proactively clears other DFS channels in the background while operating.
++			 * Distinct from PreclearEnable (iw dev ZWDFS zero-wait DFS).
++			 */
++			%persistent bool BgCacEnable {
++				default false;
++			}
++
++			/**
 +			 * Enable DFS bandwidth reduction for Agile CAC.
 +			 * When enabled, Agile CAC runs at half the configured bandwidth:
 +			 *   - Radio at 80MHz  → Agile CAC runs at 40MHz
@@ -274,9 +283,26 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
  				 * This parameter will allow the system to use an external bgdfs provider
  				 * to do its bgdfs clear
  				 */
-@@ -2971,12 +3069,48 @@ define probelist_t{
- 				 */
- 				void startBgDfsClear(%in %mandatory uint8 channel, %in uint32 bandwidth);
+@@ -2962,21 +3069,41 @@ define probelist_t{
+ 					%read-only uint32 NrClearFailOther;
+ 				}
+ 
+-				/**
+-				 * Start BgDfs
+-				 * Currently targetted for testing only. PreclearEnable is not necessary to be enabled in order this to work,
+-				 * but BgDfs must be available.
+-				 * @param channel: the channel to clear
+-				 * @param bandwidth: optional bandwidth in MHz to clear. Set to 0 for auto
+-				 */
+-				void startBgDfsClear(%in %mandatory uint8 channel, %in uint32 bandwidth);
++			/**
++			 * Start BgDfs (background CAC via iw dev / NL80211).
++			 * Equivalent to: iw dev <phy> cac trigger channel <chan> <bw>MHz bgcac
++			 * @param channel: the channel to clear (mandatory)
++			 * @param bandwidth: bandwidth in MHz (0 = auto)
++			 * @return true if background CAC started successfully, false on error
++			 */
++			bool startBgDfsClear(%in %mandatory uint8 channel, %in uint32 bandwidth);
  
 -				/**
 -				 * Stop BgDfs
@@ -290,33 +316,17 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
 +			 */
 +			void stopBgDfsClear();
 +
-+			/**
-+			 * Set the rolling CAC (rCAC) frequency.
-+			 * Sends: SET_RCAC_FREQ channel <chan> [<bw>] via hostapd wpa_ctrl.
-+			 * Equivalent to: hostapd_cli -i <ifname> set_rcac_freq channel <chan> <bw>
-+			 * If BgDfs is running via iw dev, it is stopped first (PRD constraint).
-+			 * @param channel: target channel number (mandatory)
-+			 * @param bw: bandwidth in MHz (optional, 0 = auto)
-+			 * @return true on success, false on failure
-+			 */
++			/** Start rCAC on channel. Sends: SET rcac_freq <chan> [<bw>] */
 +			bool setRcacFreq(%in %mandatory uint32 channel, %in uint32 bw);
 +
-+			/**
-+			 * Switch to the rCAC channel.
-+			 * Sends: SWITCH_TO_RCAC via hostapd wpa_ctrl.
-+			 * Equivalent to: hostapd_cli -i <ifname> switch_to_rcac
-+			 * If BgDfs is running via iw dev, it is stopped first (PRD constraint).
-+			 * @return true on success, false on failure
-+			 */
++			/** Switch radio to the pre-cleared rCAC channel. Sends: switch_to_rcac */
 +			bool switchToRcac();
 +
 +			/**
-+			 * Get the current rCAC frequency.
-+			 * Sends: GET_RCAC_FREQ via hostapd wpa_ctrl.
-+			 * Equivalent to: hostapd_cli -i <ifname> get_rcac_freq
-+			 * @return string with rCAC frequency info, or empty string on failure
++			 * Get background CAC status (RCAC or PreCAC). Sends: GET bgcac_status
++			 * Returns: mode=<RCAC|PreCAC> status=<ongoing|done|unavailable> channel=<n> freq=<n> bw=<n>
 +			 */
-+			string getRcacFreq();
++			string BgCacStatus();
 +
 +			/**
 +			 * Reset the preCAC list.
@@ -331,17 +341,28 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
  
 --- a/src/ChannelManagement/wld_bgdfs.c
 +++ b/src/ChannelManagement/wld_bgdfs.c
-@@ -73,6 +73,9 @@
+@@ -73,6 +73,10 @@
  #include "wld_chanmgt.h"
  #include "wld_bgdfs.h"
  #include "wld_channel.h"
 +#include "wld_accesspoint.h"
 +#include "wld_wpaCtrl_api.h"
 +#include "wld_rad_nl80211.h"
++#include "wld/wld_hostapd_cfgFile.h"
  
  #define ME "chanDfs"
  
-@@ -408,9 +411,39 @@ static void s_setBgdfsProvider_pwf(void*
+@@ -238,6 +242,9 @@ void wld_bgdfs_notifyClearEnded(T_Radio*
+     case DFS_RESULT_OK:
+         wld_channel_clear_passive_band(cacChSpec);
+         pRad->bgdfs_stats.nrClearSuccess[type]++;
++        /* Update ClearedDfsChannels DM — needed for RCAC (FCC) where
++         * s_markChSpecAvailable may not trigger the update. */
++        wld_chanmgt_writeDfsChannels(pRad);
+         break;
+     case DFS_RESULT_RADAR:
+         pRad->bgdfs_stats.nrClearFailRadar[type]++;
+@@ -408,9 +415,81 @@ static void s_setBgdfsProvider_pwf(void*
      SAH_TRACEZ_OUT(ME);
  }
  
@@ -374,14 +395,78 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
 +    SAH_TRACEZ_OUT(ME);
 +}
 +
++/** Runtime write handler for BgCacEnable.
++ * Sends: SET bgcac_en <0|1> via wpa_ctrl for immediate effect.
++ * Config file also updated via wld_hostapd_cfgFile_createExt for persistence.
++ */
++static void s_setBgCacEnable_pwf(void* priv _UNUSED, amxd_object_t* object,
++                                  amxd_param_t* param _UNUSED,
++                                  const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_Radio* pR = wld_rad_fromObj(amxd_object_get_parent(amxd_object_get_parent(object)));
++    ASSERT_NOT_NULL(pR, , ME, "NULL");
++
++    bool enable = amxc_var_dyncast(bool, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: BgCacEnable=%d", pR->Name, enable);
++
++    /* Update hostapd config file for persistence across restarts */
++    wld_hostapd_cfgFile_createExt(pR);
++
++    /* Apply immediately at runtime via wpa_ctrl if radio is active */
++    if(!wld_rad_isActive(pR)) {
++        SAH_TRACEZ_INFO(ME, "%s: BgCacEnable: radio not active, config file updated only", pR->Name);
++        SAH_TRACEZ_OUT(ME);
++        return;
++    }
++
++    T_AccessPoint* pAP = wld_rad_getFirstActiveAp(pR);
++    if(pAP == NULL) {
++        SAH_TRACEZ_WARNING(ME, "%s: BgCacEnable: no active AP, config file updated only", pR->Name);
++        SAH_TRACEZ_OUT(ME);
++        return;
++    }
++
++    swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pAP->wpaCtrlInterface, "OK",
++                                                        "SET bgcac_en %d", enable ? 1 : 0);
++    if(!swl_rc_isOk(rc)) {
++        SAH_TRACEZ_ERROR(ME, "%s: BgCacEnable: SET bgcac_en %d failed rc=%d", pR->Name, enable, rc);
++    }
++
++    SAH_TRACEZ_OUT(ME);
++}
++
  SWLA_DM_HDLRS(sRadBgDfsDmHdlrs,
                ARR(SWLA_DM_PARAM_HDLR("PreclearEnable", s_setEnable_pwf),
                    SWLA_DM_PARAM_HDLR("AllowProvider", s_setBgdfsProvider_pwf),
 +                  SWLA_DM_PARAM_HDLR("BgCacTimeout", s_setBgCacTimeout_pwf),
++                  SWLA_DM_PARAM_HDLR("BgCacEnable", s_setBgCacEnable_pwf),
                    ));
  
  void _wld_radBgDfs_setConf_ocf(const char* const sig_name,
-@@ -510,3 +543,214 @@ amxd_status_t _stopBgDfsClear(amxd_objec
+@@ -475,7 +554,7 @@ amxd_status_t bgdfs_stopClear(T_Radio* p
+ amxd_status_t _startBgDfsClear(amxd_object_t* object,
+                                amxd_function_t* func _UNUSED,
+                                amxc_var_t* args,
+-                               amxc_var_t* retval _UNUSED) {
++                               amxc_var_t* retval) {
+     SAH_TRACEZ_IN(ME);
+ 
+     T_Radio* pR = wld_rad_fromObj(amxd_object_get_parent(amxd_object_get_parent(object)));
+@@ -489,10 +568,11 @@ amxd_status_t _startBgDfsClear(amxd_obje
+ 
+     SAH_TRACEZ_INFO(ME, "startBgDfsClear called with channel: %i, bandwidth: %i", channel, bandwidth);
+     amxd_status_t status = bgdfs_startClear(pR, bandwidth, channel, &dfsArgs);
++    amxc_var_set(bool, retval, (status == amxd_status_ok));
+ 
+     SAH_TRACEZ_OUT(ME);
+ 
+-    return status;
++    return amxd_status_ok;
+ }
+ 
+ amxd_status_t _stopBgDfsClear(amxd_object_t* object,
+@@ -510,3 +590,216 @@ amxd_status_t _stopBgDfsClear(amxd_objec
  
      return status;
  }
@@ -454,12 +539,16 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
 +    swl_rc_ne rc;
 +    if(bw > 0) {
 +        rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pAP->wpaCtrlInterface, "OK",
-+                                                  "SET_RCAC_FREQ channel %u %u", channel, bw);
++                                                  "SET rcac_freq %u %u", channel, bw);
 +    } else {
 +        rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pAP->wpaCtrlInterface, "OK",
-+                                                  "SET_RCAC_FREQ channel %u", channel);
++                                                  "SET rcac_freq %u", channel);
 +    }
 +
++    if(!swl_rc_isOk(rc)) {
++        SAH_TRACEZ_ERROR(ME, "%s: setRcacFreq channel=%u failed rc=%d (hostapd returned FAIL — rCAC not supported or unavailable)",
++                         pR->Name, channel, rc);
++    }
 +    amxc_var_set(bool, retval, swl_rc_isOk(rc));
 +    SAH_TRACEZ_OUT(ME);
 +    return amxd_status_ok;
@@ -510,8 +599,9 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
 +    }
 +
 +    SAH_TRACEZ_INFO(ME, "%s: switchToRcac", pR->Name);
++    /* hostapd uses lowercase "switch_to_rcac" (os_strcmp, case-sensitive) */
 +    swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pAP->wpaCtrlInterface, "OK",
-+                                                        "SWITCH_TO_RCAC");
++                                                        "switch_to_rcac");
 +
 +    amxc_var_set(bool, retval, swl_rc_isOk(rc));
 +    SAH_TRACEZ_OUT(ME);
@@ -519,14 +609,11 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
 +}
 +
 +/**
-+ * @brief Get the current rCAC frequency.
-+ *
-+ * Sends: GET_RCAC_FREQ via hostapd wpa_ctrl.
-+ * Equivalent to: hostapd_cli -i <ifname> get_rcac_freq
-+ *
-+ * @return string with rCAC frequency info, or empty string on failure
++ * @brief Get background CAC status (RCAC or PreCAC).
++ * Sends: GET bgcac_status via hostapd wpa_ctrl.
++ * Returns: mode=<RCAC|PreCAC> status=<ongoing|done|unavailable> channel=<n> freq=<n> bw=<n>
 + */
-+amxd_status_t _getRcacFreq(amxd_object_t* object,
++amxd_status_t _BgCacStatus(amxd_object_t* object,
 +                            amxd_function_t* func _UNUSED,
 +                            amxc_var_t* args _UNUSED,
 +                            amxc_var_t* retval) {
@@ -537,7 +624,7 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
 +
 +    T_AccessPoint* pAP = s_bgdfs_getAp(pR);
 +    if(pAP == NULL) {
-+        SAH_TRACEZ_ERROR(ME, "%s: getRcacFreq: no AP available", pR->Name);
++        SAH_TRACEZ_ERROR(ME, "%s: BgCacStatus: no AP available", pR->Name);
 +        amxc_var_set(cstring_t, retval, "");
 +        SAH_TRACEZ_OUT(ME);
 +        return amxd_status_ok;
@@ -545,17 +632,17 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
 +
 +    char reply[256] = {0};
 +    swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtGetResponse(pAP->wpaCtrlInterface, reply,
-+                                                      sizeof(reply), "GET_RCAC_FREQ");
++                                                      sizeof(reply), "GET bgcac_status");
 +    if(swl_rc_isOk(rc)) {
-+        /* strip trailing newline/carriage return */
 +        size_t len = strlen(reply);
 +        while(len > 0 && (reply[len - 1] == '\n' || reply[len - 1] == '\r')) {
 +            reply[--len] = '\0';
 +        }
-+        SAH_TRACEZ_INFO(ME, "%s: getRcacFreq reply: '%s'", pR->Name, reply);
++        SAH_TRACEZ_INFO(ME, "%s: BgCacStatus reply: '%s'", pR->Name, reply);
 +        amxc_var_set(cstring_t, retval, reply);
 +    } else {
-+        SAH_TRACEZ_ERROR(ME, "%s: getRcacFreq failed (rc=%d)", pR->Name, rc);
++        /* bgcac_en=0 or no background CAC active */
++        SAH_TRACEZ_WARNING(ME, "%s: BgCacStatus: not active (rc=%d)", pR->Name, rc);
 +        amxc_var_set(cstring_t, retval, "");
 +    }
 +
@@ -1018,31 +1105,23 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
  bool wifiGen_wpaSupp_isRunning(T_EndPoint* pEP) {
 --- a/src/nl80211/wld_hostapd_cfgFile.c
 +++ b/src/nl80211/wld_hostapd_cfgFile.c
-@@ -858,6 +858,39 @@ void wld_hostapd_cfgFile_setRadioConfig(
+@@ -858,6 +858,31 @@ void wld_hostapd_cfgFile_setRadioConfig(
                              dwellSplit, totalDwell);
          }
      }
 +
-+    /*
-+     * Write BgDfs (Background DFS) parameters to the hostapd config file.
-+     *
-+     * enable_background_radar: written when BgDfs.Available is true.
-+     * bgcac_en: written when BgDfs.PreclearEnable is true.
-+     * dfs_bw_reduce_en: written when BgDfs.BwReduceEnable is true.
-+     *
-+     * Note: BgCacTimeout is applied via NL80211 vendor command, not hostapd config.
-+     */
++    /* Write BgDfs params to hostapd config. */
 +    if(pRad->pBus) {
 +        amxd_object_t* bgDfsObj = amxd_object_findf(pRad->pBus, "ChannelMgt.BgDfs");
 +        if(bgDfsObj != NULL) {
 +            bool bgDfsAvailable = amxd_object_get_bool(bgDfsObj, "Available", NULL);
-+            bool preclearEnable = amxd_object_get_bool(bgDfsObj, "PreclearEnable", NULL);
++            bool bgCacEnable = amxd_object_get_bool(bgDfsObj, "BgCacEnable", NULL);
 +            bool bwReduceEnable = amxd_object_get_bool(bgDfsObj, "BwReduceEnable", NULL);
 +
 +            if(bgDfsAvailable) {
 +                swl_mapCharFmt_addValInt32(radConfigMap, "enable_background_radar", 1);
 +            }
-+            if(preclearEnable) {
++            if(bgCacEnable) {
 +                swl_mapCharFmt_addValInt32(radConfigMap, "bgcac_en", 1);
 +            }
 +            if(bwReduceEnable) {
@@ -1052,7 +1131,7 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
 +            SAH_TRACEZ_INFO(ME, "%s: BgDfs config file params written "
 +                            "(enable_background_radar=%d, bgcac_en=%d, dfs_bw_reduce_en=%d)",
 +                            pRad->Name, bgDfsAvailable ? 1 : 0,
-+                            preclearEnable ? 1 : 0, bwReduceEnable ? 1 : 0);
++                            bgCacEnable ? 1 : 0, bwReduceEnable ? 1 : 0);
 +        }
 +    }
  }
