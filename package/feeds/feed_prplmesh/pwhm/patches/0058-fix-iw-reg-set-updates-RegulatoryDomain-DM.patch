@@ -1,0 +1,107 @@
+From: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+Date: Tue, 22 Jul 2026
+Subject: [PATCH] fix: allow iw reg set to update WiFi.Radio.*.RegulatoryDomain and validate input
+
+Three issues fixed:
+
+1. The boot-time guard added in 0056 blocked ALL WLD_RAD_CHANGE_REGDOM
+   events where pTmpRad->regulatoryDomain differed from the incoming
+   country. This correctly blocked firmware-default events at boot, but
+   also blocked legitimate runtime iw reg set commands.
+
+   Fix: narrow the guard to FSM_WAIT only (the init waiting phase,
+   value 1). FSM_IDLE (0) is the normal steady state between commits
+   and must not be blocked. Only FSM_WAIT indicates init is still in
+   progress and the firmware-default should be suppressed.
+
+2. When WLD_RAD_CHANGE_REGDOM adopted a new country it queued
+   GEN_FSM_MOD_COUNTRYCODE and GEN_FSM_SYNC_RAD but never updated the
+   DM object WiFi.Radio.*.RegulatoryDomain. syncData_Radio2OBJ(SET)
+   is not triggered by any of the queued FSM bits.
+
+   Fix: after setting regulatoryDomainIdx, immediately call
+   mfn_wrad_regdomain(SET) to update pTmpRad->regulatoryDomain from
+   the new index, then push just RegulatoryDomain to the DM via a
+   minimal targeted transaction. Using mfn_sync_radio(SET) here is
+   unsafe as it triggers a full DM sync with all validators before
+   the FSM has settled the new country state.
+
+3. WiFi.Radio.*.RegulatoryDomain accepted arbitrary strings (e.g.
+   "123", "hii") because the parameter had no validate action in the
+   ODL. Add _wld_rad_validateRegulatoryDomain_pvf which calls
+   s_checkCountryCode before the write is committed, and register it
+   as the validate action in wld_radio.odl.
+
+Signed-off-by: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+---
+ odl/wld_radio.odl        | 4 +++-
+ src/Plugin/wifiGen_fsm.c | 7 ++++++-
+ src/wld_radio.c          | 21 +++++++++++++++++++++
+ 3 files changed, 30 insertions(+), 2 deletions(-)
+
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -1240,5 +1240,26 @@ static swl_rc_ne s_checkCountryCode(const char* countryCode, int32_t* pIdx) {
+     return SWL_RC_OK;
+ }
++
++amxd_status_t _wld_rad_validateRegulatoryDomain_pvf(amxd_object_t* object,
++                                                     amxd_param_t* param _UNUSED,
++                                                     amxd_action_t reason _UNUSED,
++                                                     const amxc_var_t* const args,
++                                                     amxc_var_t* const retval _UNUSED,
++                                                     void* priv _UNUSED) {
++    ASSERTS_FALSE(amxc_var_is_null(args), amxd_status_invalid_value, ME, "invalid");
++    ASSERTS_EQUALS(amxd_object_get_type(object), amxd_object_instance, amxd_status_ok, ME, "obj is not instance");
++    T_Radio* pRad = wld_rad_fromObj(object);
++    ASSERTI_NOT_NULL(pRad, amxd_status_ok, ME, "No radio mapped");
++    char* newValue = amxc_var_dyncast(cstring_t, args);
++    ASSERT_NOT_NULL(newValue, amxd_status_invalid_value, ME, "NULL");
++    amxd_status_t status = amxd_status_ok;
++    if(s_checkCountryCode(newValue, NULL) != SWL_RC_OK) {
++        SAH_TRACEZ_ERROR(ME, "invalid RegulatoryDomain value: %s", newValue);
++        status = amxd_status_invalid_value;
++    }
++    free(newValue);
++    return status;
++}
+ 
+ static swl_rc_ne s_setCountryCode(T_Radio* pR, const char* countryCode, bool direct) {
+     ASSERT_NOT_NULL(pR, SWL_RC_INVALID_PARAM, ME, "NULL");
+
+--- a/odl/wld_radio.odl
++++ b/odl/wld_radio.odl
+@@ -1210,5 +1210,7 @@
+ 		 * Possible patterns: </p>
+ 		 * <li>[A-Z][A-Z][ OI]</li>
+ 		 */
+-		%persistent string RegulatoryDomain;
++		%persistent string RegulatoryDomain {
++			on action validate call wld_rad_validateRegulatoryDomain_pvf;
++		}
+ 
+
+--- a/src/Plugin/wifiGen_fsm.c
++++ b/src/Plugin/wifiGen_fsm.c
+@@ -2275,7 +2275,7 @@ static void s_radioChange(wld_rad_changeEvent_t* event) {
+                 char savedRegDom[8] = {0};
+                 if(!(swl_rc_isOk(wifiGen_hapd_getConfiguredCountryCode(pTmpRad, savedRegDom, sizeof(savedRegDom))) &&
+                      swl_str_matches(savedRegDom, regDom)) &&
+-                   !(!swl_str_isEmpty(pTmpRad->regulatoryDomain) && !swl_str_matches(pTmpRad->regulatoryDomain, regDom)) &&
++                   !((pTmpRad->fsmRad.FSM_State == FSM_WAIT) && !swl_str_isEmpty(pTmpRad->regulatoryDomain) && !swl_str_matches(pTmpRad->regulatoryDomain, regDom)) &&
+                    (getCountryParam(regDom, 0, &pTmpRad->regulatoryDomainIdx) != -1)) {
+                     SAH_TRACEZ_INFO(ME, "%s: applying country %s (wiphy %d)", pTmpRad->Name, regDom, pTmpRad->wiphy);
+
+@@ -2296,6 +2296,12 @@ static void s_radioChange(wld_rad_changeEvent_t* event) {
+                     setBitLongArray(actionArray, FSM_BW, GEN_FSM_MOD_COUNTRYCODE);
+                     setBitLongArray(actionArray, FSM_BW, GEN_FSM_SYNC_RAD);
+                     setBitLongArray(actionArray, FSM_BW, GEN_FSM_MOD_HOSTAPD);
++                    pTmpRad->pFA->mfn_wrad_regdomain(pTmpRad, NULL, 0, SET);
++                    amxd_trans_t trans;
++                    if(swl_object_prepareTransaction(&trans, pTmpRad->pBus) == amxd_status_ok) {
++                        amxd_trans_set_cstring_t(&trans, "RegulatoryDomain", pTmpRad->regulatoryDomain);
++                        swl_object_finalizeTransactionOnLocalDm(&trans);
++                    }
+                     if(needCommit) {
+                         wld_rad_doCommitIfUnblocked(pTmpRad);
+                     }
