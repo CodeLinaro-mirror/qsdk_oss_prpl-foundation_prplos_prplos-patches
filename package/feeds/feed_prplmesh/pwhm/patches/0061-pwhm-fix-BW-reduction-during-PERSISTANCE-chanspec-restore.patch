@@ -1,0 +1,44 @@
+From e7cca16f8241af7443df03382160d9914d8417ed Mon Sep 17 00:00:00 2001
+From: Kartheek E <karte@qti.qualcomm.com>
+Date: Wed, 29 Jul 2026 14:55:13 +0530
+Subject: [PATCH 1/1] pwhm: fix BW reduction during PERSISTANCE chanspec
+ restore
+
+Signed-off-by: Kartheek E <karte@qti.qualcomm.com>
+---
+ src/ChannelManagement/wld_chanmgt.c | 11 ++++++-----
+ 1 file changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/src/ChannelManagement/wld_chanmgt.c b/src/ChannelManagement/wld_chanmgt.c
+index f7bde3b..da4a933 100644
+--- a/src/ChannelManagement/wld_chanmgt.c
++++ b/src/ChannelManagement/wld_chanmgt.c
+@@ -667,8 +667,13 @@ swl_rc_ne wld_chanmgt_setTargetChanspec(T_Radio* pR, swl_chanspec_t chanspec, bo
+     ASSERT_TRUE(tgtChanspec.bandwidth > 0, SWL_RC_ERROR, ME, "%s: channel / bw not available %s",
+                 pR->Name, swl_type_toBuf32(&gtSwl_type_chanspecExt, &chanspec).buf);
+ 
++    if(!wld_rad_firstCommitFinished(pR) && (reason == CHAN_REASON_MANUAL) && (pR->totalNrTargetChanspecChanges < 2)) {
++        reason = CHAN_REASON_PERSISTANCE;
++    }
++
+     /** adapt fronthaul target chanspec if not imposed by backchaul */
+-    if(!wld_rad_hasConnectedEp(pR) && (reason != CHAN_REASON_EP_MOVE)) {
++    if(!wld_rad_hasConnectedEp(pR) && (reason != CHAN_REASON_EP_MOVE)
++       && (reason != CHAN_REASON_PERSISTANCE)) {
+         s_adaptFronthaulTgtChanspec(pR, &tgtChanspec);
+     }
+ 
+@@ -682,10 +687,6 @@ swl_rc_ne wld_chanmgt_setTargetChanspec(T_Radio* pR, swl_chanspec_t chanspec, bo
+         }
+     }
+ 
+-    if(!wld_rad_firstCommitFinished(pR) && (reason == CHAN_REASON_MANUAL) && (pR->totalNrTargetChanspecChanges < 2)) {
+-        reason = CHAN_REASON_PERSISTANCE;
+-    }
+-
+     SAH_TRACEZ_WARNING(ME, "%s: set tgt chanspec %s -> %s (reason <%s>, direct <%d>, current %s, in %s)",
+                        pR->Name,
+                        swl_typeChanspecExt_toBuf32(pR->targetChanspec.chanspec).buf,
+-- 
+2.43.0
+
