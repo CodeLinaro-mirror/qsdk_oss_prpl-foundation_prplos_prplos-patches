@@ -1,0 +1,151 @@
+From: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+Date: Thu, 30 Jul 2026
+Subject: [PATCH] dpp: add Relay role to AccessPoint.DPP and fix EndPoint.DPP
+
+AP side (AccessPoint.{i}.DPP):
+1. Add "Relay" to Role enum: check_enum ["Configurator", "Relay"].
+2. Enable=1 + Role="Relay"        -> dpp_controller + dpp=1 + dpp_configurator_connectivity=1
+   Enable=1 + Role="Configurator" -> dpp=1 + dpp_configurator_connectivity=1
+3. Add DPP_IsRelay struct field. Set it in s_setDppRole_pwf and call
+   wld_ap_doSync so hostapd.conf is regenerated when Role changes.
+4. Guard configureDPP() RPC: reject when Role="Relay".
+
+STA side (EndPoint.{i}.DPP):
+5. Add optional 'key' param to dpp_bootstrap_gen().
+6. Guard dpp_bootstrap_gen() and chirp() - return amxd_status_not_supported
+   when wpa_supplicant is not running (wpaCtrl socket not open yet).
+   Both commands work regardless of AP connection state.
+
+Signed-off-by: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+---
+ include/wld/wld.h                   |  1 +
+ odl/wld_accesspoint.odl             |  9 +++---
+ odl/wld_endpoint.odl                |  2 +-
+ src/nl80211/wld_hostapd_cfgFile.c   |  9 ++++---
+ src/wld_accesspoint.c               |  7 +++++
+ src/wld_endpoint.c                  | 14 ++++++++++-
+ 6 files changed, 35 insertions(+), 7 deletions(-)
+
+--- a/odl/wld_accesspoint.odl	2026-07-30 15:24:33.811601249 +0530
++++ b/odl/wld_accesspoint.odl	2026-07-30 15:25:18.661542708 +0530
+@@ -1046,8 +1046,13 @@
+ 			%persistent bool Enable{
+ 				default false;
+ 			}
+-			/** Role of DPP.*/
++			/** DPP role for this AP.
++			 * "Configurator": writes dpp=1 + dpp_configurator_connectivity=1
++			 * "Relay"       : writes dpp_controller only. BootstrapType and
++			 *                 configureDPP not applicable.
++			 */
+ 			%persistent string Role{
++				on action validate call check_enum ["Configurator", "Relay"];
+ 				default "Configurator";
+ 			}
+ 			/** BootstrapType of DPP.*/
+--- a/odl/wld_endpoint.odl	2026-07-30 15:24:33.923606097 +0530
++++ b/odl/wld_endpoint.odl	2026-07-30 15:25:18.661542708 +0530
+@@ -879,7 +879,7 @@
+ 			}
+ 
+ 			/** Generates a bootstrap info and returns the URI */
+-			string dpp_bootstrap_gen(%in string curve, %in uint32 chan, %in uint32 operatingclass);
++			string dpp_bootstrap_gen(%in string curve, %in uint32 chan, %in uint32 operatingclass, %in string key);
+ 
+ 			/** Triggers a chirp message to start authentication */
+ 			bool chirp(%in uint32 id);
+--- a/include/wld/wld.h	2026-07-30 15:24:33.935606617 +0530
++++ b/include/wld/wld.h	2026-07-30 15:25:18.665542881 +0530
+@@ -1974,6 +1974,7 @@
+     bool DPP_Enable;                                /* DPP enabled? */
+     char DPP_Role[16];
+     char DPP_BootstrapType[16];
++    bool DPP_IsRelay;                             /* true when DPP.Role="Relay" */
+ 
+     uint32_t DCS_Enable;                            /* DCS enable bitmask: bit0=CW, bit1=WLAN, bit2=AWGN, bit4=OBSS */
+     uint32_t DCS_WlanIntrDetectionThreshold;        /* DCS WLAN interference detection threshold (0-6) */
+--- a/src/nl80211/wld_hostapd_cfgFile.c	2026-07-30 15:24:33.951607309 +0530
++++ b/src/nl80211/wld_hostapd_cfgFile.c	2026-07-30 16:48:13.537229603 +0530
+@@ -1757,7 +1757,13 @@
+     s_setVapWpsConfig(pAP, vapConfigMap);
+     s_setVapMultiApConf(pAP, vapConfigMap, multiAPConfig);
+ 
++    if(pAP->DPP_Enable && pAP->DPP_IsRelay) {
++        /* Relay + Enable: only dpp_controller */
++        swl_mapChar_add(vapConfigMap, "dpp_controller",
++            "ipaddr=127.0.0.1 pkhash=0000000000000000000000000000000000000000000000000000000000000000");
++    }
+     if(pAP->DPP_Enable) {
++        /* Configurator + Enable: dpp=1 + CCE IE */
+         swl_mapChar_add(vapConfigMap, "dpp", "1");
+         swl_mapChar_add(vapConfigMap, "dpp_configurator_connectivity", "1");
+     }
+--- a/src/wld_accesspoint.c	2026-07-30 15:24:33.519588609 +0530
++++ b/src/wld_accesspoint.c	2026-07-30 17:30:46.656156655 +0530
+@@ -1276,6 +1276,7 @@
+         char* dppRole = amxd_object_get_cstring_t(dppObj, "Role", NULL);
+         if(!swl_str_nmatches(pAP->DPP_Role, dppRole, swl_str_len(pAP->DPP_Role))) {
+             swl_str_copy(pAP->DPP_Role, sizeof(pAP->DPP_Role), dppRole);
++            pAP->DPP_IsRelay = swl_str_matches(dppRole, "Relay");
+         }
+         free(dppRole);
+ 
+@@ -1805,6 +1806,8 @@
+     const char* role = amxc_var_constcast(cstring_t, newValue);
+     SAH_TRACEZ_INFO(ME, "%s: set DppRole %s", pAP->alias, role);
+     swl_str_copy(pAP->DPP_Role, sizeof(pAP->DPP_Role), role);
++    pAP->DPP_IsRelay = swl_str_matches(role, "Relay");
++    wld_ap_doSync(pAP);
+ 
+     SAH_TRACEZ_OUT(ME);
+ }
+@@ -1845,6 +1848,10 @@
+         curve = "P-256";
+     }
+ 
++    if(pAP->DPP_IsRelay) {
++        SAH_TRACEZ_ERROR(ME, "%s: configureDPP not applicable for Relay role", pAP->alias);
++        return amxd_status_function_not_implemented;
++    }
+     if (swl_str_isEmpty(qr)) {
+         SAH_TRACEZ_ERROR(ME, "QR parameter is mandatory");
+         return amxd_status_invalid_arg;
+--- a/src/wld_endpoint.c	2026-07-30 15:24:32.287535276 +0530
++++ b/src/wld_endpoint.c	2026-07-30 19:48:39.589780038 +0530
+@@ -2719,6 +2719,9 @@
+     
+     T_EndPoint* pEP = wld_ep_fromObj(amxd_object_get_parent(obj));
+     ASSERT_NOT_NULL(pEP, amxd_status_ok, ME, "No EP Ctx");
++    ASSERTS_TRUE(wld_wpaCtrlInterface_isReady(pEP->wpaCtrlInterface),
++                 amxd_status_not_supported, ME,
++                 "%s: wpaCtrl not ready - wpa_supplicant not running", pEP->alias);
+ 
+     const char* curve = GET_CHAR(args, "curve");
+     uint32_t chan = GET_UINT32(args, "chan");
+@@ -2731,10 +2734,15 @@
+     char cmd[1024] = {0};
+     char reply[1024] = {0};
+     
++    const char* key = GET_CHAR(args, "key");
++
+     int len = snprintf(cmd, sizeof(cmd), "DPP_BOOTSTRAP_GEN type=qrcode curve=%s", curve);
+     
+     if (chan != 0 && operatingclass != 0) {
+-        snprintf(cmd + len, sizeof(cmd) - len, " chan=%u/%u", operatingclass, chan);
++        len += snprintf(cmd + len, sizeof(cmd) - len, " chan=%u/%u", operatingclass, chan);
++    }
++    if (!swl_str_isEmpty(key)) {
++        snprintf(cmd + len, sizeof(cmd) - len, " key=%s", key);
+     }
+     
+     swl_rc_ne ret = wld_wpaCtrl_sendCmdFmtGetResponse(pEP->wpaCtrlInterface, reply, sizeof(reply), "%s", cmd);
+@@ -2779,6 +2787,9 @@
+     
+     T_EndPoint* pEP = wld_ep_fromObj(amxd_object_get_parent(obj));
+     ASSERT_NOT_NULL(pEP, amxd_status_ok, ME, "No EP Ctx");
++    ASSERTS_TRUE(wld_wpaCtrlInterface_isReady(pEP->wpaCtrlInterface),
++                 amxd_status_not_supported, ME,
++                 "%s: wpaCtrl not ready - wpa_supplicant not running", pEP->alias);
+ 
+     uint32_t id = GET_UINT32(args, "id");
+     char cmd[128] = {0};
