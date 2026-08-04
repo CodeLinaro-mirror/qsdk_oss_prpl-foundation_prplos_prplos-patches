@@ -1,0 +1,586 @@
+From: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+Date: Mon, 04 Aug 2026 00:00:00 +0000
+Subject: [PATCH] dpp: add DPPRelay object and Relay role support
+
+Signed-off-by: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+---
+--- a/acl/admin/pwhm.json
++++ b/acl/admin/pwhm.json
+@@ -62,5 +62,10 @@
+     "Device.WiFi.Radio.*.TransmitPower": {
+         "Order": 2,
+         "Param": "rw-n"
++    },
++    "Device.WiFi.DPPRelay.": {
++        "Order": 2,
++        "Param": "rw-n",
++        "CommandEvent": "rwxn"
+     }
+ }
+\ No newline at end of file
+
+--- /dev/null
++++ b/include/wld/wld_dpp.h
+@@ -0,0 +1,18 @@
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++#ifndef __WLD_DPP_H__
++#define __WLD_DPP_H__
++
++#include "wld.h"
++
++void wld_dpp_stopRelay(void);
++
++void _wld_dpp_relay_setConf_ocf(const char* const sig_name, const amxc_var_t* const data, void* const priv);
++
++amxd_status_t _DPPRelay_SendDppFrame(amxd_object_t* object,
++                                      amxd_function_t* func,
++                                      amxc_var_t* args,
++                                      amxc_var_t* retval);
++
++#endif // __WLD_DPP_H__
+
+--- a/makefile
++++ b/makefile
+@@ -52,6 +52,7 @@ install: all
+ 	$(INSTALL) -D -p -m 0644 odl/wld_accesspoint.odl $(DEST)/etc/amx/wld/wld_accesspoint.odl
+ 	$(INSTALL) -D -p -m 0644 odl/wld_endpoint.odl $(DEST)/etc/amx/wld/wld_endpoint.odl
+ 	$(INSTALL) -D -p -m 0644 odl/wld_mld.odl $(DEST)/etc/amx/wld/wld_mld.odl
++	$(INSTALL) -D -p -m 0644 odl/wld_dpp.odl $(DEST)/etc/amx/wld/wld_dpp.odl
+ ifneq ($(CONFIG_SAH_WLD_DATAMODEL_MAPPER),y)
+ 	$(INSTALL) -D -p -m 0644 odl/01_device-wifi_pwhm_mapping.odl $(DEST)/etc/amx/tr181-device/extensions/01_device-wifi_pwhm_mapping.odl
+ endif
+@@ -115,6 +116,7 @@ package: all
+ 	$(INSTALL) -D -p -m 0644 odl/wld_accesspoint.odl $(PKGDIR)/etc/amx/wld/wld_accesspoint.odl
+ 	$(INSTALL) -D -p -m 0644 odl/wld_endpoint.odl $(PKGDIR)/etc/amx/wld/wld_endpoint.odl
+ 	$(INSTALL) -D -p -m 0644 odl/wld_mld.odl $(PKGDIR)/etc/amx/wld/wld_mld.odl
++	$(INSTALL) -D -p -m 0644 odl/wld_dpp.odl $(PKGDIR)/etc/amx/wld/wld_dpp.odl
+ ifneq ($(CONFIG_SAH_WLD_DATAMODEL_MAPPER),y)
+ 	$(INSTALL) -D -p -m 0644 odl/01_device-wifi_pwhm_mapping.odl $(PKGDIR)/etc/amx/tr181-device/extensions/01_device-wifi_pwhm_mapping.odl
+ endif
+@@ -180,6 +182,7 @@ doc:
+ 	$(eval ODLFILES += odl/wld_accesspoint.odl)
+ 	$(eval ODLFILES += odl/wld_endpoint.odl)
+ 	$(eval ODLFILES += odl/wld_mld.odl)
++	$(eval ODLFILES += odl/wld_dpp.odl)
+ ifneq ($(CONFIG_SAH_WLD_DATAMODEL_MAPPER),y)
+ 	$(eval ODLFILES += odl/01_device-wifi_pwhm_mapping.odl)
+ endif
+--- a/odl/wld.odl.m4
++++ b/odl/wld.odl.m4
+@@ -122,6 +122,7 @@ m4_ifelse(DISABLE_PERSIST,y,``
+                    "chanMgt" = 200,
+                    "csi" = 200,
+                    "dm_trans" = 200,
++                   "dpp" = 500,
+                    "ep" = 200,
+                    "fileMgr" = 200,
+                    "gen" = 200,
+--- a/odl/wld_definitions.odl
++++ b/odl/wld_definitions.odl
+@@ -383,6 +383,7 @@ include "wld_ssid.odl";
+ include "wld_accesspoint.odl";
+ include "wld_endpoint.odl";
+ include "wld_mld.odl";
++include "wld_dpp.odl";
+
+ %populate {
+ 	on event "app:start" call app_start;
+--- /dev/null
++++ b/odl/wld_dpp.odl
+@@ -0,0 +1,59 @@
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++%define {
++	select WiFi {
++		/**
++		 * DPP TCP relay listener (127.0.0.1:8908).
++		 * Proxies raw DPP frames between a local hostapd instance (acting as
++		 * an Enrollee-proxy) and the 1905/EasyMesh Controller (acting as
++		 * Configurator). Independent of AccessPoint.{i}.DPP / EndPoint.{i}.DPP,
++		 * which only control local wpa_supplicant/hostapd DPP configurator
++		 * behaviour and the CCE beacon bit - this object never touches them.
++		 * Singleton: there is exactly one relay listener socket for the whole
++		 * device, regardless of AccessPoint count - this is not per-AP.
++		 *
++		 * @version 10.4
++		 */
++		%persistent object DPPRelay {
++			on event "*" call wld_dpp_relay_setConf_ocf;
++
++			/**
++			 * Actual switch for the DPP TCP relay listener socket. Written by
++			 * the prplMesh agent (slave_wlan_hal_whm::init_dpp_relay() /
++			 * stop_dpp_relay()) to reflect whether it currently needs the
++			 * relay running.
++			 *
++			 * Not persistent: the agent re-asserts it every time the relay
++			 * should be up, so a stale value can't survive an agent restart.
++			 */
++			bool RelayEnable {
++				default false;
++			}
++
++			/**
++			 * True while a client (hostapd) is connected to the relay.
++			 */
++			bool ClientConnected {
++				default false;
++			}
++
++			/**
++			 * Notifies a raw DPP frame reception, or a relay client
++			 * connect/disconnect transition.
++			 * - Frame received: htable with 'frame' (hex-encoded string) and
++			 *   'tcpType' (uint8) keys, no 'state' key.
++			 * - Client connect/disconnect: htable with a 'state' key set to
++			 *   "connected" or "disconnected", no 'frame'/'tcpType' keys.
++			 */
++			event 'DppFrameReceived!';
++
++			/**
++			 * Sends a raw DPP frame to the connected hostapd client.
++			 * @param tcpType the raw TCP frame type byte
++			 * @param frame hex-encoded DPP frame bytes
++			 */
++			void SendDppFrame(%in %mandatory uint8 tcpType, %in %mandatory string frame);
++		}
++	}
++}
+
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -1731,12 +1731,10 @@ void wld_hostapd_cfgFile_setVapConfig(T_AccessPoint* pAP, swl_mapChar_t* vapCon
+     s_setVapMultiApConf(pAP, vapConfigMap, multiAPConfig);
+
+     if(pAP->DPP_Enable && pAP->DPP_IsRelay) {
+-        /* Relay + Enable: only dpp_controller */
+         swl_mapChar_add(vapConfigMap, "dpp_controller",
+-            "ipaddr=127.0.0.1 pkhash=0000000000000000000000000000000000000000000000000000000000000000");
++                         "ipaddr=127.0.0.1 pkhash="
++                         "0000000000000000000000000000000000000000000000000000000000000000");
+     }
+     if(pAP->DPP_Enable) {
+-        /* Configurator + Enable: dpp=1 + CCE IE */
+-        swl_mapChar_add(vapConfigMap, "dpp", "1");
+         swl_mapChar_add(vapConfigMap, "dpp_configurator_connectivity", "1");
+     }
+
+--- a/src/wld.c
++++ b/src/wld.c
+@@ -76,6 +76,7 @@
+ #include "wld_accesspoint.h"
+ #include "wld_endpoint.h"
+ #include "wld_wps.h"
++#include "wld_dpp.h"
+ #include "wld_rad_stamon.h"
+ #include "wld_eventing.h"
+ #include "wld_chanmgt.h"
+@@ -252,6 +253,7 @@ void wld_cleanup() {
+     wld_event_destroy();
+     wld_nl80211_cleanupAll();
+     wld_channel_cleanAll();
++    wld_dpp_stopRelay();
+     wld_unregisterAllVendors();
+     swl_lib_cleanup();
+     wld_plugin_dm = NULL;
+--- a/src/wld_accesspoint.c
++++ b/src/wld_accesspoint.c
+@@ -1784,8 +1784,9 @@ static void s_setDppRole_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_pa
+
+     const char* role = amxc_var_constcast(cstring_t, newValue);
+     SAH_TRACEZ_INFO(ME, "%s: set DppRole %s", pAP->alias, role);
++    ASSERTI_FALSE(swl_str_matches(pAP->DPP_Role, role), , ME, "EQUALS");
+     swl_str_copy(pAP->DPP_Role, sizeof(pAP->DPP_Role), role);
+     pAP->DPP_IsRelay = swl_str_matches(role, "Relay");
+     wld_ap_doSync(pAP);
+
+     SAH_TRACEZ_OUT(ME);
+@@ -1811,6 +1812,7 @@ SWLA_DM_HDLRS(sApDppDmHdlrs,
+                   )
+               );
+
++
+ amxd_status_t _configureDPP(amxd_object_t* obj,
+                                  amxd_function_t* func _UNUSED,
+                                  amxc_var_t* args,
+--- /dev/null
++++ b/src/wld_dpp.c
+@@ -0,0 +1,375 @@
++/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++#include <errno.h>
++#include <string.h>
++#include <unistd.h>
++#include <fcntl.h>
++#include <sys/socket.h>
++#include <netinet/in.h>
++#include <arpa/inet.h>
++#include "wld.h"
++#include "wld_dpp.h"
++#include "swl/swl_common.h"
++#include "swl/swl_assert.h"
++#include "swl/swl_hex.h"
++
++#define ME "dpp"
++
++#define DPP_TCP_PORT           8908
++#define DPP_RX_BUF_SIZE        (16 * 1024)
++#define DPP_FRAME_HDR_LEN      5 /* 4B BE length + 1B type */
++#define DPP_HDR_LEN            6 /* OUI(3)+OUIType(1)+CryptoSuite(1)+DPPFrameType(1), mirrors hostapd's dpp.h DPP_HDR_LEN */
++#define DPP_PA_AUTHENTICATION_REQ    0
++#define DPP_PA_AUTHENTICATION_RESP   1
++#define DPP_PA_AUTHENTICATION_CONF   2
++#define DPP_PA_PEER_DISCOVERY_REQ    5
++#define DPP_PA_PEER_DISCOVERY_RESP   6
++#define DPP_PA_PKEX_V1_EXCHANGE_REQ  7
++#define DPP_PA_PKEX_EXCHANGE_RESP    8
++#define DPP_PA_PKEX_COMMIT_REVEAL_REQ  9
++#define DPP_PA_PKEX_COMMIT_REVEAL_RESP 10
++#define DPP_PA_CONFIGURATION_RESULT     11
++#define DPP_PA_CONNECTION_STATUS_RESULT 12
++#define DPP_PA_PRESENCE_ANNOUNCEMENT    13
++#define DPP_PA_RECONFIG_ANNOUNCEMENT    14
++#define DPP_PA_RECONFIG_AUTH_REQ        15
++#define DPP_PA_RECONFIG_AUTH_RESP       16
++#define DPP_PA_RECONFIG_AUTH_CONF       17
++#define DPP_PA_PKEX_EXCHANGE_REQ        18
++#define DPP_SEND_EAGAIN_MAX_RETRIES 50   /* bounded spin, paired with the delay below */
++#define DPP_SEND_EAGAIN_RETRY_DELAY_US 2000 /* 2ms; ~100ms worst case before giving up */
++
++typedef struct {
++    int listenFd;
++    int clientFd;
++    amxd_object_t* dppObj;
++    uint8_t rxBuf[DPP_RX_BUF_SIZE];
++    size_t rxLen;
++} wld_dpp_ctx_t;
++
++static wld_dpp_ctx_t s_dppCtx = {
++    .listenFd = -1,
++    .clientFd = -1,
++    .dppObj = NULL,
++    .rxLen = 0,
++};
++
++static void s_notifyClientState(bool connected) {
++    ASSERTS_NOT_NULL(s_dppCtx.dppObj, , ME, "no DPP object");
++
++    amxc_var_t notifMap;
++    amxc_var_init(&notifMap);
++    amxc_var_set_type(&notifMap, AMXC_VAR_ID_HTABLE);
++    amxc_var_add_key(cstring_t, &notifMap, "state", connected ? "connected" : "disconnected");
++    amxd_object_trigger_signal(s_dppCtx.dppObj, "DppFrameReceived", &notifMap);
++    amxc_var_clean(&notifMap);
++
++    amxd_object_set_bool(s_dppCtx.dppObj, "ClientConnected", connected);
++}
++
++static const char* s_dppActionTypeToStr(uint8_t type) {
++    switch(type) {
++    case DPP_PA_AUTHENTICATION_REQ: return "AUTHENTICATION_REQ";
++    case DPP_PA_AUTHENTICATION_RESP: return "AUTHENTICATION_RESP";
++    case DPP_PA_AUTHENTICATION_CONF: return "AUTHENTICATION_CONF";
++    case DPP_PA_PEER_DISCOVERY_REQ: return "PEER_DISCOVERY_REQ";
++    case DPP_PA_PEER_DISCOVERY_RESP: return "PEER_DISCOVERY_RESP";
++    case DPP_PA_PKEX_V1_EXCHANGE_REQ: return "PKEX_V1_EXCHANGE_REQ";
++    case DPP_PA_PKEX_EXCHANGE_RESP: return "PKEX_EXCHANGE_RESP";
++    case DPP_PA_PKEX_COMMIT_REVEAL_REQ: return "PKEX_COMMIT_REVEAL_REQ";
++    case DPP_PA_PKEX_COMMIT_REVEAL_RESP: return "PKEX_COMMIT_REVEAL_RESP";
++    case DPP_PA_CONFIGURATION_RESULT: return "CONFIGURATION_RESULT";
++    case DPP_PA_CONNECTION_STATUS_RESULT: return "CONNECTION_STATUS_RESULT";
++    case DPP_PA_PRESENCE_ANNOUNCEMENT: return "PRESENCE_ANNOUNCEMENT";
++    case DPP_PA_RECONFIG_ANNOUNCEMENT: return "RECONFIG_ANNOUNCEMENT";
++    case DPP_PA_RECONFIG_AUTH_REQ: return "RECONFIG_AUTH_REQ";
++    case DPP_PA_RECONFIG_AUTH_RESP: return "RECONFIG_AUTH_RESP";
++    case DPP_PA_RECONFIG_AUTH_CONF: return "RECONFIG_AUTH_CONF";
++    case DPP_PA_PKEX_EXCHANGE_REQ: return "PKEX_EXCHANGE_REQ";
++    default: return "UNKNOWN";
++    }
++}
++
++static void s_notifyFrameReceived(uint8_t tcpType, const uint8_t* frame, size_t frameLen) {
++    ASSERTS_NOT_NULL(s_dppCtx.dppObj, , ME, "no DPP object");
++
++    char frameHex[(frameLen * 2) + 1];
++    bool ok = swl_hex_fromBytesSep(frameHex, sizeof(frameHex), frame, frameLen, false, 0, NULL);
++    ASSERT_TRUE(ok, , ME, "fail to hex-encode DPP frame (len:%zu)", frameLen);
++
++    if(frameLen >= DPP_HDR_LEN) {
++        uint8_t dppActionType = frame[DPP_HDR_LEN - 1];
++        SAH_TRACEZ_INFO(ME, "rx DPP frame tcpType(%u) dppActionType(%u:%s) len(%zu) raw(%s)",
++                        tcpType, dppActionType, s_dppActionTypeToStr(dppActionType), frameLen, frameHex);
++        if((dppActionType == DPP_PA_PRESENCE_ANNOUNCEMENT) || (dppActionType == DPP_PA_RECONFIG_ANNOUNCEMENT)) {
++            SAH_TRACEZ_INFO(ME, "rx DPP %s from hostapd (Enrollee-proxy) fd(%d)",
++                            s_dppActionTypeToStr(dppActionType), s_dppCtx.clientFd);
++        }
++    } else {
++        SAH_TRACEZ_WARNING(ME, "rx DPP frame too short to decode action type tcpType(%u) len(%zu) raw(%s)",
++                            tcpType, frameLen, frameHex);
++    }
++
++    amxc_var_t notifMap;
++    amxc_var_init(&notifMap);
++    amxc_var_set_type(&notifMap, AMXC_VAR_ID_HTABLE);
++    amxc_var_add_key(cstring_t, &notifMap, "frame", frameHex);
++    amxc_var_add_key(uint8_t, &notifMap, "tcpType", tcpType);
++    SAH_TRACEZ_INFO(ME, "sending DppFrameReceived signal via ambiorix to 1905/EasyMesh process (tcpType:%u, frameLen:%zu)",
++                    tcpType, frameLen);
++    amxd_object_trigger_signal(s_dppCtx.dppObj, "DppFrameReceived", &notifMap);
++    amxc_var_clean(&notifMap);
++}
++
++static void s_closeClient(void) {
++    ASSERTS_TRUE(s_dppCtx.clientFd >= 0, , ME, "no client");
++    SAH_TRACEZ_INFO(ME, "closing DPP relay client fd(%d)", s_dppCtx.clientFd);
++    amxo_connection_remove(get_wld_plugin_parser(), s_dppCtx.clientFd);
++    close(s_dppCtx.clientFd);
++    s_dppCtx.clientFd = -1;
++    s_dppCtx.rxLen = 0;
++    s_notifyClientState(false);
++}
++
++/*
++ * Parses complete [4B BE payloadLen][1B type][frame] records out of rxBuf,
++ * firing a notification for each one, then compacts any leftover partial
++ * record to the front of the buffer. payloadLen covers the type byte plus
++ * the frame (1 + frameLen), matching hostapd's dpp_tcp.c wire format.
++ */
++static void s_reassembleFrames(void) {
++    size_t offset = 0;
++    while((s_dppCtx.rxLen - offset) >= DPP_FRAME_HDR_LEN) {
++        const uint8_t* hdr = &s_dppCtx.rxBuf[offset];
++        uint32_t payloadLen = ((uint32_t) hdr[0] << 24) | ((uint32_t) hdr[1] << 16) |
++            ((uint32_t) hdr[2] << 8) | (uint32_t) hdr[3];
++        if(payloadLen < 1) {
++            SAH_TRACEZ_ERROR(ME, "invalid DPP frame payloadLen(%u), discarding buffer", payloadLen);
++            s_dppCtx.rxLen = 0;
++            return;
++        }
++        if((s_dppCtx.rxLen - offset - 4) < payloadLen) {
++            break;
++        }
++        uint8_t tcpType = hdr[4];
++        uint32_t frameLen = payloadLen - 1;
++        s_notifyFrameReceived(tcpType, &s_dppCtx.rxBuf[offset + DPP_FRAME_HDR_LEN], frameLen);
++        offset += 4 + payloadLen;
++    }
++    if((offset > 0) && (offset < s_dppCtx.rxLen)) {
++        memmove(s_dppCtx.rxBuf, &s_dppCtx.rxBuf[offset], s_dppCtx.rxLen - offset);
++    }
++    s_dppCtx.rxLen -= offset;
++}
++
++static void s_dppClientRead(int fd, void* priv _UNUSED) {
++    SAH_TRACEZ_IN(ME);
++    ASSERTS_EQUALS(fd, s_dppCtx.clientFd, , ME, "fd mismatch");
++
++    bool disconnected = false;
++    while(true) {
++        if(s_dppCtx.rxLen >= sizeof(s_dppCtx.rxBuf)) {
++            SAH_TRACEZ_ERROR(ME, "DPP rx buffer full, dropping client");
++            disconnected = true;
++            break;
++        }
++        ssize_t n = recv(fd, &s_dppCtx.rxBuf[s_dppCtx.rxLen], sizeof(s_dppCtx.rxBuf) - s_dppCtx.rxLen, MSG_DONTWAIT);
++        if(n > 0) {
++            char rawHex[((size_t) n * 2) + 1];
++            if(swl_hex_fromBytesSep(rawHex, sizeof(rawHex), &s_dppCtx.rxBuf[s_dppCtx.rxLen], (size_t) n, false, 0, NULL)) {
++                SAH_TRACEZ_INFO(ME, "recv fd(%d) %zd raw byte(s): %s", fd, n, rawHex);
++            }
++            s_dppCtx.rxLen += (size_t) n;
++            continue;
++        } else if(n == 0) {
++            SAH_TRACEZ_INFO(ME, "DPP relay client fd(%d) closed connection (EOF)", fd);
++            disconnected = true;
++            break;
++        } else if((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
++            break;
++        } else if(errno == EINTR) {
++            continue;
++        } else {
++            SAH_TRACEZ_ERROR(ME, "recv err(%d:%s)", errno, strerror(errno));
++            disconnected = true;
++            break;
++        }
++    }
++
++    s_reassembleFrames();
++
++    if(disconnected) {
++        s_closeClient();
++    }
++
++    SAH_TRACEZ_OUT(ME);
++}
++
++static void s_dppAccept(int fd, void* priv _UNUSED) {
++    SAH_TRACEZ_IN(ME);
++    ASSERTS_EQUALS(fd, s_dppCtx.listenFd, , ME, "fd mismatch");
++
++    int newFd = accept4(fd, NULL, NULL, SOCK_NONBLOCK);
++    ASSERTI_FALSE(newFd < 0, , ME, "accept4 err(%d:%s)", errno, strerror(errno));
++
++    /* Single-Enrollee policy, mirrors nl80211's dpp_relay_socket::handle_accept():
++     * reject any new connection outright while one is already active. The existing
++     * connection is only torn down on its own EOF/error, never evicted for a newcomer. */
++    if(s_dppCtx.clientFd >= 0) {
++        SAH_TRACEZ_WARNING(ME, "DPP relay already has an active client fd(%d), rejecting new connection fd(%d)",
++                            s_dppCtx.clientFd, newFd);
++        close(newFd);
++        SAH_TRACEZ_OUT(ME);
++        return;
++    }
++
++    if(amxo_connection_add(get_wld_plugin_parser(), newFd, s_dppClientRead, "dppClient", AMXO_CUSTOM, NULL) != 0) {
++        SAH_TRACEZ_ERROR(ME, "fail to register DPP client fd");
++        close(newFd);
++        SAH_TRACEZ_OUT(ME);
++        return;
++    }
++
++    s_dppCtx.clientFd = newFd;
++    s_dppCtx.rxLen = 0;
++    SAH_TRACEZ_INFO(ME, "accepted new DPP relay client fd(%d)", newFd);
++    s_notifyClientState(true);
++
++    SAH_TRACEZ_OUT(ME);
++}
++
++static swl_rc_ne s_startRelay(amxd_object_t* dppObj) {
++    ASSERTI_TRUE(s_dppCtx.listenFd < 0, SWL_RC_OK, ME, "relay already started");
++
++    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
++    ASSERT_FALSE(fd < 0, SWL_RC_ERROR, ME, "socket() failed err(%d:%s)", errno, strerror(errno));
++
++    int reuse = 1;
++    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
++
++    struct sockaddr_in addr;
++    memset(&addr, 0, sizeof(addr));
++    addr.sin_family = AF_INET;
++    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
++    addr.sin_port = htons(DPP_TCP_PORT);
++
++    if((bind(fd, (struct sockaddr*) &addr, sizeof(addr)) < 0) ||
++       (listen(fd, 5) < 0) ||
++       (amxo_connection_add(get_wld_plugin_parser(), fd, s_dppAccept, "dppListen", AMXO_CUSTOM, NULL) != 0)) {
++        SAH_TRACEZ_ERROR(ME, "fail to start DPP relay listener err(%d:%s)", errno, strerror(errno));
++        close(fd);
++        return SWL_RC_ERROR;
++    }
++
++    s_dppCtx.listenFd = fd;
++    s_dppCtx.dppObj = dppObj;
++    SAH_TRACEZ_INFO(ME, "DPP relay listening on 127.0.0.1:%d", DPP_TCP_PORT);
++    return SWL_RC_OK;
++}
++
++static void s_stopRelay(void) {
++    if(s_dppCtx.clientFd >= 0) {
++        s_closeClient();
++    }
++    if(s_dppCtx.listenFd >= 0) {
++        amxo_connection_remove(get_wld_plugin_parser(), s_dppCtx.listenFd);
++        close(s_dppCtx.listenFd);
++        s_dppCtx.listenFd = -1;
++        SAH_TRACEZ_INFO(ME, "DPP relay stopped");
++    }
++}
++
++void wld_dpp_stopRelay(void) {
++    s_stopRelay();
++}
++
++static void s_setDppRelayEnable_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    bool flag = amxc_var_dyncast(bool, newValue);
++    SAH_TRACEZ_INFO(ME, "set DPP RelayEnable %d", flag);
++    if(flag) {
++        s_startRelay(object);
++    } else {
++        s_stopRelay();
++    }
++
++    SAH_TRACEZ_OUT(ME);
++}
++
++SWLA_DM_HDLRS(sDppDmHdlrs,
++              ARR(SWLA_DM_PARAM_HDLR("RelayEnable", s_setDppRelayEnable_pwf)
++                  )
++              );
++
++void _wld_dpp_relay_setConf_ocf(const char* const sig_name, const amxc_var_t* const data, void* const priv) {
++    swla_dm_procObjEvtOfLocalDm(&sDppDmHdlrs, sig_name, data, priv);
++}
++
++amxd_status_t _DPPRelay_SendDppFrame(amxd_object_t* object _UNUSED,
++                                      amxd_function_t* func _UNUSED,
++                                      amxc_var_t* args,
++                                      amxc_var_t* retval _UNUSED) {
++    SAH_TRACEZ_IN(ME);
++
++    ASSERT_TRUE(s_dppCtx.clientFd >= 0, amxd_status_invalid_action, ME, "no DPP client connected");
++
++    uint8_t tcpType = amxc_var_dyncast(uint8_t, GET_ARG(args, "tcpType"));
++    const char* frameHex = GET_CHAR(args, "frame");
++    ASSERT_STR(frameHex, amxd_status_invalid_arg, ME, "empty frame");
++
++    size_t frameLen = swl_str_len(frameHex) / 2;
++    SAH_TRACEZ_INFO(ME, "sending DPP frame to fd(%d) tcpType(%u) frameLen(%zu)",
++                    s_dppCtx.clientFd, tcpType, frameLen);
++    swl_bit8_t frameBin[frameLen];
++    bool ok = swl_hex_toBytes(frameBin, sizeof(frameBin), frameHex, swl_str_len(frameHex));
++    ASSERT_TRUE(ok, amxd_status_invalid_arg, ME, "fail to hex-decode DPP frame");
++
++    if(frameLen >= DPP_HDR_LEN) {
++        uint8_t dppActionType = frameBin[DPP_HDR_LEN - 1];
++        SAH_TRACEZ_INFO(ME, "tx DPP frame dppActionType(%u:%s) to fd(%d) (from 1905/EasyMesh process via ambiorix)",
++                        dppActionType, s_dppActionTypeToStr(dppActionType), s_dppCtx.clientFd);
++    }
++
++    uint32_t payloadLen = (uint32_t) (frameLen + 1);
++    uint8_t hdr[DPP_FRAME_HDR_LEN];
++    hdr[0] = (uint8_t) (payloadLen >> 24);
++    hdr[1] = (uint8_t) (payloadLen >> 16);
++    hdr[2] = (uint8_t) (payloadLen >> 8);
++    hdr[3] = (uint8_t) payloadLen;
++    hdr[4] = tcpType;
++
++    uint8_t sendBuf[DPP_FRAME_HDR_LEN + frameLen];
++    memcpy(sendBuf, hdr, DPP_FRAME_HDR_LEN);
++    memcpy(sendBuf + DPP_FRAME_HDR_LEN, frameBin, frameLen);
++
++    size_t sent = 0;
++    int eagainRetries = 0;
++    while(sent < sizeof(sendBuf)) {
++        ssize_t n = send(s_dppCtx.clientFd, sendBuf + sent, sizeof(sendBuf) - sent, 0);
++        if(n > 0) {
++            SAH_TRACEZ_INFO(ME, "sent %zd/%zu bytes to fd(%d)", n, sizeof(sendBuf), s_dppCtx.clientFd);
++            eagainRetries = 0;
++            sent += (size_t) n;
++        } else if((n < 0) && (errno == EINTR)) {
++            SAH_TRACEZ_INFO(ME, "send fd(%d) interrupted (EINTR), retrying", s_dppCtx.clientFd);
++            continue;
++        } else if((n < 0) && ((errno == EAGAIN) || (errno == EWOULDBLOCK))) {
++            eagainRetries++;
++            SAH_TRACEZ_INFO(ME, "send fd(%d) would block (EAGAIN), retry %d/%d",
++                            s_dppCtx.clientFd, eagainRetries, DPP_SEND_EAGAIN_MAX_RETRIES);
++            ASSERT_TRUE(eagainRetries <= DPP_SEND_EAGAIN_MAX_RETRIES, amxd_status_unknown_error,
++                        ME, "send fd(%d) still not writable after %d retries, dropping frame",
++                        s_dppCtx.clientFd, eagainRetries);
++            usleep(DPP_SEND_EAGAIN_RETRY_DELAY_US);
++        } else {
++            SAH_TRACEZ_ERROR(ME, "send err(%d:%s)", errno, strerror(errno));
++            return amxd_status_unknown_error;
++        }
++    }
++
++    SAH_TRACEZ_INFO(ME, "DPP frame fully sent to fd(%d) (%zu bytes)", s_dppCtx.clientFd, sent);
++    SAH_TRACEZ_OUT(ME);
++    return amxd_status_ok;
++}
