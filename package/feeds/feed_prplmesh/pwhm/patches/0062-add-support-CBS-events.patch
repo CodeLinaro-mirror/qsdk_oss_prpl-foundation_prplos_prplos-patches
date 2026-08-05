@@ -1,0 +1,168 @@
+From cbb0f15cba6309f8f7519729ed81230e8534eb46 Mon Sep 17 00:00:00 2001
+From: Atchaya R <ratchaya@qti.qualcomm.com>
+Date: Tue, 4 Aug 2026 20:24:57 +0530
+Subject: [PATCH] pwhm: add support for CBS events like CBS-STARTED,
+ CBS-ABORTED and CBS-COMPLETED events in PWHM.
+
+These events are notified to prplmesh via ambiorix framework
+
+Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
+---
+ include/wld/wld_wpaCtrl_events.h   |  6 +++
+ src/Plugin/wifiGen_eventHandlers.c | 69 ++++++++++++++++++++++++++++++
+ src/nl80211/wld_wpaCtrl_events.c   | 21 +++++++++
+ 3 files changed, 96 insertions(+)
+
+diff --git a/include/wld/wld_wpaCtrl_events.h b/include/wld/wld_wpaCtrl_events.h
+index 077bcdb..c17d0e1 100644
+--- a/include/wld/wld_wpaCtrl_events.h
++++ b/include/wld/wld_wpaCtrl_events.h
+@@ -232,6 +232,9 @@ typedef void (* wld_wpaCtrl_awgnInterferenceDetectedCb_f)(void* userData, char*
+ typedef void (* wld_wpaCtrl_acsCompletedCb_f)(void* userData, char* ifName, swl_chanspec_t* chanSpec, char* params);
+ typedef void (* wld_wpaCtrl_acsStartedCb_f)(void* userData, char* ifName, char* params);
+ typedef void (* wld_wpaCtrl_acsFailedCb_f)(void* userData, char* ifName, char* params);
++typedef void (* wld_wpaCtrl_cbsStartedCb_f)(void* userData, char* ifName, char* params);
++typedef void (* wld_wpaCtrl_cbsCompletedCb_f)(void* userData, char* ifName, char* params);
++typedef void (* wld_wpaCtrl_cbsAbortedCb_f)(void* userData, char* ifName, char* params);
+ typedef void (* wld_wpaCtrl_mainApSetupCompletedCb_f)(void* userData, char* ifName);
+ typedef void (* wld_wpaCtrl_mainApDisabledCb_f)(void* userData, char* ifName);
+ typedef void (* wld_wpaCtrl_syncOnReadyCb_f)(void* userData, char* ifName, bool state);
+@@ -265,6 +268,9 @@ typedef struct {
+     wld_wpaCtrl_acsCompletedCb_f fAcsCompletedCb;                        // ACS completed (DCS-triggered)
+     wld_wpaCtrl_acsStartedCb_f fAcsStartedCb;                            // ACS started
+     wld_wpaCtrl_acsFailedCb_f fAcsFailedCb;                              // ACS failed
++    wld_wpaCtrl_cbsStartedCb_f fCbsStartedCb;                            // CBS background scan started
++    wld_wpaCtrl_cbsCompletedCb_f fCbsCompletedCb;                        // CBS background scan completed
++    wld_wpaCtrl_cbsAbortedCb_f fCbsAbortedCb;                            // CBS background scan aborted
+     wld_wpaCtrl_mainApSetupCompletedCb_f fMainApSetupCompletedCb;
+     wld_wpaCtrl_mainApDisabledCb_f fMainApDisabledCb;
+ 
+diff --git a/src/Plugin/wifiGen_eventHandlers.c b/src/Plugin/wifiGen_eventHandlers.c
+index 1af1e22..79f9580 100644
+--- a/src/Plugin/wifiGen_eventHandlers.c
++++ b/src/Plugin/wifiGen_eventHandlers.c
+@@ -957,6 +957,72 @@ static void s_acsFailedCb(void* userData, char* ifName, char* params) {
+     amxc_var_clean(&eventData);
+ }
+ 
++static void s_cbsStartedCb(void* userData, char* ifName, char* params) {
++    /*
++     * CBS-STARTED event: hostapd has started CBS (Channel Background Scan).
++     * Notify prplmesh and other bus subscribers via AMX wpaCtrlEvents signal
++     * on the Radio object (same pattern as INTERFERENCE-DETECTED/AWGN).
++     */
++    SAH_TRACEZ_WARNING(ME, "%s: CBS started: %s", ifName, params ? params : "");
++    T_Radio* pRad = (T_Radio*) userData;
++    ASSERT_NOT_NULL(pRad, , ME, "NULL");
++
++    char msgData[256] = {0};
++    snprintf(msgData, sizeof(msgData), "CBS-STARTED %s", params ? params : "");
++    amxc_var_t eventData;
++    amxc_var_init(&eventData);
++    amxc_var_set_type(&eventData, AMXC_VAR_ID_HTABLE);
++    amxc_var_add_key(cstring_t, &eventData, "ifName", ifName);
++    amxc_var_add_key(cstring_t, &eventData, "eventData", msgData);
++    SAH_TRACEZ_WARNING(ME, "%s: notify wpaCtrlEvents CBS-STARTED eventData=%s", pRad->Name, msgData);
++    amxd_object_trigger_signal(pRad->pBus, "wpaCtrlEvents", &eventData);
++    amxc_var_clean(&eventData);
++}
++
++static void s_cbsCompletedCb(void* userData, char* ifName, char* params) {
++    /*
++     * CBS-COMPLETED event: hostapd has finished CBS (Channel Background Scan).
++     * Notify prplmesh and other bus subscribers via AMX wpaCtrlEvents signal
++     * on the Radio object (same pattern as INTERFERENCE-DETECTED/AWGN).
++     */
++    SAH_TRACEZ_WARNING(ME, "%s: CBS completed: %s", ifName, params ? params : "");
++    T_Radio* pRad = (T_Radio*) userData;
++    ASSERT_NOT_NULL(pRad, , ME, "NULL");
++
++    char msgData[256] = {0};
++    snprintf(msgData, sizeof(msgData), "CBS-COMPLETED %s", params ? params : "");
++    amxc_var_t eventData;
++    amxc_var_init(&eventData);
++    amxc_var_set_type(&eventData, AMXC_VAR_ID_HTABLE);
++    amxc_var_add_key(cstring_t, &eventData, "ifName", ifName);
++    amxc_var_add_key(cstring_t, &eventData, "eventData", msgData);
++    SAH_TRACEZ_WARNING(ME, "%s: notify wpaCtrlEvents CBS-COMPLETED eventData=%s", pRad->Name, msgData);
++    amxd_object_trigger_signal(pRad->pBus, "wpaCtrlEvents", &eventData);
++    amxc_var_clean(&eventData);
++}
++
++static void s_cbsAbortedCb(void* userData, char* ifName, char* params) {
++    /*
++     * CBS-ABORTED event: hostapd has aborted CBS (Channel Background Scan).
++     * Notify prplmesh and other bus subscribers via AMX wpaCtrlEvents signal
++     * on the Radio object (same pattern as INTERFERENCE-DETECTED/AWGN).
++     */
++    SAH_TRACEZ_WARNING(ME, "%s: CBS aborted: %s", ifName, params ? params : "");
++    T_Radio* pRad = (T_Radio*) userData;
++    ASSERT_NOT_NULL(pRad, , ME, "NULL");
++
++    char msgData[256] = {0};
++    snprintf(msgData, sizeof(msgData), "CBS-ABORTED %s", params ? params : "");
++    amxc_var_t eventData;
++    amxc_var_init(&eventData);
++    amxc_var_set_type(&eventData, AMXC_VAR_ID_HTABLE);
++    amxc_var_add_key(cstring_t, &eventData, "ifName", ifName);
++    amxc_var_add_key(cstring_t, &eventData, "eventData", msgData);
++    SAH_TRACEZ_WARNING(ME, "%s: notify wpaCtrlEvents CBS-ABORTED eventData=%s", pRad->Name, msgData);
++    amxd_object_trigger_signal(pRad->pBus, "wpaCtrlEvents", &eventData);
++    amxc_var_clean(&eventData);
++}
++
+ static void s_acsCompletedCb(void* userData, char* ifName _UNUSED, swl_chanspec_t* chanSpec, char* params) {
+     /*
+      * ACS-COMPLETED event: hostapd has finished automatic channel selection.
+@@ -1094,6 +1160,9 @@ static swl_rc_ne s_setWpaCtrlRadEvtHandlers(wld_wpaCtrlMngr_t* wpaCtrlMngr, T_Ra
+     SET_HDLR(wpaCtrlRadEvthandlers.fAcsCompletedCb, s_acsCompletedCb);
+     SET_HDLR(wpaCtrlRadEvthandlers.fAcsStartedCb, s_acsStartedCb);
+     SET_HDLR(wpaCtrlRadEvthandlers.fAcsFailedCb, s_acsFailedCb);
++    SET_HDLR(wpaCtrlRadEvthandlers.fCbsStartedCb, s_cbsStartedCb);
++    SET_HDLR(wpaCtrlRadEvthandlers.fCbsCompletedCb, s_cbsCompletedCb);
++    SET_HDLR(wpaCtrlRadEvthandlers.fCbsAbortedCb, s_cbsAbortedCb);
+     wld_wpaCtrlMngr_setEvtHandlers(wpaCtrlMngr, pRad, &wpaCtrlRadEvthandlers);
+     return SWL_RC_OK;
+ }
+diff --git a/src/nl80211/wld_wpaCtrl_events.c b/src/nl80211/wld_wpaCtrl_events.c
+index 9366d47..835282d 100644
+--- a/src/nl80211/wld_wpaCtrl_events.c
++++ b/src/nl80211/wld_wpaCtrl_events.c
+@@ -701,6 +701,24 @@ static void s_acsFailedEvt(wld_wpaCtrlInterface_t* pInterface, char* event _UNUS
+     CALL_MGR_I(pInterface, fAcsFailedCb, params);
+ }
+ 
++static void s_cbsStartedEvt(wld_wpaCtrlInterface_t* pInterface, char* event _UNUSED, char* params) {
++    // Example: CBS-STARTED
++    SAH_TRACEZ_INFO(ME, "%s: CBS started (%s)", pInterface->name, params ? params : "");
++    CALL_MGR_I(pInterface, fCbsStartedCb, params);
++}
++
++static void s_cbsCompletedEvt(wld_wpaCtrlInterface_t* pInterface, char* event _UNUSED, char* params) {
++    // Example: CBS-COMPLETED
++    SAH_TRACEZ_INFO(ME, "%s: CBS completed (%s)", pInterface->name, params ? params : "");
++    CALL_MGR_I(pInterface, fCbsCompletedCb, params);
++}
++
++static void s_cbsAbortedEvt(wld_wpaCtrlInterface_t* pInterface, char* event _UNUSED, char* params) {
++    // Example: CBS-ABORTED
++    SAH_TRACEZ_WARNING(ME, "%s: CBS aborted (%s)", pInterface->name, params ? params : "");
++    CALL_MGR_I(pInterface, fCbsAbortedCb, params);
++}
++
+ static void s_awgnInterferenceDetectedEvt(wld_wpaCtrlInterface_t* pInterface, char* event, char* params) {
+     // Example: INTERFERENCE-DETECTED type=AWGN freq=6135 chan_width=5 cf1=6105 cf2=0 bitmap=0x01
+     // Example: INTERFERENCE-DETECTED type=WLAN freq=5805 chan_width=3 cf1=5775 cf2=0 bitmap=0x00000000
+@@ -972,6 +990,9 @@ SWL_TABLE(sWpaCtrlEvents,
+ 	      {"DFS-UPLINK-CSA", &s_uplinkCsaEvtCb},
+ 	      {"DFS-UPLINK-CSA-TIMEOUT", &s_uplinkCsaTimeoutEvtCb},
+               {"INTERFERENCE-DETECTED", &s_awgnInterferenceDetectedEvt},
++              {"CBS-STARTED",           &s_cbsStartedEvt},
++              {"CBS-COMPLETED",         &s_cbsCompletedEvt},
++              {"CBS-ABORTED",           &s_cbsAbortedEvt},
+               ));
+ 
+ static evtParser_f s_getEventParser(char* eventName) {
+-- 
+2.34.1
+
