@@ -1,0 +1,107 @@
+From ab364526b2dea96c1abe89e1c72347be4b73ccd1 Mon Sep 17 00:00:00 2001
+From: Kartheek E <karte@qti.qualcomm.com>
+Date: Wed, 5 Aug 2026 15:47:55 +0530
+Subject: [PATCH 1/1] PWHM: Add Disable11bn configurable per-BSS
+
+Signed-off-by: Kartheek E <karte@qti.qualcomm.com>
+---
+ include/wld/wld.h                 |  1 +
+ odl/wld_accesspoint.odl           | 13 +++++++++++++
+ src/nl80211/wld_hostapd_cfgFile.c |  5 +++++
+ src/wld_accesspoint.c             | 21 +++++++++++++++++++++
+ 4 files changed, 40 insertions(+)
+
+diff --git a/include/wld/wld.h b/include/wld/wld.h
+index 3c995e1..957ae14 100644
+--- a/include/wld/wld.h
++++ b/include/wld/wld.h
+@@ -2058,6 +2058,7 @@ struct S_ACCESSPOINT {
+     int32_t savedMldUnit11be; /* Saved SSID.mldUnit before Disable11be=true; -1 means no saved value */
+     int32_t savedMldUnit11ax; /* Saved SSID.mldUnit before Disable11ax=true; -1 means no saved value */
+     bool disable11ax;  /* disable_11ax=1 in hostapd BSS config */
++    bool disable11bn;  /* disable_11bn=1 in hostapd BSS config */
+     bool qbssEnable;                /* QBSS Load feature enable flag */
+     uint32_t bssLoadUpdatePeriod;   /* BSS Load Update Period in TUs (only used when qbssEnable=true) */
+     uint32_t chanUtilAvgPeriod;     /* Channel Utilization Averaging Period in TUs (only used when qbssEnable=true) */
+diff --git a/odl/wld_accesspoint.odl b/odl/wld_accesspoint.odl
+index b3d4eab..edc1e16 100644
+--- a/odl/wld_accesspoint.odl
++++ b/odl/wld_accesspoint.odl
+@@ -407,6 +407,19 @@ define rrm_t{
+ 			default -2;
+ 		}
+ 
++		/**
++		 * Disable IEEE 802.11bn (Wi-Fi 8 / UHR) for this BSS.
++		 * Writes disable_11bn=1 to the hostapd BSS configuration,
++		 * downgrading the BSS from UHR (802.11bn) to EHT (802.11be)
++		 * without removing it from the MLD group.
++		 * NOTE: Only effective on radios where OperatingStandards includes
++		 * 'bn'. Silently ignored on other radios.
++		 * Default is false (802.11bn enabled per radio capability).
++		 */
++		%persistent bool Disable11bn {
++			default false;
++		}
++
+ 		/**
+ 		 * Add MBO Assoc Disallow Reason in the MBO IE
+ 		 * Possible options are : "Off", "Unspecified", "MaxAssocSTA",
+diff --git a/src/nl80211/wld_hostapd_cfgFile.c b/src/nl80211/wld_hostapd_cfgFile.c
+index a2ee252..3b35f64 100644
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -1246,6 +1246,11 @@ static bool s_setVapCommonConfig(T_AccessPoint* pAP, swl_mapChar_t* vapConfigMap
+         SAH_TRACEZ_INFO(ME, "%s: disable_11ax=1 (downgrade to 11ac/11n)", pAP->alias);
+         swl_mapChar_addOrSet(vapConfigMap, "disable_11ax", "1");
+     }
++    bool enableRad11bn = wld_rad_checkEnabledRadStd(pRad, SWL_RADSTD_BN);
++    if(pAP->disable11bn && enableRad11bn) {
++        SAH_TRACEZ_INFO(ME, "%s: disable_11bn=1 (downgrade to 11be/EHT)", pAP->alias);
++        swl_mapChar_addOrSet(vapConfigMap, "disable_11bn", "1");
++    }
+     if(enableRad11be && wld_rad_isMloCapable(pRad)) {
+         if(wld_mld_isLinkUsable(pSSID->pMldLink)) {
+             wld_mld_t* pMld = pSSID->pMldLink->pMld;
+diff --git a/src/wld_accesspoint.c b/src/wld_accesspoint.c
+index ae95055..3e83525 100644
+--- a/src/wld_accesspoint.c
++++ b/src/wld_accesspoint.c
+@@ -1712,6 +1712,26 @@ static void s_setDisable11ax_pwf(void* priv _UNUSED, amxd_object_t* object,
+     SAH_TRACEZ_OUT(ME);
+ }
+ 
++/* Disable11bn: downgrade UHR (802.11bn) to EHT (802.11be) per-BSS without
++ * removing the BSS from its MLD group. Writes disable_11bn=1 to hostapd config
++ * when the radio supports BN (OperatingStandards includes 'bn'). */
++static void s_setDisable11bn_pwf(void* priv _UNUSED, amxd_object_t* object,
++                                  amxd_param_t* param _UNUSED,
++                                  const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_AccessPoint* pAP = wld_ap_fromObj(object);
++    ASSERT_NOT_NULL(pAP, , ME, "INVALID");
++
++    bool disable = amxc_var_dyncast(bool, newValue);
++    pAP->disable11bn = disable;
++
++    SAH_TRACEZ_INFO(ME, "%s: Disable11bn=%d - triggering sync", pAP->alias, disable);
++    wld_ap_doSync(pAP);
++
++    SAH_TRACEZ_OUT(ME);
++}
++
+ static void s_setMultiAPType_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
+     SAH_TRACEZ_IN(ME);
+ 
+@@ -4239,6 +4259,7 @@ SWLA_DM_HDLRS(sApDmHdlrs,
+                   SWLA_DM_PARAM_HDLR("LegacyMode", s_setLegacyMode_pwf),
+                   SWLA_DM_PARAM_HDLR("Disable11be", s_setDisable11be_pwf),
+                   SWLA_DM_PARAM_HDLR("Disable11ax", s_setDisable11ax_pwf),
++                  SWLA_DM_PARAM_HDLR("Disable11bn", s_setDisable11bn_pwf),
+                   SWLA_DM_PARAM_HDLR("HtMcsNssSet",  s_setHtMcsNssSet_pwf),
+                   SWLA_DM_PARAM_HDLR("VhtMcsNssSet", s_setVhtMcsNssSet_pwf),
+                   SWLA_DM_PARAM_HDLR("MBOAssocDisallowReason", s_setMBOAssocDisallowReason_pwf),
+-- 
+2.43.0
+
