@@ -1,0 +1,66 @@
+From: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+Date: Fri, 07 Aug 2026
+Subject: [PATCH] pwhm: fix MLO bSTA EndPoint ConnectionStatus not updated on connect
+
+Signed-off-by: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+---
+ src/Plugin/wifiGen_eventHandlers.c | 9 +++++++--
+ src/Plugin/wifiGen_fsm.c          | 14 +++++++++++++-
+ 2 files changed, 20 insertions(+), 3 deletions(-)
+
+--- a/src/Plugin/wifiGen_eventHandlers.c
++++ b/src/Plugin/wifiGen_eventHandlers.c
+@@ -2176,6 +2176,14 @@
+     ASSERT_NOT_NULL(ifName, , ME, "NULL");
+
+     /*
++     * Save the wpaCtrlInterface of the EP that owns the wpa_supplicant
++     * socket before pEP may be reassigned to the MLD main-link EP below.
++     * fSyncOnEpConnected is registered on this interface's manager, not on
++     * the main-link EP's interface manager.
++     */
++    wld_wpaCtrlInterface_t* pOrigWpaCtrlIface = pEP->wpaCtrlInterface;
++
++    /*
+      * this event's wpactrl interface itself just reported a successful connection:
+      * clear its own reconnect retry state now, before pEP may get reassigned to
+      * the MLD main link below. Otherwise a secondary link that never gets
+@@ -2233,7 +2241,7 @@
+     // update radio datamodel
+     wld_rad_updateState(pRad, false);
+
+-    CALL_MGR_I_EXT(pEP->wpaCtrlInterface, fSyncOnEpConnected, true);
++    CALL_MGR_I_EXT(pOrigWpaCtrlIface, fSyncOnEpConnected, true);
+
+     /*
+      * delay refreshing current radio chanspec,
+--- a/src/Plugin/wifiGen_fsm.c
++++ b/src/Plugin/wifiGen_fsm.c
+@@ -1722,6 +1722,18 @@
+
+     s_updateEpMld(pEP, epIfInfo);
+
++    /*
++     * s_updateEpMld() resolved pEP's MLO link ID from nl80211 iface info.
++     * If pEP is a valid MLD link (link ID set) and its stack is enabled,
++     * it is itself an active secondary link and must also be set to Connected.
++     * The neighbor loop below only processes *other* links (it skips
++     * pSSID == pNgSSID), so without this call pEP stays in Discovering/Idle.
++     */
++    if(wld_ssid_hasValidMLDLinkID(pSSID) && wld_endpoint_hasStackEnabled(pEP) &&
++       (pEP->connectionStatus != EPCS_CONNECTED)) {
++        wld_endpoint_setConnectionStatus(pEP, EPCS_CONNECTED, EPE_NONE);
++    }
++
+     wld_mldLink_t* pLink = pSSID->pMldLink;
+     wld_for_eachNeighMldLink_safe(pNgLink, pLink) {
+         T_SSID* pNgSSID = wld_mld_getLinkSsid(pNgLink);
+@@ -1734,7 +1746,7 @@
+         }
+         s_updateEpMld(pNgEp, epIfInfo);
+         // update bstamld secondary links connStatus
+-        if(wld_ssid_hasValidMLDLinkID(pNgSSID)) {
++        if(wld_ssid_hasValidMLDLinkID(pNgSSID) && wld_endpoint_hasStackEnabled(pNgEp)) {
+             if(pEP->connectionStatus == EPCS_CONNECTED) {
+                 swl_str_copy(pNgSSID->SSID, sizeof(pNgSSID->SSID), pSSID->SSID);
+             }
