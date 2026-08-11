@@ -75,6 +75,54 @@ Bank_health_check_ipq54xx() {
 	fi
 }
 
+# bank_boot_done() - post-boot handler for ipq52xx and ipq96xx.
+bank_boot_done() {
+	if [ -f /sys/class/registers/bootcount ]; then
+		echo 0 > /sys/class/registers/bootcount
+	fi
+
+	local partlabel booted_bank
+	partlabel=$(cat /proc/cmdline 2>/dev/null | grep -o 'PARTLABEL=[^ ]*' | cut -d= -f2)
+	case "$partlabel" in
+		rootfs-inactive) booted_bank="inactive" ;;
+		*)               booted_bank="active" ;;
+	esac
+	echo " Booted bank: $booted_bank" > /dev/console
+
+	local PON_DP is_pon_rdp=0
+	PON_DP=$(ls /proc/device-tree/soc@0 2>/dev/null | grep '^dp[0-9][0-9]*$' | sort -V | tail -n 1)
+	[ -n "$PON_DP" ] && ls -la /proc/device-tree/soc@0/${PON_DP} 2>/dev/null | grep -q gem_port && is_pon_rdp=1
+
+	case "$partlabel" in
+		rootfs-active)
+			if [ "$is_pon_rdp" -eq 1 ]; then
+				set_env_vars 1 0
+				eval $(fw_printenv sw_commit 2>/dev/null)
+				if [ "$sw_commit" = "1" ]; then
+					fw_setenv bootfrom 1 2>/dev/null
+				else
+					fw_setenv bootfrom 0 2>/dev/null
+				fi
+			else
+				fw_setenv bootfrom 0 2>/dev/null
+			fi
+			;;
+		rootfs-inactive)
+			if [ "$is_pon_rdp" -eq 1 ]; then
+				set_env_vars 0 1
+				eval $(fw_printenv sw_commit 2>/dev/null)
+				if [ "$sw_commit" = "1" ]; then
+					fw_setenv bootfrom 1 2>/dev/null
+				else
+					fw_setenv bootfrom 0 2>/dev/null
+				fi
+			else
+				fw_setenv bootfrom 1 2>/dev/null
+			fi
+			;;
+	esac
+}
+
 start() {
 	local trymode_inprogress="/proc/upgrade_info/trymode_inprogress"
 	local board=$(board_name)
@@ -144,6 +192,10 @@ start() {
 
 			Bank_health_check_ipq54xx
 			return 1;
+			;;
+		*ipq52*|*ipq96*)
+			# ipq52xx and ipq96xx use the booted bank info from device tree.
+			bank_boot_done
 			;;
 		*)
 			if [[ "$board" == *"ipq5424"* ]]; then
