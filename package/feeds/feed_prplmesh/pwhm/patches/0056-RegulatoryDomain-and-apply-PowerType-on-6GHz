@@ -42,7 +42,7 @@ Signed-off-by: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
               */
              SAH_TRACEZ_INFO(ME, "%s: Adding 6GHz regulatory power type to %d", pRad->Name, pRad->PowerType);
              swl_mapCharFmt_addValInt32(radConfigMap, "he_6ghz_reg_pwr_type", pRad->PowerType);
-+            swl_mapCharFmt_addValInt32(radConfigMap, "enable_best_power_mode", 0);
++
          }
      }
      if(SWL_BIT_IS_SET(pRad->supportedStandards, SWL_RADSTD_BE)) {
