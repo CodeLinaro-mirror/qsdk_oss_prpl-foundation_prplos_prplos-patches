@@ -1,0 +1,42 @@
+From: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+Date: Mon, 11 Aug 2026
+Subject: [PATCH] pwhm: fix MLD bSTA deauth triggered by neighbor EP reconfig
+
+When an MLD endpoint is actively connected, s_updateEpMldLink() was
+scheduling deferred reconfigures (commitNow=false) on all neighbor
+links unconditionally. This caused wpa_supplicant to receive a
+RECONFIGURE command on a live session, which the kernel interpreted
+as a local interface state change and responded with
+DEAUTH_LEAVING (Reason 3), tearing down the active MLD connection.
+
+Guard the deferred path: if the EP is already CONNECTED and commitNow
+is false (no primary-link change forcing a teardown), skip the
+reconfigure. The MLD unit config will be re-evaluated naturally during
+the next reconnect cycle, so no state is lost.
+
+The commitNow=true path (triggered when the primary link actually
+changes) is left unconditional, as that teardown is intentional.
+
+Signed-off-by: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+---
+ src/Plugin/wifiGen_mld.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+--- a/src/Plugin/wifiGen_mld.c
++++ b/src/Plugin/wifiGen_mld.c
+@@ -339,6 +339,15 @@
+     ASSERTS_NOT_NULL(pSSID, , ME, "NULL");
+     T_EndPoint* pEP = pSSID->ENDP_HOOK;
+     ASSERTS_NOT_NULL(pEP, , ME, "NULL");
++    /* Skip deferred MLD reconfigures while EP is actively connected to avoid
++     * triggering DEAUTH_LEAVING (Reason 3) via a wpa_supplicant RECONFIGURE
++     * on a live session. commitNow=true is only set when the primary link
++     * actually changes, which is an intentional teardown and must proceed
++     * even when connected. */
++    if(!commitNow && (pEP->connectionStatus == EPCS_CONNECTED)) {
++        SAH_TRACEZ_WARNING(ME, "skip reconfigure EP %s: EP is connected", pEP->alias);
++        return;
++    }
+     SAH_TRACEZ_WARNING(ME, "reconfigure EP %s (commitNow:%u)", pEP->alias, commitNow);
+     pEP->pFA->mfn_wendpoint_setMldUnit(pEP);
+     int ret = -1;
