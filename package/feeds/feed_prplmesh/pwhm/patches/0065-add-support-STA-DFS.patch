@@ -1,0 +1,748 @@
+From 3479d3e74a545077bdffeaf8c9658036d2d11fd3 Mon Sep 17 00:00:00 2001
+From: Atchaya R <ratchaya@qti.qualcomm.com>
+Date: Wed, 12 Aug 2026 14:57:27 +0530
+Subject: [PATCH] pwhm: add support for STA-DFS feature in PWHM
+
+Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
+---
+ include/wld/wld_accesspoint.h       |  7 +++
+ include/wld/wld_chanmgt.h           |  7 +++
+ include/wld/wld_channel.h           |  4 ++
+ include/wld/wld_endpoint.h          |  8 +++
+ include/wld/wld_nl80211_api.h       | 12 +++++
+ include/wld/wld_rad_nl80211.h       | 12 +++++
+ include/wld/wld_radio.h             |  9 ++++
+ odl/wld_accesspoint.odl             | 17 +++++++
+ odl/wld_endpoint.odl                | 11 ++---
+ odl/wld_radio.odl                   | 38 +++++++++++---
+ src/ChannelManagement/wld_chanmgt.c | 44 +++++++++++++++++
+ src/ChannelManagement/wld_channel.c | 37 +++++++++++++-
+ src/Plugin/wifiGen_eventHandlers.c  | 33 ++++++++++++-
+ src/Plugin/wifiGen_rad.c            |  4 ++
+ src/Plugin/wifiGen_wpaSupp.c        |  4 ++
+ src/nl80211/wld_hostapd_cfgFile.c   |  4 ++
+ src/nl80211/wld_nl80211_api.c       |  9 ++++
+ src/nl80211/wld_rad_nl80211.c       |  5 ++
+ src/wld_accesspoint.c               | 36 ++++++++++++++
+ src/wld_endpoint.c                  | 77 +++++++++++++++++++++++++++++
+ src/wld_radio.c                     | 57 +++++++++++++++++++++
+ 21 files changed, 418 insertions(+), 17 deletions(-)
+
+--- a/include/wld/wld_accesspoint.h
++++ b/include/wld/wld_accesspoint.h
+@@ -216,4 +216,11 @@ bool wld_ap_isEnabledWithRef(T_AccessPoi
+ bool wld_ap_hasStackEnabled(T_AccessPoint* pAP);
+ swl_rc_ne wld_ap_applyEnable(T_AccessPoint* pAP, bool combEnable, bool enable);
+ 
++amxd_status_t wld_ap_setDisassocLowAck_pwf(amxd_object_t* object,
++                                            amxd_param_t* param,
++                                            amxd_action_t reason,
++                                            const amxc_var_t* const args,
++                                            amxc_var_t* const retval,
++                                            void* priv);
++
+ #endif /* __WLD_ACCESSPOINT_H__ */
+--- a/include/wld/wld_chanmgt.h
++++ b/include/wld/wld_chanmgt.h
+@@ -90,6 +90,13 @@ void wld_chanmgt_cleanup(T_Radio* pRad);
+  */
+ void wld_chanmgt_writeDfsChannels(T_Radio* pRad);
+ 
++/**
++ * Restore NOL history from the persistent DM NolHistory parameter into the
++ * internal channel data structure.  Call after wld_channel_init_channels()
++ * and s_readChanInfo() so that WLD_CHAN_RADAR_REQUIRED is already set.
++ */
++void wld_chanmgt_loadNolHistory(T_Radio* pRad);
++
+ swl_rc_ne wld_chanmgt_reportCurrentChanspec(T_Radio* pR, swl_chanspec_t chanspec, wld_channelChangeReason_e reason);
+ swl_rc_ne wld_chanmgt_setTargetChanspec(T_Radio* pR, swl_chanspec_t chanspec, bool direct, wld_channelChangeReason_e reason, const char* reasonExt);
+ 
+--- a/include/wld/wld_channel.h
++++ b/include/wld/wld_channel.h
+@@ -133,6 +133,10 @@ void wld_channel_clear_passive_band(swl_
+ void wld_channel_mark_radar_detected_band(swl_chanspec_t chanspec);
+ void wld_channel_clear_radar_detected_band(swl_chanspec_t chanspec);
+ 
++/* NOL history: channels that have ever had radar detected (persists across reboots) */
++void wld_channel_mark_nol_history_channel(swl_chanspec_t chanspec);
++size_t wld_channel_get_nol_history_channels(T_Radio* pRad, swl_channel_t* list, size_t list_size);
++
+ void wld_channel_do_for_each_channel(T_Radio* rad, void* data, void (* channel_function)(T_Radio* rad, void* data, int channel));
+ 
+ //Debug
+--- a/include/wld/wld_endpoint.h
++++ b/include/wld/wld_endpoint.h
+@@ -193,4 +193,12 @@ bool wld_endpoint_needCreateIface(T_EndP
+  */
+ bool wld_endpoint_needDestroyIface(T_EndPoint* pEP);
+ 
++/* AMX action write handler for EndPoint.STADfsEnable */
++amxd_status_t wld_ep_setSTADfsEnable_pwf(amxd_object_t* object,
++                                          amxd_param_t* param,
++                                          amxd_action_t reason,
++                                          const amxc_var_t* const args,
++                                          amxc_var_t* const retval,
++                                          void* priv);
++
+ #endif /* __WLD_ENDPOINT_H__ */
+--- a/include/wld/wld_nl80211_api.h
++++ b/include/wld/wld_nl80211_api.h
+@@ -443,6 +443,18 @@ swl_rc_ne wld_nl80211_getSurveyInfoExt(w
+ swl_rc_ne wld_nl80211_setWiphyAntennas(wld_nl80211_state_t* state, uint32_t ifIndex, uint32_t txMapAnt, uint32_t rxMapAnt);
+ 
+ /*
++ * @brief Set the sta_dfs_en attribute on a wiphy device via NL80211_CMD_SET_WIPHY.
++ *
++ * @param state  nl80211 shared state
++ * @param ifIndex interface index of any interface on the wiphy
++ * @param enable  true to enable STA DFS, false to disable
++ *
++ * @return SWL_RC_OK on success
++ *         <= SWL_RC_ERROR otherwise
++ */
++swl_rc_ne wld_nl80211_setWiphyStaDfsEn(wld_nl80211_state_t* state, uint32_t ifIndex, bool enable);
++
++/*
+  * @brief configure automatic transmit power level
+  * (Synchronous api)
+  *
+--- a/include/wld/wld_rad_nl80211.h
++++ b/include/wld/wld_rad_nl80211.h
+@@ -298,6 +298,18 @@ swl_rc_ne wld_rad_nl80211_getAirstats(T_
+ swl_rc_ne wld_rad_nl80211_setAntennas(T_Radio* pRadio, uint32_t txMapAnt, uint32_t rxMapAnt);
+ 
+ /*
++ * @brief Set the sta_dfs_en attribute on the wiphy device associated with pRadio.
++ * Sends NL80211_CMD_SET_WIPHY with NL80211_ATTR_STA_DFS_EN.
++ *
++ * @param pRadio pointer to radio context
++ * @param enable true to enable STA DFS, false to disable
++ *
++ * @return SWL_RC_OK in case of success
++ *         <= SWL_RC_ERROR otherwise
++ */
++swl_rc_ne wld_rad_nl80211_setStaDfsEn(T_Radio* pRadio, bool enable);
++
++/*
+  * @brief configure auto transmit power level
+  *
+  * @param pRadio pointer to radio context
+--- a/include/wld/wld_radio.h
++++ b/include/wld/wld_radio.h
+@@ -442,4 +442,13 @@ swl_rc_ne wld_rad_unregisterExtModData(T
+ 
+ amxd_object_t* wld_rad_getObject(T_Radio* pRad);
+ bool wld_rad_firstCommitFinished(T_Radio* pRad);
++
++/* AMX action write handler for Radio.CSwOpts */
++amxd_status_t wld_radio_setCSwOpts_pwf(amxd_object_t* object,
++                                        amxd_param_t* param,
++                                        amxd_action_t reason,
++                                        const amxc_var_t* const args,
++                                        amxc_var_t* const retval,
++                                        void* priv);
++
+ #endif /* __WLD_RADIO_H__ */
+--- a/odl/wld_accesspoint.odl
++++ b/odl/wld_accesspoint.odl
+@@ -3026,6 +3026,23 @@ define rrm_t{
+                     }
+                 }
+ 
++		/**
++		 * Disassociate stations with massive packet loss.
++		 *
++		 * When enabled (true), hostapd monitors the ACK rate for each associated
++		 * station and disassociates stations that fail to acknowledge a large
++		 * fraction of transmitted frames (reason code 34 = DISASSOC_LOW_ACK).
++		 *
++		 * Written to hostapd.conf as: disassoc_low_ack=<0|1>
++		 * Applied at runtime via: SET disassoc_low_ack <0|1>
++		 *
++		 * Default: false (disabled, matching hostapd default).
++		 */
++		%persistent bool DisassocLowAck {
++			on action write call wld_ap_setDisassocLowAck_pwf;
++			default false;
++		}
++
+ 	} /* object AccessPoint */
+     }
+ }
+--- a/odl/wld_endpoint.odl
++++ b/odl/wld_endpoint.odl
+@@ -867,8 +867,7 @@
+ 		/**
+ 		 * Enable or disable STA DFS (Station Dynamic Frequency Selection).
+ 		 *
+-		 * When true (default), wpa_supplicant uses the driver's sta_dfs_en
+-		 * capability (reported via NL80211_ATTR_STA_DFS_EN) to:
++		 * When true, wpa_supplicant uses the driver's sta_dfs_en capability to:
+ 		 *   - Track NOL (Non-Occupancy List) history for DFS channels
+ 		 *   - Perform pre-association CAC when connecting to a channel in NOL history
+ 		 *   - Send RCSA to the uplink AP on radar detection (requires
+@@ -877,12 +876,12 @@
+ 		 * When false, cswopts=0 is written to wpa_supplicant.conf, disabling
+ 		 * all channel-switch options regardless of the Radio.CSwOpts setting.
+ 		 *
+-		 * Note: The underlying sta_dfs_en capability is reported by the kernel
+-		 * driver (QCA NL80211_ATTR_STA_DFS_EN). This parameter controls whether
+-		 * PWHM enables the STA DFS feature by writing the cswopts config key.
++		 * Runtime write handler: applies cswopts immediately via wpa_ctrl
++		 * (SET cswopts <value>) and sets sta_dfs_en in the kernel driver.
+ 		 */
+ 		%persistent bool STADfsEnable {
+-			default true;
++			on action write call wld_ep_setSTADfsEnable_pwf;
++			default false;
+ 		}
+ 
+ 		/** When this is toggled, we must check for updating the full
+--- a/odl/wld_radio.odl
++++ b/odl/wld_radio.odl
+@@ -1255,8 +1255,14 @@ define probelist_t{
+ 		 * Default 0 = all options disabled.
+ 		 * Maximum valid value is 0x7F (all 7 bits set).
+ 		 */
++		/**
++		 * Runtime write handler: applies CSwOpts immediately via wpa_ctrl
++		 * (SET CSwOpts <value> to hostapd, SET cswopts <value> to wpa_supplicant)
++		 * in addition to updating the config file for the next restart.
++		 */
+ 		%persistent uint32 CSwOpts {
+ 			on action validate call check_maximum 127;
++			on action write call wld_radio_setCSwOpts_pwf;
+ 			default 0;
+ 		}
+ 
+@@ -2822,6 +2828,22 @@ define probelist_t{
+ 				default "";
+ 			}
+ 
++			/**
++			 * Persistent NOL (Non-Occupancy List) history.
++			 * Comma-separated list of DFS channels on which radar has ever been
++			 * detected.  Unlike RadarTriggeredDfsChannels (which is cleared when
++			 * the 30-minute NOP expires), NolHistory accumulates all radar-hit
++			 * channels and survives reboots.
++			 *
++			 * Used by the STA-DFS logic to decide whether a CAC is required
++			 * before associating to a Root AP on a channel that was previously
++			 * in the NOL (test cases: "STA performs CAC if Channel is in NOL
++			 * history when reload is done" / "when station connects to different AP").
++			 */
++			%persistent string NolHistory{
++				default "";
++			}
++
+ 			/**
+ 			 * Detailed radio status. This radio state will show the current operating mode of the radio.
+ 			 * Options are:
+--- a/src/ChannelManagement/wld_chanmgt.c
++++ b/src/ChannelManagement/wld_chanmgt.c
+@@ -119,6 +119,15 @@ static void s_writeRadarChannels(T_Radio
+     }
+ }
+ 
++static void s_saveNolHistory(T_Radio* pRad, amxd_trans_t* pTrans) {
++    swl_channel_t nolHistList[WLD_MAX_POSSIBLE_CHANNELS];
++    memset(nolHistList, 0, sizeof(nolHistList));
++    size_t nr = wld_channel_get_nol_history_channels(pRad, nolHistList, WLD_MAX_POSSIBLE_CHANNELS);
++    char buf[256] = {0};
++    swl_conv_uint8ArrayToChar(buf, sizeof(buf), nolHistList, nr);
++    amxd_trans_set_value(cstring_t, pTrans, "NolHistory", buf);
++}
++
+ static void s_saveDfsChanInfo(T_Radio* pRad) {
+     ASSERT_NOT_NULL(pRad, , ME, "NULL");
+     ASSERTI_TRUE(pRad->hasDmReady, , ME, "%s: radio dm obj not ready for updates", pRad->Name);
+@@ -128,6 +137,7 @@ static void s_saveDfsChanInfo(T_Radio* p
+     ASSERT_TRANSACTION_INIT(chanObject, &trans, , ME, "%s : trans init failure", pRad->Name);
+     s_saveClearedChannels(pRad, &trans);
+     s_saveRadarChannels(pRad, &trans);
++    s_saveNolHistory(pRad, &trans);
+     ASSERT_TRANSACTION_LOCAL_DM_END(&trans, , ME, "%s : trans apply failure", pRad->Name);
+ }
+ 
+@@ -137,6 +147,40 @@ void wld_chanmgt_writeDfsChannels(T_Radi
+     s_saveDfsChanInfo(pRad);
+ }
+ 
++/**
++ * Load NOL history from the persistent DM parameter and mark the channels
++ * in the internal channel data structure.  Must be called AFTER
++ * wld_channel_init_channels() + s_readChanInfo() so that WLD_CHAN_RADAR_REQUIRED
++ * is already set on DFS channels (required by chandata_add_flag guard).
++ */
++void wld_chanmgt_loadNolHistory(T_Radio* pRad) {
++    ASSERTI_NOT_NULL(pRad, , ME, "Radio null");
++    ASSERTI_NOT_NULL(pRad->pBus, , ME, "Radio pBus null");
++    amxd_object_t* chanObject = amxd_object_findf(pRad->pBus, "ChannelMgt");
++    ASSERTI_NOT_NULL(chanObject, , ME, "ChannelMgt null");
++    const amxc_var_t* nolHistVar = amxd_object_get_param_value(chanObject, "NolHistory");
++    if(!nolHistVar) {
++        return;
++    }
++    const char* nolHistStr = amxc_var_constcast(cstring_t, nolHistVar);
++    if(!nolHistStr || !nolHistStr[0]) {
++        return;
++    }
++    /* Parse comma-separated channel list and mark each channel in NOL history */
++    char buf[256] = {0};
++    swl_str_copy(buf, sizeof(buf), nolHistStr);
++    char* token = strtok(buf, ",");
++    while(token) {
++        int chan = atoi(token);
++        if(chan > 0) {
++            swl_chanspec_t chanSpec = SWL_CHANSPEC_NEW(chan, SWL_BW_20MHZ, pRad->operatingFrequencyBand);
++            wld_channel_mark_nol_history_channel(chanSpec);
++        }
++        token = strtok(NULL, ",");
++    }
++    SAH_TRACEZ_INFO(ME, "%s: restored NOL history: %s", pRad->Name, nolHistStr);
++}
++
+ static void s_sendNotification(wld_rad_chanChange_t* change) {
+     ASSERTS_NOT_NULL(change, , ME, "NULL");
+     T_Radio* pRad = change->pRad;
+--- a/src/ChannelManagement/wld_channel.c
++++ b/src/ChannelManagement/wld_channel.c
+@@ -115,6 +115,12 @@
+  * Flag indicating that a radar is detected on this channel, and thus currently unusable.
+  */
+ #define WLD_CHAN_RADAR_DETECTED 0x08
++/**
++ * Flag indicating this channel has ever had radar detected on it (NOL history).
++ * Unlike WLD_CHAN_RADAR_DETECTED, this flag is never cleared by NOP expiry.
++ * It is persisted via the NolHistory DM parameter and restored on startup.
++ */
++#define WLD_CHAN_NOL_HISTORY 0x10
+ 
+ 
+ typedef struct {
+@@ -231,9 +237,10 @@ static inline bool chandata_has_flag(wld
+ }
+ 
+ static inline void chandata_add_flag(wld_channel_data* data, uint32_t flag) {
+-    /* Do not mark CAC needed or RADAR detected flags on non-DFS channels */
++    /* Do not mark DFS-only flags on non-DFS channels */
+     if((!chandata_has_flag(data, WLD_CHAN_RADAR_REQUIRED)) &&
+-       ((flag == WLD_CHAN_PASSIVE) || (flag == WLD_CHAN_RADAR_DETECTED))) {
++       ((flag == WLD_CHAN_PASSIVE) || (flag == WLD_CHAN_RADAR_DETECTED) ||
++        (flag == WLD_CHAN_NOL_HISTORY))) {
+         return;
+     }
+     data->flags = data->flags | flag;
+@@ -517,6 +524,32 @@ void wld_channel_clear_radar_detected_ba
+ }
+ 
+ /**
++ * Mark a single channel as NOL history (radar was ever detected here).
++ * Only effective on DFS channels (WLD_CHAN_RADAR_REQUIRED must be set).
++ */
++void wld_channel_mark_nol_history_channel(swl_chanspec_t chanspec) {
++    chan_add_flag(chanspec.channel, chanspec.band, WLD_CHAN_NOL_HISTORY);
++}
++
++/**
++ * Get all channels that have NOL history (radar ever detected).
++ * Returns the number of channels written to list[].
++ */
++size_t wld_channel_get_nol_history_channels(T_Radio* pRad, swl_channel_t* list, size_t list_size) {
++    wld_band_data* band = get_band(pRad->operatingFrequencyBand);
++    ASSERTS_NOT_NULL(band, 0, ME, "null freqband");
++    size_t nr = 0;
++    for(size_t i = 0; (i < band->nr_channels) && (nr < list_size); i++) {
++        ASSERTS_NOT_NULL(band->channels, 0, ME, "null channel list");
++        wld_channel_data* ch = &(band->channels[i]);
++        if(chandata_has_flag(ch, WLD_CHAN_NOL_HISTORY)) {
++            list[nr++] = ch->channel;
++        }
++    }
++    return nr;
++}
++
++/**
+  * Returns whether the channel is usable
+  */
+ bool wld_channel_is_usable(swl_chanspec_t chanspec) {
+--- a/src/Plugin/wifiGen_eventHandlers.c
++++ b/src/Plugin/wifiGen_eventHandlers.c
+@@ -147,6 +147,9 @@ static void s_notifyWpaCtrlEvent(amxd_ob
+     }
+ }
+ 
++/* Forward declaration — defined later in this file */
++static void s_dfsRadarDetectedCb(void* userData, char* ifName, swl_chanspec_t* chanSpec);
++
+ static void s_wpaCtrlIfaceStdEvt(void* userData, char* ifName, char* eventName, char* msgData) {
+     ASSERT_NOT_NULL(ifName, , ME, "NULL");
+     ASSERT_NOT_NULL(eventName, , ME, "NULL");
+@@ -159,6 +162,18 @@ static void s_wpaCtrlIfaceStdEvt(void* u
+         object = pAP->pBus;
+     } else if(debugIsEpPointer(pEP)) {
+         object = pEP->pBus;
++        /* Forward DFS-RADAR-DETECTED to the AP-side handler so RadarTriggeredDfsChannels
++         * is updated even when radar is detected on the STA side.
++         * Parse both freq and chan_width so the bandwidth is set correctly — without it
++         * wld_channel_mark_radar_detected_band cannot determine which 20MHz sub-channels
++         * to mark as radar-detected. */
++        if(swl_str_matches(eventName, "DFS-RADAR-DETECTED") && pEP->pRadio) {
++            swl_chanspec_t chanSpec = SWL_CHANSPEC_EMPTY;
++            if(swl_rc_isOk(wld_wpaCtrl_freqParamToChanSpec(msgData, "freq", &chanSpec))) {
++                wld_wpaCtrl_chWidthIdToChanSpec(msgData, "chan_width", &chanSpec);
++                s_dfsRadarDetectedCb(pEP->pRadio, ifName, &chanSpec);
++            }
++        }
+     }
+ 
+     ASSERTS_NOT_NULL(object, , ME, "NULL");
+@@ -718,7 +733,9 @@ static void s_dfsRadarDetectedCb(void* u
+             if(chanSpec->punctBitmap & (1u << i)) {
+                 swl_chanspec_t subChanSpec = SWL_CHANSPEC_NEW(chanList[i], SWL_BW_20MHZ, chanSpec->band);
+                 wld_channel_mark_radar_detected_channel(subChanSpec);
+-                SAH_TRACEZ_INFO(ME, "%s: radar_bitmap: marking sub-channel %d as radar-detected",
++                /* Also record in persistent NOL history */
++                wld_channel_mark_nol_history_channel(subChanSpec);
++                SAH_TRACEZ_INFO(ME, "%s: radar_bitmap: marking sub-channel %d as radar-detected + NOL history",
+                                 ifName, chanList[i]);
+                 markedAny = true;
+             }
+@@ -726,10 +743,24 @@ static void s_dfsRadarDetectedCb(void* u
+         if(!markedAny) {
+             /* Bitmap was non-zero but no channels matched — fall back to band marking */
+             wld_channel_mark_radar_detected_band(*chanSpec);
++            /* Mark all sub-channels in NOL history */
++            swl_channel_t allChans[SWL_BW_CHANNELS_MAX] = {0};
++            int nAll = swl_chanspec_getChannelsInChanspec(chanSpec, allChans, SWL_BW_CHANNELS_MAX);
++            for(int i = 0; i < nAll; i++) {
++                swl_chanspec_t sub = SWL_CHANSPEC_NEW(allChans[i], SWL_BW_20MHZ, chanSpec->band);
++                wld_channel_mark_nol_history_channel(sub);
++            }
+         }
+     } else {
+         /* No bitmap from driver — mark entire band (legacy behavior) */
+         wld_channel_mark_radar_detected_band(*chanSpec);
++        /* Mark all sub-channels in NOL history */
++        swl_channel_t chanList[SWL_BW_CHANNELS_MAX] = {0};
++        int nChans = swl_chanspec_getChannelsInChanspec(chanSpec, chanList, SWL_BW_CHANNELS_MAX);
++        for(int i = 0; i < nChans; i++) {
++            swl_chanspec_t sub = SWL_CHANSPEC_NEW(chanList[i], SWL_BW_20MHZ, chanSpec->band);
++            wld_channel_mark_nol_history_channel(sub);
++        }
+     }
+ 
+     if(wld_bgdfs_isRunning(pRad)) {
+--- a/src/Plugin/wifiGen_rad.c
++++ b/src/Plugin/wifiGen_rad.c
+@@ -565,6 +565,10 @@ int wifiGen_rad_poschans(T_Radio* pRad,
+     ASSERT_FALSE(rc < SWL_RC_OK, rc, ME, "Fail to get nl80211 wiphy info");
+     wld_nl80211_bandDef_t* pOperBand = &wiphyInfo.bands[pRad->operatingFrequencyBand];
+     rc = s_updateChannels(pRad, pOperBand);
++    /* Restore NOL history after channel re-init: wld_channel_init_channels clears all
++     * flags, so we must reload the persisted NolHistory from the DM after s_readChanInfo
++     * has re-set WLD_CHAN_RADAR_REQUIRED on DFS channels. */
++    wld_chanmgt_loadNolHistory(pRad);
+     wld_rad_write_possible_channels(pRad);
+     wld_chanmgt_writeDfsChannels(pRad);
+     return rc;
+--- a/src/Plugin/wifiGen_wpaSupp.c
++++ b/src/Plugin/wifiGen_wpaSupp.c
+@@ -65,6 +65,7 @@
+ #include "wld/wld_endpoint.h"
+ #include "wld/wld_linuxIfUtils.h"
+ #include "wld/wld_wpaSupp_cfgFile.h"
++#include "wld/wld_rad_nl80211.h"
+ #include "wifiGen_wpaSupp.h"
+ #include "wifiGen_hapd.h"
+ #include "wifiGen_wpaSupp.h"
+@@ -227,6 +228,9 @@ void wifiGen_wpaSupp_writeConfig(T_EndPo
+             SAH_TRACEZ_INFO(ME, "%s: STA DFS: cswopts=0 (STADfsEnable=%d), not writing to wpa_supplicant config",
+                             pEP->Name, staDfsEnable);
+         }
++        /* Also configure the kernel driver's sta_dfs_en to match STADfsEnable */
++        swl_rc_ne rc = wld_rad_nl80211_setStaDfsEn(pRad, staDfsEnable);
++        SAH_TRACEZ_WARNING(ME, "%s: STA DFS: set sta_dfs_en=%d rc=%d", pEP->Name, staDfsEnable, rc);
+     }
+ }
+ 
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -1773,6 +1773,10 @@ void wld_hostapd_cfgFile_setVapConfig(T_
+         swl_mapCharFmt_addValInt32(vapConfigMap, "dcs_enable", (int32_t) pAP->DCS_Enable);
+     }
+ 
++    /* Write disassoc_low_ack=1 to hostapd config when enabled */
++    if(pAP->pBus && amxd_object_get_bool(pAP->pBus, "DisassocLowAck", NULL)) {
++        swl_mapCharFmt_addValInt32(vapConfigMap, "disassoc_low_ack", 1);
++    }
+ 
+     // rnr standard config
+     bool isIEEE80211k = pAP->IEEE80211kEnable && pAP->pRadio->IEEE80211kSupported;
+--- a/src/nl80211/wld_nl80211_api.c
++++ b/src/nl80211/wld_nl80211_api.c
+@@ -802,6 +802,15 @@ swl_rc_ne wld_nl80211_setWiphyAntennas(w
+     return rc;
+ }
+ 
++swl_rc_ne wld_nl80211_setWiphyStaDfsEn(wld_nl80211_state_t* state, uint32_t ifIndex, bool enable) {
++    uint8_t val = enable ? 1 : 0;
++    NL_ATTRS(attribs,
++             ARR(NL_ATTR_VAL(NL80211_ATTR_STA_DFS_EN, val)));
++    swl_rc_ne rc = wld_nl80211_sendCmdSyncWithAck(state, NL80211_CMD_SET_WIPHY, 0, ifIndex, &attribs);
++    NL_ATTRS_CLEAR(&attribs);
++    return rc;
++}
++
+ static swl_rc_ne s_setTxPower(wld_nl80211_state_t* state, uint32_t ifIndex, int8_t mloLinkId, enum nl80211_tx_power_setting type, int32_t dbm) {
+     NL_ATTRS(attribs, ARR(NL_ATTR_VAL(NL80211_ATTR_WIPHY_TX_POWER_SETTING, type)));
+ 
+--- a/src/nl80211/wld_rad_nl80211.c
++++ b/src/nl80211/wld_rad_nl80211.c
+@@ -623,6 +623,11 @@ swl_rc_ne wld_rad_nl80211_setAntennas(T_
+     return wld_nl80211_setWiphyAntennas(wld_nl80211_getSharedState(), pRadio->index, txMapAnt, rxMapAnt);
+ }
+ 
++swl_rc_ne wld_rad_nl80211_setStaDfsEn(T_Radio* pRadio, bool enable) {
++    ASSERT_NOT_NULL(pRadio, SWL_RC_INVALID_PARAM, ME, "NULL");
++    return wld_nl80211_setWiphyStaDfsEn(wld_nl80211_getSharedState(), pRadio->index, enable);
++}
++
+ swl_rc_ne wld_rad_nl80211_setTxPowerAuto(T_Radio* pRadio) {
+     ASSERT_NOT_NULL(pRadio, SWL_RC_INVALID_PARAM, ME, "No radio ctx");
+     int8_t mloLinkId = MLO_LINK_ID_UNKNOWN;
+--- a/src/wld_accesspoint.c
++++ b/src/wld_accesspoint.c
+@@ -93,6 +93,7 @@
+ #include "Features/wld_persist.h"
+ #include "wld_extMod.h"
+ #include "wld_wpaCtrl_api.h"
++#include "wld_hostapd_cfgFile.h"
+ 
+ #define ME "ap"
+ 
+@@ -4294,6 +4295,41 @@ SWLA_DM_HDLRS(sApDmHdlrs,
+                   ),
+               .instAddedCb = s_addApInst_oaf, );
+ 
++/**
++ * @brief Runtime write handler for AccessPoint.DisassocLowAck.
++ *
++ * Applies disassoc_low_ack immediately without requiring a hostapd restart:
++ *   - Regenerates the config file so the value persists across restarts.
++ *   - Sends "SET disassoc_low_ack <0|1>" to hostapd via wpa_ctrl if running.
++ */
++amxd_status_t wld_ap_setDisassocLowAck_pwf(amxd_object_t* object,
++                                            amxd_param_t* param _UNUSED,
++                                            amxd_action_t reason _UNUSED,
++                                            const amxc_var_t* const args,
++                                            amxc_var_t* const retval _UNUSED,
++                                            void* priv _UNUSED) {
++    ASSERTS_FALSE(amxc_var_is_null(args), amxd_status_invalid_value, ME, "invalid args");
++    T_AccessPoint* pAP = wld_ap_fromObj(object);
++    ASSERTI_NOT_NULL(pAP, amxd_status_ok, ME, "No AP mapped");
++
++    bool enable = amxc_var_dyncast(bool, args);
++    SAH_TRACEZ_WARNING(ME, "%s: DisassocLowAck write handler: enable=%d", pAP->alias, enable);
++
++    /* Regenerate config file so value persists across restarts */
++    wld_hostapd_cfgFile_createExt(pAP->pRadio);
++
++    /* Send SET disassoc_low_ack to hostapd via wpa_ctrl if running */
++    if(pAP->wpaCtrlInterface && wld_wpaCtrlInterface_isReady(pAP->wpaCtrlInterface)) {
++        char cmd[64] = {0};
++        snprintf(cmd, sizeof(cmd), "SET disassoc_low_ack %d", enable ? 1 : 0);
++        wld_wpaCtrl_sendCmdCheckResponse(pAP->wpaCtrlInterface, cmd, "OK");
++        SAH_TRACEZ_WARNING(ME, "%s: disassoc_low_ack=%d applied via hostapd wpa_ctrl",
++                           pAP->alias, enable);
++    }
++
++    return amxd_status_ok;
++}
++
+ void _wld_ap_setConf_ocf(const char* const sig_name,
+                          const amxc_var_t* const data,
+                          void* const priv) {
+--- a/src/wld_endpoint.c
++++ b/src/wld_endpoint.c
+@@ -88,6 +88,7 @@
+ #include "wld_chanmgt.h"
+ #include "wld_wpaCtrl_api.h"
+ #include "wld_epMld.h"
++#include "wld_rad_nl80211.h"
+ 
+ /* Function prototypes for helpers. */
+ static void s_setEndpointStatus(T_EndPoint* pEP,
+@@ -270,6 +271,81 @@ static void s_setMultiAPProfile_pwf(void
+     SAH_TRACEZ_OUT(ME);
+ }
+ 
++/**
++ * @brief s_setStaDfsEnable_pwf
++ *
++ * Parameter handler to apply STADfsEnable changes to the kernel driver
++ * immediately at runtime via NL80211, without requiring endpoint restart.
++ */
++static void s_setStaDfsEnable_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_EndPoint* pEP = wld_ep_fromObj(object);
++    ASSERT_NOT_NULL(pEP, , ME, "INVALID");
++
++    bool enable = amxc_var_dyncast(bool, newValue);
++    T_Radio* pRad = pEP->pRadio;
++
++    /* Only apply if wpa_supplicant is configured and running */
++    if(pRad && pEP->wpaSupp && !swl_str_isEmpty(pEP->wpaSupp->cfgFile)) {
++        swl_rc_ne rc = wld_rad_nl80211_setStaDfsEn(pRad, enable);
++        SAH_TRACEZ_INFO(ME, "%s: STADfsEnable changed: set sta_dfs_en=%d rc=%d", pEP->Name, enable, rc);
++    }
++
++    SAH_TRACEZ_OUT(ME);
++}
++
++/**
++ * @brief wld_ep_setSTADfsEnable_pwf - AMX action write handler for STADfsEnable.
++ *
++ * Called when STADfsEnable is written via the AMX data model.
++ * Applies the change immediately at runtime:
++ *   1. Regenerates wpa_supplicant config file (persists cswopts across restarts)
++ *   2. Sends "SET cswopts <value>" to wpa_supplicant via wpa_ctrl if running
++ *      (value = Radio.CSwOpts when enable=true, 0 when enable=false)
++ *   3. Sets sta_dfs_en in the kernel driver via NL80211
++ */
++amxd_status_t wld_ep_setSTADfsEnable_pwf(amxd_object_t* object,
++                                          amxd_param_t* param _UNUSED,
++                                          amxd_action_t reason _UNUSED,
++                                          const amxc_var_t* const args,
++                                          amxc_var_t* const retval _UNUSED,
++                                          void* priv _UNUSED) {
++    ASSERTS_FALSE(amxc_var_is_null(args), amxd_status_invalid_value, ME, "invalid args");
++    T_EndPoint* pEP = wld_ep_fromObj(object);
++    ASSERTI_NOT_NULL(pEP, amxd_status_ok, ME, "No endpoint mapped");
++
++    bool enable = amxc_var_dyncast(bool, args);
++    T_Radio* pRad = pEP->pRadio;
++    SAH_TRACEZ_WARNING(ME, "%s: STADfsEnable write handler: enable=%d", pEP->Name, enable);
++
++    /* Regenerate config file so cswopts persists across restarts */
++    if(pEP->wpaSupp && !swl_str_isEmpty(pEP->wpaSupp->cfgFile)) {
++        wld_wpaSupp_cfgFile_createExt(pEP);
++    }
++
++    /* Send SET cswopts to wpa_supplicant via wpa_ctrl if running */
++    if(pEP->wpaCtrlInterface && wld_wpaCtrlInterface_isReady(pEP->wpaCtrlInterface)) {
++        uint32_t cswopts = 0;
++        if(enable && pRad && pRad->pBus) {
++            cswopts = amxd_object_get_uint32_t(pRad->pBus, "CSwOpts", NULL);
++        }
++        char cmd[64] = {0};
++        snprintf(cmd, sizeof(cmd), "SET cswopts %u", cswopts);
++        wld_wpaCtrl_sendCmdCheckResponse(pEP->wpaCtrlInterface, cmd, "OK");
++        SAH_TRACEZ_WARNING(ME, "%s: cswopts=%u applied via wpa_supplicant wpa_ctrl (STADfsEnable=%d)",
++                           pEP->Name, cswopts, enable);
++    }
++
++    /* Set sta_dfs_en in the kernel driver via NL80211 */
++    if(pRad && pEP->wpaSupp && !swl_str_isEmpty(pEP->wpaSupp->cfgFile)) {
++        swl_rc_ne rc = wld_rad_nl80211_setStaDfsEn(pRad, enable);
++        SAH_TRACEZ_INFO(ME, "%s: sta_dfs_en=%d set via NL80211 rc=%d", pEP->Name, enable, rc);
++    }
++
++    return amxd_status_ok;
++}
++
+ static amxd_object_t* s_getProfileObjFromReference(amxd_object_t* endpointObject, const char* profileRefStr) {
+     ASSERTS_NOT_NULL(endpointObject, NULL, ME, "NULL");
+     ASSERTS_STR(profileRefStr, NULL, ME, "empty reference");
+@@ -2848,6 +2924,7 @@ SWLA_DM_HDLRS(sEpDmHdlrs,
+                   SWLA_DM_PARAM_HDLR("BridgeInterface", s_setBridgeInterface_pwf),
+                   SWLA_DM_PARAM_HDLR("Enable", s_setEnable_pwf),
+                   SWLA_DM_PARAM_HDLR("RequiredOperatingStandards", s_setRequiredStandards_pwf),
++                  SWLA_DM_PARAM_HDLR("STADfsEnable", s_setStaDfsEnable_pwf),
+                   ),
+               .instAddedCb = s_addEpInst_oaf, );
+ 
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -98,6 +98,7 @@
+ 
+ #include "wld_rad_hostapd_api.h"
+ #include "wld_hostapd_cfgFile.h"
++#include "wld_wpaSupp_cfgFile.h"
+ #include "wld_rad_nl80211.h"
+ #include "wld_linuxIfStats.h"
+ #include "wld_linuxIfUtils.h"
+@@ -7329,6 +7330,71 @@ void _wld_rad_setStaticPuncturing_ocf(co
+     swla_dm_procObjEvtOfLocalDm(&sStaticPuncturingDmHdlrs, sig_name, data, priv);
+ }
+ 
++/**
++ * @brief Runtime write handler for Radio.CSwOpts.
++ *
++ * Applies CSwOpts immediately without requiring a hostapd/wpa_supplicant restart:
++ *   AP side  : sends "SET CSwOpts <value>" to hostapd via wpa_ctrl
++ *   STA side : sends "SET cswopts <value>" to wpa_supplicant via wpa_ctrl
++ *              (only when EndPoint.STADfsEnable is true; otherwise sends 0)
++ *
++ * Also regenerates the config file so the value persists across restarts.
++ */
++amxd_status_t wld_radio_setCSwOpts_pwf(amxd_object_t* object,
++                                        amxd_param_t* param _UNUSED,
++                                        amxd_action_t reason _UNUSED,
++                                        const amxc_var_t* const args,
++                                        amxc_var_t* const retval _UNUSED,
++                                        void* priv _UNUSED) {
++    ASSERTS_FALSE(amxc_var_is_null(args), amxd_status_invalid_value, ME, "invalid args");
++    T_Radio* pRad = wld_rad_fromObj(object);
++    ASSERTI_NOT_NULL(pRad, amxd_status_ok, ME, "No radio mapped");
++
++    uint32_t cswopts = amxc_var_dyncast(uint32_t, args);
++    SAH_TRACEZ_WARNING(ME, "%s: CSwOpts write handler: value=0x%02x", pRad->Name, cswopts);
++
++    /* Regenerate config file so value persists across restarts */
++    wld_hostapd_cfgFile_createExt(pRad);
++
++    /* AP side: send SET CSwOpts <value> to hostapd via wpa_ctrl if running */
++    if(wld_rad_isActive(pRad)) {
++        T_AccessPoint* pAP = wld_rad_getFirstActiveAp(pRad);
++        if(pAP && pAP->wpaCtrlInterface && wld_wpaCtrlInterface_isReady(pAP->wpaCtrlInterface)) {
++            char cmd[64] = {0};
++            snprintf(cmd, sizeof(cmd), "SET CSwOpts %u", cswopts);
++            wld_wpaCtrl_sendCmdCheckResponse(pAP->wpaCtrlInterface, cmd, "OK");
++            SAH_TRACEZ_WARNING(ME, "%s: CSwOpts=0x%02x applied via hostapd wpa_ctrl", pRad->Name, cswopts);
++        }
++    }
++
++    /* STA side: send SET cswopts <value> to wpa_supplicant via wpa_ctrl if running */
++    T_EndPoint* pEP = NULL;
++    wld_rad_forEachEp(pEP, pRad) {
++        if(!pEP || !pEP->wpaCtrlInterface || !wld_wpaCtrlInterface_isReady(pEP->wpaCtrlInterface)) {
++            continue;
++        }
++        bool staDfsEnable = pEP->pBus ? amxd_object_get_bool(pEP->pBus, "STADfsEnable", NULL) : false;
++        uint32_t epCswopts = staDfsEnable ? cswopts : 0;
++        if(epCswopts > 0) {
++            char cmd[64] = {0};
++            snprintf(cmd, sizeof(cmd), "SET cswopts %u", epCswopts);
++            wld_wpaCtrl_sendCmdCheckResponse(pEP->wpaCtrlInterface, cmd, "OK");
++            SAH_TRACEZ_WARNING(ME, "%s: cswopts=0x%02x applied via wpa_supplicant wpa_ctrl (STADfsEnable=%d)",
++                               pEP->Name, epCswopts, staDfsEnable);
++        }
++    }
++
++    /* STA side: also update wpa_supplicant config file so new CSwOpts persists across restarts */
++    T_EndPoint* pEP2 = NULL;
++    wld_rad_forEachEp(pEP2, pRad) {
++        if(pEP2 && pEP2->pBus && amxd_object_get_bool(pEP2->pBus, "STADfsEnable", NULL)) {
++            wld_wpaSupp_cfgFile_createExt(pEP2);
++        }
++    }
++
++    return amxd_status_ok;
++}
++
+ amxd_status_t _getEHTOperations(amxd_object_t* object,
+                                 amxd_function_t* func _UNUSED,
+                                 amxc_var_t* args _UNUSED,
