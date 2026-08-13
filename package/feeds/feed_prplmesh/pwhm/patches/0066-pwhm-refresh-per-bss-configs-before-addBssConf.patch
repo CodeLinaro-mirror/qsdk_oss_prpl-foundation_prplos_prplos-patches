@@ -1,0 +1,45 @@
+From: Kartheek E <karte@qti.qualcomm.com>
+Date: Tue, 12 Aug 2026 00:00:00 +0000
+Subject: [PATCH] pwhm: fix dual-home channel on FH re-enable after EP move
+
+Two fixes for the case where the EP has connected on a channel that
+differs from the radio's startup default and FH is then re-enabled:
+
+1. s_doAddLink: refresh per-BSS config files before addBssConf so the
+   channel written into hostapd matches the radio's current operating
+   channel (not the stale startup default).
+
+2. s_syncOnEpStartConn: widen the early-return guard from
+   isApplied == SWL_TRL_TRUE to isApplied != SWL_TRL_FALSE so that a
+   channel switch that is in-flight (CSA) or queued (cold-apply) also
+   skips the FH-disable path, preventing a double-disable that leaves
+   hostapd in an inconsistent state and triggers a dual-home channel.
+
+Signed-off-by: Kartheek E <karte@qti.qualcomm.com>
+---
+--- a/src/Plugin/wifiGen_fsm.c
++++ b/src/Plugin/wifiGen_fsm.c
+@@ -679,6 +679,11 @@ static bool s_doAddLink(T_AccessPoint* pAP, T_Radio* pRad)
+     wld_rad_hostapd_setMiscParams(pRad);
+     wifiGen_hapd_restoreMainIface(pRad);
+
++    /* Refresh per-BSS config files so the channel matches the radio's current
++     * operating channel (which may differ from the startup default when the EP
++     * connected on a different channel before FH was enabled). */
++    wld_hostapd_cfgFile_updatePerBssConfigs(pRad);
++
+     SAH_TRACEZ_INFO(ME, "%s: adding BSS config for AP %s", pRad->Name, pAP->alias);
+     swl_rc_ne rc = wld_ap_hostapd_addBssConf(pAP);
+     if(!swl_rc_isOk(rc)) {
+@@ -1969,7 +1974,10 @@ static void s_syncOnEpStartConn(void* userData, char* ifName, const char* ssid,
+                                );
+             wld_chanmgt_setTargetChanspec(pRad, chanSpec, true, CHAN_REASON_EP_MOVE, "ep preConnect");
+             if((swl_typeChanspec_equals(wld_chanmgt_getTgtChspec(pRad), chanSpec)) &&
+-               (pRad->targetChanspec.isApplied == SWL_TRL_TRUE)) {
++               (pRad->targetChanspec.isApplied != SWL_TRL_FALSE)) {
++                /* Channel switch was initiated (CSA in-flight or cold-apply queued):
++                 * skip disabling FH here to avoid a double-disable that would leave
++                 * hostapd in an inconsistent state and trigger a dual-home channel. */
+                 return;
+             }
+         }
