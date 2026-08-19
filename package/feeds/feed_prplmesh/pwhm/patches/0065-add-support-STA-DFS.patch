@@ -449,7 +449,60 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
  #include "wifiGen_wpaSupp.h"
  #include "wifiGen_hapd.h"
  #include "wifiGen_wpaSupp.h"
-@@ -227,6 +228,9 @@ void wifiGen_wpaSupp_writeConfig(T_EndPo
+@@ -208,9 +209,41 @@ void wifiGen_wpaSupp_writeConfig(T_EndPo
+      */
+     T_Radio* pRad = pEP->pRadio;
+     if(pRad && pRad->pBus && pEP->pBus && pEP->wpaSupp && !swl_str_isEmpty(pEP->wpaSupp->cfgFile)) {
++        /* STADfsEnable may be set on a different endpoint than the one being reconfigured.
++         * In MLO, EndPoint.1 (2G/Radio.1) and EndPoint.2 (5G/Radio.2) are on different
++         * radios. Iterate ALL radios and ALL endpoints — if any has STADfsEnable=1, use 1.
++         * sta_dfs_en is a per-phy kernel parameter so it applies to the whole device. */
+         bool staDfsEnable = amxd_object_get_bool(pEP->pBus, "STADfsEnable", NULL);
+-        uint32_t cswopts = staDfsEnable ?
+-            (uint32_t) amxd_object_get_uint32_t(pRad->pBus, "CSwOpts", NULL) : 0;
++        if(!staDfsEnable) {
++            T_Radio* pRadIter = NULL;
++            wld_for_eachRad(pRadIter) {
++                T_EndPoint* pEPIter = NULL;
++                wld_rad_forEachEp(pEPIter, pRadIter) {
++                    if(pEPIter->pBus && amxd_object_get_bool(pEPIter->pBus, "STADfsEnable", NULL)) {
++                        staDfsEnable = true;
++                        break;
++                    }
++                }
++                if(staDfsEnable) {
++                    break;
++                }
++            }
++        }
++        /* CSwOpts is a global wpa_supplicant setting that may be set on any radio
++         * (e.g. CSwOpts set on Radio.2/wlan1 but STA endpoint is on Radio.1/wlan2).
++         * Iterate over all radios to find the highest CSwOpts value. */
++        uint32_t cswopts = 0;
++        if(staDfsEnable) {
++            T_Radio* pRadIter = NULL;
++            wld_for_eachRad(pRadIter) {
++                if(pRadIter->pBus) {
++                    uint32_t radCswOpts = amxd_object_get_uint32_t(pRadIter->pBus, "CSwOpts", NULL);
++                    if(radCswOpts > cswopts) {
++                        cswopts = radCswOpts;
++                    }
++                }
++            }
++        }
+         /*
+          * Only write cswopts when non-zero. Writing cswopts=0 causes wpa_supplicant
+          * to fail config parsing on builds that do not support this parameter.
+@@ -220,13 +253,16 @@ void wifiGen_wpaSupp_writeConfig(T_EndPo
+         if(cswopts > 0) {
+             char cswopts_str[16] = {0};
+             snprintf(cswopts_str, sizeof(cswopts_str), "%u", cswopts);
+-            wld_wpaSupp_cfgFile_globalConfigUpdate(pEP->wpaSupp->cfgFile, "cswopts", cswopts_str);
+-            SAH_TRACEZ_WARNING(ME, "%s: STA DFS: wrote cswopts=%u (STADfsEnable=%d) to wpa_supplicant config",
++            wld_wpaSupp_cfgFile_globalConfigUpdate(pEP->wpaSupp->cfgFile, "CSwOpts", cswopts_str);
++            SAH_TRACEZ_WARNING(ME, "%s: STA DFS: wrote CSwOpts=%u (STADfsEnable=%d) to wpa_supplicant config",
+                                pEP->Name, cswopts, staDfsEnable);
+         } else {
              SAH_TRACEZ_INFO(ME, "%s: STA DFS: cswopts=0 (STADfsEnable=%d), not writing to wpa_supplicant config",
                              pEP->Name, staDfsEnable);
          }
@@ -472,6 +525,22 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
  
      // rnr standard config
      bool isIEEE80211k = pAP->IEEE80211kEnable && pAP->pRadio->IEEE80211kSupported;
+@@ -1907,13 +1911,13 @@ void wld_hostapd_cfgFile_createExt(T_Rad
+ bool wld_hostapd_cfgFile_update(char* configPath, const char* interface, const char* key, const char* value) {
+     SAH_TRACEZ_IN(ME);
+     ASSERT_STR(configPath, false, ME, "Empty path");
+-    ASSERT_STR(interface, false, ME, "Empty interface");
++    /* interface may be NULL to write to the global/header section */
+     ASSERT_STR(key, false, ME, "Empty key");
+     ASSERT_NOT_NULL(value, false, ME, "NULL");
+     wld_hostapd_config_t* config;
+     bool ret = wld_hostapd_loadConfig(&config, configPath);
+     ASSERTS_TRUE(ret, false, ME, "Bad config");
+-    SAH_TRACEZ_INFO(ME, "%s: updateConfig interface:%s, key:%s, value:%s", configPath, interface, key, value);
++    SAH_TRACEZ_INFO(ME, "%s: updateConfig interface:%s, key:%s, value:%s", configPath, interface ? interface : "(global)", key, value);
+     ret = wld_hostapd_addConfigParam(config, interface, key, value);
+     if(ret) {
+         ret = wld_hostapd_writeConfig(config, configPath);
 --- a/src/nl80211/wld_nl80211_api.c
 +++ b/src/nl80211/wld_nl80211_api.c
 @@ -802,6 +802,15 @@ swl_rc_ne wld_nl80211_setWiphyAntennas(w
@@ -566,7 +635,7 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
  
  /* Function prototypes for helpers. */
  static void s_setEndpointStatus(T_EndPoint* pEP,
-@@ -270,6 +271,92 @@ static void s_setMultiAPProfile_pwf(void
+@@ -270,6 +271,100 @@ static void s_setMultiAPProfile_pwf(void
      SAH_TRACEZ_OUT(ME);
  }
  
@@ -618,32 +687,40 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
 +    T_Radio* pRad = pEP->pRadio;
 +    SAH_TRACEZ_WARNING(ME, "%s: STADfsEnable write handler: enable=%d", pEP->Name, enable);
 +
++    /* CSwOpts is a global wpa_supplicant setting that may be set on any radio.
++     * Iterate all radios to find the highest CSwOpts value (same logic as s_setCSwOpts_pwf). */
++    uint32_t cswopts = 0;
++    if(enable) {
++        T_Radio* pRadIter = NULL;
++        wld_for_eachRad(pRadIter) {
++            if(pRadIter->pBus) {
++                uint32_t radCswOpts = amxd_object_get_uint32_t(pRadIter->pBus, "CSwOpts", NULL);
++                if(radCswOpts > cswopts) {
++                    cswopts = radCswOpts;
++                }
++            }
++        }
++    }
++
 +    /* Regenerate config file so cswopts persists across restarts */
 +    if(pEP->wpaSupp && !swl_str_isEmpty(pEP->wpaSupp->cfgFile)) {
 +        wld_wpaSupp_cfgFile_createExt(pEP);
 +        /* Write cswopts to config file (only when enable=true and CSwOpts > 0) */
-+        if(enable && pRad && pRad->pBus) {
-+            uint32_t cswopts = amxd_object_get_uint32_t(pRad->pBus, "CSwOpts", NULL);
-+            if(cswopts > 0) {
-+                char cswopts_str[16] = {0};
-+                snprintf(cswopts_str, sizeof(cswopts_str), "%u", cswopts);
-+                wld_wpaSupp_cfgFile_globalConfigUpdate(pEP->wpaSupp->cfgFile, "cswopts", cswopts_str);
-+                SAH_TRACEZ_WARNING(ME, "%s: wrote cswopts=%u to wpa_supplicant config (STADfsEnable=true)",
-+                                   pEP->Name, cswopts);
-+            }
++        if(cswopts > 0) {
++            char cswopts_str[16] = {0};
++            snprintf(cswopts_str, sizeof(cswopts_str), "%u", cswopts);
++            wld_wpaSupp_cfgFile_globalConfigUpdate(pEP->wpaSupp->cfgFile, "CSwOpts", cswopts_str);
++            SAH_TRACEZ_WARNING(ME, "%s: wrote CSwOpts=%u to wpa_supplicant config (STADfsEnable=true)",
++                               pEP->Name, cswopts);
 +        }
 +    }
 +
 +    /* Send SET cswopts to wpa_supplicant via wpa_ctrl if running */
 +    if(pEP->wpaCtrlInterface && wld_wpaCtrlInterface_isReady(pEP->wpaCtrlInterface)) {
-+        uint32_t cswopts = 0;
-+        if(enable && pRad && pRad->pBus) {
-+            cswopts = amxd_object_get_uint32_t(pRad->pBus, "CSwOpts", NULL);
-+        }
 +        char cmd[64] = {0};
-+        snprintf(cmd, sizeof(cmd), "SET cswopts %u", cswopts);
++        snprintf(cmd, sizeof(cmd), "SET CSwOpts %u", cswopts);
 +        wld_wpaCtrl_sendCmdCheckResponse(pEP->wpaCtrlInterface, cmd, "OK");
-+        SAH_TRACEZ_WARNING(ME, "%s: cswopts=%u applied via wpa_supplicant wpa_ctrl (STADfsEnable=%d)",
++        SAH_TRACEZ_WARNING(ME, "%s: CSwOpts=%u applied via wpa_supplicant wpa_ctrl (STADfsEnable=%d)",
 +                           pEP->Name, cswopts, enable);
 +    }
 +
@@ -659,7 +736,7 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
  static amxd_object_t* s_getProfileObjFromReference(amxd_object_t* endpointObject, const char* profileRefStr) {
      ASSERTS_NOT_NULL(endpointObject, NULL, ME, "NULL");
      ASSERTS_STR(profileRefStr, NULL, ME, "empty reference");
-@@ -2848,6 +2935,7 @@ SWLA_DM_HDLRS(sEpDmHdlrs,
+@@ -2848,6 +2943,7 @@ SWLA_DM_HDLRS(sEpDmHdlrs,
                    SWLA_DM_PARAM_HDLR("BridgeInterface", s_setBridgeInterface_pwf),
                    SWLA_DM_PARAM_HDLR("Enable", s_setEnable_pwf),
                    SWLA_DM_PARAM_HDLR("RequiredOperatingStandards", s_setRequiredStandards_pwf),
@@ -677,7 +754,7 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
  #include "wld_rad_nl80211.h"
  #include "wld_linuxIfStats.h"
  #include "wld_linuxIfUtils.h"
-@@ -6421,6 +6422,93 @@ amxd_status_t _Radio_debug(amxd_object_t
+@@ -6421,6 +6422,109 @@ amxd_status_t _Radio_debug(amxd_object_t
      return amxd_status_ok;
  }
  
@@ -686,7 +763,7 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
 + *
 + * Applies CSwOpts immediately without requiring a hostapd/wpa_supplicant restart:
 + *   AP side  : sends "SET CSwOpts <value>" to hostapd via wpa_ctrl
-+ *   STA side : sends "SET cswopts <value>" to wpa_supplicant via wpa_ctrl
++ *   STA side : sends "SET CSwOpts <value>" to wpa_supplicant via wpa_ctrl
 + *              (only when EndPoint.STADfsEnable is true; otherwise sends 0)
 + *
 + * Also regenerates the config file so the value persists across restarts.
@@ -716,7 +793,13 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
 +        if(pCfgAP != NULL) {
 +            char cswopts_str[16] = {0};
 +            snprintf(cswopts_str, sizeof(cswopts_str), "%u", cswopts);
-+            wld_hostapd_cfgFile_update(pRad->hostapd->cfgFile, pCfgAP->alias, "CSwOpts", cswopts_str);
++            /* Use pRad->Name (e.g. "wlan1") as the interface key — same as s_getMainIface()
++             * in wifiGen_hapd.c. pCfgAP->alias (e.g. "wlan1.1") is the BSS name and does
++             * not match the global section key used by wld_hostapd_addConfigParam. */
++            /* Pass NULL as bssName to write CSwOpts to the global/header section.
++             * wld_hostapd_addConfigParam writes to the BSS section when bssName != NULL,
++             * but CSwOpts is a global hostapd parameter (not per-BSS). */
++            wld_hostapd_cfgFile_update(pRad->hostapd->cfgFile, NULL, "CSwOpts", cswopts_str);
 +            SAH_TRACEZ_WARNING(ME, "%s: CSwOpts=0x%02x written to hostapd config file (%s)",
 +                               pRad->Name, cswopts, pRad->hostapd->cfgFile);
 +        }
@@ -733,8 +816,8 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
 +        }
 +    }
 +
-+    /* STA side: send SET cswopts <value> to wpa_supplicant via wpa_ctrl if running.
-+     * Iterate over ALL radios' endpoints — cswopts is a global wpa_supplicant setting
++    /* STA side: send SET CSwOpts <value> to wpa_supplicant via wpa_ctrl if running.
++     * Iterate over ALL radios' endpoints — CSwOpts is a global wpa_supplicant setting
 +     * and the STA endpoint may be on a different radio than the one whose CSwOpts changed
 +     * (e.g. CSwOpts set on Radio.2/wlan1 but STA endpoint is on Radio.3/wlan2). */
 +    T_Radio* pRadIter = NULL;
@@ -748,21 +831,31 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
 +            }
 +            if(staDfsEnable) {
 +                char cmd[64] = {0};
-+                snprintf(cmd, sizeof(cmd), "SET cswopts %u", cswopts);
++                snprintf(cmd, sizeof(cmd), "SET CSwOpts %u", cswopts);
 +                wld_wpaCtrl_sendCmdCheckResponse(pEP->wpaCtrlInterface, cmd, "OK");
-+                SAH_TRACEZ_WARNING(ME, "%s: cswopts=0x%02x applied via wpa_supplicant wpa_ctrl",
++                SAH_TRACEZ_WARNING(ME, "%s: CSwOpts=0x%02x applied via wpa_supplicant wpa_ctrl",
 +                                   pEP->Name, cswopts);
 +            }
 +        }
 +    }
 +
-+    /* STA side: also update wpa_supplicant config file so new CSwOpts persists across restarts. */
++    /* STA side: also update wpa_supplicant config file so new CSwOpts persists across restarts.
++     * Use wld_wpaSupp_cfgFile_globalConfigUpdate directly with the cswopts value from this handler.
++     * Do NOT use wld_wpaSupp_cfgFile_createExt — it reads CSwOpts from the endpoint's own radio
++     * (e.g. Radio.1/wlan2 = 0) which may differ from the radio whose CSwOpts was just changed
++     * (e.g. Radio.2/wlan1 = 48). */
 +    T_Radio* pRadIter2 = NULL;
 +    wld_for_eachRad(pRadIter2) {
 +        T_EndPoint* pEP2 = NULL;
 +        wld_rad_forEachEp(pEP2, pRadIter2) {
 +            if(pEP2 && pEP2->pBus && amxd_object_get_bool(pEP2->pBus, "STADfsEnable", NULL)) {
-+                wld_wpaSupp_cfgFile_createExt(pEP2);
++                if(pEP2->wpaSupp && pEP2->wpaSupp->cfgFile && cswopts > 0) {
++                    char cswopts_cfg_str[16] = {0};
++                    snprintf(cswopts_cfg_str, sizeof(cswopts_cfg_str), "%u", cswopts);
++                    wld_wpaSupp_cfgFile_globalConfigUpdate(pEP2->wpaSupp->cfgFile, "CSwOpts", cswopts_cfg_str);
++                    SAH_TRACEZ_WARNING(ME, "%s: CSwOpts=%u written to wpa_supplicant config file",
++                                       pEP2->Name, cswopts);
++                }
 +            }
 +        }
 +    }
@@ -771,7 +864,7 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
  static void s_setDiscardAwgnEvent_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
      SAH_TRACEZ_IN(ME);
  
-@@ -6615,6 +6703,7 @@ SWLA_DM_HDLRS(sRadioDmHdlrs,
+@@ -6615,6 +6719,7 @@ SWLA_DM_HDLRS(sRadioDmHdlrs,
                    SWLA_DM_PARAM_HDLR("AntennaGain5G", s_setAntennaGain5G_pwf),
                    SWLA_DM_PARAM_HDLR("PowerSaveEnable", s_setPowerSaveEnable_pwf),
                    SWLA_DM_PARAM_HDLR("StrictPassiveScan", s_setStrictPassiveScan_pwf),
@@ -779,3 +872,31 @@ Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
                    ),
                .instAddedCb = s_addInstance_oaf);
  
+--- a/src/nl80211/wld_wpaCtrl_events.c
++++ b/src/nl80211/wld_wpaCtrl_events.c
+@@ -646,10 +646,23 @@ static void s_radDfsCacExpiredEvt(wld_wp
+     CALL_MGR_I(pInterface, fDfsCacExpiredCb, &chanSpec);
+ }
+ static void s_radDfsRadarDetectedEvt(wld_wpaCtrlInterface_t* pInterface, char* event _UNUSED, char* params) {
+-    // Example: DFS-RADAR-DETECTED freq=5540 ht_enabled=0 chan_offset=0 chan_width=3 cf1=5530 cf2=0 radar_bitmap:2
++    // Example (AP/hostapd):  DFS-RADAR-DETECTED freq=5540 ht_enabled=0 chan_offset=0 chan_width=3 cf1=5530 cf2=0 radar_bitmap:2
++    // Example (STA/wpa_supplicant): DFS-RADAR-DETECTED  on 5500 MHz
+     // Note: radar_bitmap uses ':' separator (not '='), provided by NL80211_ATTR_RADAR_BITMAP
+     swl_chanspec_t chanSpec = SWL_CHANSPEC_EMPTY;
+-    ASSERT_FALSE(s_freqParamToChanSpec(params, "freq", &chanSpec) < SWL_RC_OK, , ME, "fail to get freq");
++    if(s_freqParamToChanSpec(params, "freq", &chanSpec) < SWL_RC_OK) {
++        /* STA-side wpa_supplicant sends "on <freq> MHz" — no freq= key */
++        int freqMhz = 0;
++        if(params && sscanf(params, " on %d MHz", &freqMhz) == 1 && freqMhz > 0) {
++            swl_chanspec_channelFromMHz(&chanSpec, (uint32_t) freqMhz);
++            SAH_TRACEZ_INFO(ME, "%s: DFS radar detected (STA format) freq=%d MHz channel=%d",
++                            pInterface->name, freqMhz, chanSpec.channel);
++        } else {
++            SAH_TRACEZ_ERROR(ME, "%s: fail to get freq from params: '%s'",
++                             pInterface->name, params ? params : "NULL");
++            return;
++        }
++    }
+     s_chWidthIdToChanSpec(params, "chan_width", &chanSpec);
+ 
+     /* Parse radar_bitmap if present — indicates which 20MHz sub-channel(s) were hit.
