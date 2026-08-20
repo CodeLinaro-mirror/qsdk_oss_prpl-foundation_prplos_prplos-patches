@@ -1,0 +1,73 @@
+From: Kartheek E <karte@qti.qualcomm.com>
+Date: Wed, 20 Aug 2026 00:00:00 +0000
+Subject: [PATCH] pwhm: fix BSTA disconnect on BH VAP during FH MLO 11BE->11AX conversion
+
+On MBSS-capable radios (hasMbssidAds=true) getCfgMainVap() always returns
+getFirstEnabledVap(), which yields the FH VAP (wlan0.1) because it is the
+first entry in pRad->llAP.  Hostapd therefore writes the FH VAP as the
+"interface=" (Tx BSS, vdev index 0) and the BH link VAP as the "bss="
+(non-Tx BSS, vdev index 1).
+
+If s_doAddLink() finds !hasAvailableCtrlIface but hasReadyGlobalCtrlIface,
+the per-BSS sockets have only gone away transiently (reconnecting after the
+ath12k cascade).  Proceed with the incremental ADD bss_config via the global
+ctrl iface instead of escalating to GEN_FSM_ADD_HOSTAPD, which would
+needlessly restart all BSSes on the radio (including any remaining BH VAP).
+
+Signed-off-by: Kartheek E <karte@qti.qualcomm.com>
+---
+--- a/src/nl80211/wld_rad_hostapd_api.c
++++ b/src/nl80211/wld_rad_hostapd_api.c
+@@ -640,7 +640,24 @@ T_AccessPoint* wld_rad_hostapd_getCfgMainVap(T_Radio* pRad)
+             pMainAP = wld_rad_getFirstEnabledVap(pRad);
+         }
+     } else if(wld_rad_hasMbssidAds(pRad)) {
+-        pMainAP = wld_rad_getFirstEnabledVap(pRad);
++        /* Prefer a pure-BH VAP as the MBSS Tx BSS (main/first BSS in hostapd config).
++         * When a BH link VAP (wlan0.2) coexists with a FH VAP (wlan0.1) on an MBSS
++         * radio and the FH VAP is the Tx BSS, ath12k cascades vdev/peer teardown to
++         * the BH (non-Tx) BSS when the FH (Tx) BSS vdev is stopped -- e.g. during a
++         * 11BE->11AX conversion (Disable11be=1 on the FH VAP triggers LINK_REMOVE).
++         * Making the BH VAP the Tx BSS avoids this cascade: removing the FH non-Tx
++         * BSS does not force the BH Tx BSS down, so the BSTA stays connected. */
++        T_AccessPoint* pAP = NULL;
++        wld_rad_forEachAp(pAP, pRad) {
++            if(SWL_BIT_IS_ONLY_SET(pAP->multiAPType, MULTIAP_BACKHAUL_BSS) &&
++               wld_ap_isEnabledWithRef(pAP)) {
++                pMainAP = pAP;
++                break;
++            }
++        }
++        if(pMainAP == NULL) {
++            pMainAP = wld_rad_getFirstEnabledVap(pRad);
++        }
+     }
+     if(pMainAP == NULL) {
+         pMainAP = wld_rad_getFirstVap(pRad);
+
+--- a/src/Plugin/wifiGen_fsm.c
++++ b/src/Plugin/wifiGen_fsm.c
+@@ -662,13 +662,18 @@ static bool s_doAddLink(T_AccessPoint* pAP, T_Radio* pRad)
+         s_schedNextAction(SECDMN_ACTION_OK_NEED_RESTART, pAP, pRad);
+     }
+
+     if(!wld_secDmn_hasAvailableCtrlIface(pRad->hostapd)) {
+-        SAH_TRACEZ_WARNING(ME, "%s: no conf added yet, falling back to full radio config add", pAP->alias);
+-        s_setApplyAction(pRad->fsmRad.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_ADD_HOSTAPD, GEN_FSM_ADD_LINK);
+-        s_clearRadLowerApplyActions(pRad, GEN_FSM_ADD_HOSTAPD);
+-        s_clearRadDynConfActions(pRad);
+-        return true;
++        if(wld_secDmn_hasReadyGlobalCtrlIface(pRad->hostapd)) {
++            SAH_TRACEZ_WARNING(ME, "%s: per-BSS ctrl ifaces not yet available, using global iface for incremental add",
++                               pAP->alias);
++        } else {
++            SAH_TRACEZ_WARNING(ME, "%s: no conf added yet, falling back to full radio config add", pAP->alias);
++            s_setApplyAction(pRad->fsmRad.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_ADD_HOSTAPD, GEN_FSM_ADD_LINK);
++            s_clearRadLowerApplyActions(pRad, GEN_FSM_ADD_HOSTAPD);
++            s_clearRadDynConfActions(pRad);
++            return true;
++        }
+     }
+
+     /**
+      * Adding an MLO BSS will fail if the primary BSS is non-MLO.
