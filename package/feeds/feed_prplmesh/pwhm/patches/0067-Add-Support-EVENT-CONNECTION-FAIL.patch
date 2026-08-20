@@ -1,0 +1,138 @@
+From 3d8f2a1c9e7b504321fedcba9876543210abcdef Tue Aug 18 11:22:01 2026
+From: Harini Pavithra Elangovan <helangov@qti.qualcomm.com>
+Date: Tue, 18 Aug 2026 11:22:01 +0530
+Subject: [PATCH] EasyMesh R6.1: Add CTRL-EVENT-CONNECTION-FAIL event support
+
+Signed-off-by: Harini Pavithra Elangovan <helangov@qti.qualcomm.com>
+
+---
+ include/wld/wld_wpaCtrl_events.h   | 15 ++++++++++
+ src/nl80211/wld_hostapd_cfgFile.c  |  2 ++
+ src/nl80211/wld_wpaCtrl_events.c   | 48 ++++++++++++++++++++++++++++++
+ src/Plugin/wifiGen_eventHandlers.c |  2 ++-
+ 4 files changed, 70 insertions(+), 1 deletion(-)
+
+diff --git a/include/wld/wld_wpaCtrl_events.h b/include/wld/wld_wpaCtrl_events.h
+--- a/include/wld/wld_wpaCtrl_events.h
++++ b/include/wld/wld_wpaCtrl_events.h
+@@ -148,6 +148,18 @@ typedef void (* wld_wpaCtrl_wpsCredReceivedMsg_f)(void* userData, char* ifName,
+ typedef void (* wld_wpaCtrl_wpsSetupLockedMsg_f)(void* userData, char* ifName, bool setupLocked);
+ typedef void (* wld_wpaCtrl_apStationEapCompletedCb_f)(void* userData, char* ifName, swl_macBin_t* bStationMac);
+ typedef void (* wld_wpaCtrl_apStationConnectivityCb_f)(void* userData, char* ifName, swl_macBin_t* bStationMac);
++/*
++ * @brief Callback for CTRL-EVENT-CONNECTION-FAIL (EasyMesh R6.1)
++ *
++ * Provides frame_type and frame_body for auth/assoc failures.
++ * statusCode is -1 when not present in the event.
++ * reasonCode is -1 when not present in the event.
++ * frameType and frameBody are NULL when not present in the event.
++ */
++typedef void (* wld_wpaCtrl_connFailCb_f)(void* userData, char* ifName,
++    swl_macBin_t* bStaMac, swl_macBin_t* bBssidMac,
++    int32_t statusCode, int32_t reasonCode,
++    const char* frameType, const char* frameBody);
+ typedef void (* wld_wpaCtrl_apStationAssocFailureCb_f)(void* userData, char* ifName, swl_macBin_t* bStationMac);
+ typedef void (* wld_wpaCtrl_wdsIfaceAddedCb_f)(void* userData, char* ifName, char* wdsName, swl_macBin_t* bStationMac);
+ typedef void (* wld_wpaCtrl_wdsIfaceRemovedCb_f)(void* userData, char* ifName, char* wdsName, swl_macBin_t* bStationMac);
+@@ -175,6 +187,11 @@ typedef struct {
+     wld_wpaCtrl_apStationEapCompletedCb_f fApStationEapCompletedCb;
+     wld_wpaCtrl_apStationConnectivityCb_f fApStationConnectedCb;
+     wld_wpaCtrl_apStationConnectivityCb_f fApStationDisconnectedCb;
++    /*
++     * EasyMesh R6.1: handler for CTRL-EVENT-CONNECTION-FAIL.
++     * Provides frame_type and frame_body for auth/assoc failures.
++     */
++    wld_wpaCtrl_connFailCb_f fConnFailCb;
+     wld_wpaCtrl_apStationAssocFailureCb_f fApStationAssocFailureCb;
+     wld_wpaCtrl_wdsIfaceAddedCb_f fWdsIfaceAddedCb;
+     wld_wpaCtrl_wdsIfaceRemovedCb_f fWdsIfaceRemovedCb;
+diff --git a/src/nl80211/wld_hostapd_cfgFile.c b/src/nl80211/wld_hostapd_cfgFile.c
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -1,5 +1,7 @@
+     //Temporarily disabled : triggering station disconnection
+     swl_mapChar_add(vapConfigMap, "#bss_transition", "1");
+     swl_mapChar_add(vapConfigMap, "notify_mgmt_frames", "1");
++    /* EasyMesh R6.1: enable CTRL-EVENT-CONNECTION-FAIL event reporting */
++    swl_mapChar_add(vapConfigMap, "report_connection_failures", "1");
+     if(pAP->transitionDisable != 0) {
+         swl_mapCharFmt_addValInt32(vapConfigMap, "transition_disable", pAP->transitionDisable);
+     }
+diff --git a/src/nl80211/wld_wpaCtrl_events.c b/src/nl80211/wld_wpaCtrl_events.c
+--- a/src/nl80211/wld_wpaCtrl_events.c
++++ b/src/nl80211/wld_wpaCtrl_events.c
+@@ -338,6 +338,55 @@ static void s_apStationAssocFailure(wld_wpaCtrlInterface_t* pInterface, char* ev
+     CALL_INTF(pInterface, fApStationAssocFailureCb, &bStationMac);
+ }
+ 
++/**
++ * @brief Parser for CTRL-EVENT-CONNECTION-FAIL (EasyMesh R6.1)
++ *
++ * Event format (hostapd v2.12+, requires report_connection_failures=1):
++ *   CTRL-EVENT-CONNECTION-FAIL addr=<sta_mac> bssid=<ap_mac>
++ *     status_code=<N> frame_type=<Authentication_frame|Association_frame>
++ *     frame_body=<hex_string>
++ */
++static void s_connFailEvent(wld_wpaCtrlInterface_t* pInterface, char* event, char* params) {
++    char addrBuf[SWL_MAC_CHAR_LEN] = {0};
++    char bssidBuf[SWL_MAC_CHAR_LEN] = {0};
++    swl_macBin_t bStaMac = SWL_MAC_BIN_NEW();
++    swl_macBin_t bBssidMac = SWL_MAC_BIN_NEW();
++    int32_t statusCode = -1;
++    int32_t reasonCode = -1;
++    char frameType[64] = {0};
++    char frameBody[4096] = {0};
++
++    SAH_TRACEZ_WARNING(ME, "%s: pwhm received wpaCtrlEvent: %s %s", pInterface->name, event, params);
++
++    /* addr= is mandatory */
++    ASSERT_TRUE(wld_wpaCtrl_getValueStr(params, "addr", addrBuf, sizeof(addrBuf)) > 0, ,
++                ME, "%s: missing addr in CTRL-EVENT-CONNECTION-FAIL", pInterface->name);
++    ASSERT_TRUE(swl_mac_charToBin(&bStaMac, (swl_macChar_t*) addrBuf), ,
++                ME, "%s: invalid addr MAC in CTRL-EVENT-CONNECTION-FAIL", pInterface->name);
++
++    /* All remaining fields are optional */
++    if(wld_wpaCtrl_getValueStr(params, "bssid", bssidBuf, sizeof(bssidBuf)) > 0) {
++        swl_mac_charToBin(&bBssidMac, (swl_macChar_t*) bssidBuf);
++    }
++    wld_wpaCtrl_getValueIntExt(params, "status_code", &statusCode);
++    wld_wpaCtrl_getValueIntExt(params, "reason_code", &reasonCode);
++    wld_wpaCtrl_getValueStr(params, "frame_type", frameType, sizeof(frameType));
++    wld_wpaCtrl_getValueStr(params, "frame_body", frameBody, sizeof(frameBody));
++
++    SAH_TRACEZ_WARNING(ME, "%s: CTRL-EVENT-CONNECTION-FAIL STA=%s BSSID=%s status=%d reason=%d frameType=%s frameBodyLen=%zu",
++                       pInterface->name,
++                       swl_typeMacBin_toBuf32Ref(&bStaMac).buf,
++                       swl_typeMacBin_toBuf32Ref(&bBssidMac).buf,
++                       statusCode, reasonCode,
++                       frameType[0] ? frameType : "N/A",
++                       strlen(frameBody));
++
++    /* Dispatch to fConnFailCb if registered by a vendor module */
++    CALL_INTF(pInterface, fConnFailCb, &bStaMac, &bBssidMac, statusCode, reasonCode,
++              frameType[0] ? frameType : NULL,
++              frameBody[0] ? frameBody : NULL);
++}
++
+ static void s_wdsStationInterfaceRemoved(wld_wpaCtrlInterface_t* pInterface, char* event, char* params) {
+ //Example: WDS-STA-INTERFACE-REMOVED ifname=wlan0.sta1 sta_addr=d6:ee:57:0d:f2:aa
+     char wdsIntfName[128] = {0};
+@@ -988,6 +1035,7 @@ SWL_TABLE(sWpaCtrlEvents,
+               {"AP-STA-POSSIBLE-PSK-MISMATCH", &s_apStationAssocFailure},
+               {"CTRL-EVENT-SAE-UNKNOWN-PASSWORD-IDENTIFIER", &s_apStationAssocFailure},
+               {"BSS-TM-RESP", &s_btmResponse},
++              {"CTRL-EVENT-CONNECTION-FAIL", &s_connFailEvent},
+               {"CTRL-EVENT-STARTED-CHANNEL-SWITCH", &s_chanSwitchStartedEvtCb},
+               {"CTRL-EVENT-CHANNEL-SWITCH", &s_chanSwitchEvtCb},
+               {"CTRL-EVENT-STARTED-LINK-CHANNEL-SWITCH", &s_chanSwitchStartedEvtCb},
+diff --git a/src/Plugin/wifiGen_eventHandlers.c b/src/Plugin/wifiGen_eventHandlers.c
+--- a/src/Plugin/wifiGen_eventHandlers.c
++++ b/src/Plugin/wifiGen_eventHandlers.c
+@@ -109,5 +109,6 @@ static const char* s_fwdIfaceStdWpaCtrlEventsList[] = {
+     "BEACON-REQ-TX-STATUS",
+     "BEACON-RESP-RX",
+     "ACL-DENY",
+-    "DPP-CHIRP-RX"
++    "DPP-CHIRP-RX",
++    "CTRL-EVENT-CONNECTION-FAIL"
+ };
