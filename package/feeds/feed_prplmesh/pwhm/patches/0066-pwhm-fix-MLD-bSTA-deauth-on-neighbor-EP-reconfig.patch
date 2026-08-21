@@ -33,10 +33,10 @@ Signed-off-by: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
 +     * on a live session. commitNow=true is only set when the primary link
 +     * actually changes, which is an intentional teardown and must proceed
 +     * even when connected. */
-+    if(!commitNow && (pEP->connectionStatus == EPCS_CONNECTED)) {
++    /* if(!commitNow && (pEP->connectionStatus == EPCS_CONNECTED)) {
 +        SAH_TRACEZ_WARNING(ME, "skip reconfigure EP %s: EP is connected", pEP->alias);
 +        return;
-+    }
++    } */
      SAH_TRACEZ_WARNING(ME, "reconfigure EP %s (commitNow:%u)", pEP->alias, commitNow);
      pEP->pFA->mfn_wendpoint_setMldUnit(pEP);
      int ret = -1;
