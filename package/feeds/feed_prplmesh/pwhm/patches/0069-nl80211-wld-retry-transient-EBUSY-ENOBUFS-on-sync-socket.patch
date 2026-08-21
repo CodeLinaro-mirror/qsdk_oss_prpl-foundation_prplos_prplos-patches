@@ -1,0 +1,99 @@
+From: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+Date: Thu, 20 Aug 2026
+Subject: [PATCH] nl80211: wld: retry transient EBUSY/ENOBUFS on sync socket
+
+Two changes to make nl80211 sync requests more resilient against
+transient kernel/netlink socket congestion:
+
+1. In the nl80211 error handler, treat EBUSY and ENOBUFS the same as
+   EOPNOTSUPP: map them to SWL_RC_NOT_AVAILABLE rather than SWL_RC_ERROR.
+   Both indicate a transient condition (concurrent dump in progress, or
+   reply backlog not yet drained) where the request itself is valid and
+   retrying is likely to succeed.
+
+2. Refactor s_sendMsgSync() to extract a single-attempt helper
+   s_sendMsgSyncOnce(), then wrap it in a bounded retry loop (up to
+   SYNC_REQUEST_MAX_RESENDS = 3 attempts) that retries only when
+   SWL_RC_NOT_AVAILABLE is returned. A 200ms back-off between attempts
+   gives the congested socket time to drain. Hard errors fall through
+   immediately without retrying.
+
+Signed-off-by: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+---
+ src/nl80211/wld_nl80211_core.c | 51 ++++++++++++++++++++++++++++++----
+ 1 file changed, 46 insertions(+), 5 deletions(-)
+
+--- a/src/nl80211/wld_nl80211_core.c
++++ b/src/nl80211/wld_nl80211_core.c
+@@ -511,6 +511,14 @@
+         if(errId == EOPNOTSUPP) {
+             //special error code when detecting unsupported command at execution time
+             rc = SWL_RC_NOT_AVAILABLE;
++        } else if((errId == EBUSY) || (errId == ENOBUFS)) {
++            /*
++             * kernel/netlink socket transiently congested (e.g. concurrent dump
++             * already in progress on this socket, or reply backlog not yet
++             * drained): the request itself is not invalid, retrying later may
++             * succeed, so do not report this as a hard/permanent error.
++             */
++            rc = SWL_RC_NOT_AVAILABLE;
+         }
+     }
+     return s_updateRequest(pReq, nlh, rc);
+@@ -1029,15 +1037,18 @@
+  *       Uses REQUEST_SYNC_TIMEOUT as the request timeout duration.
+  *       Polls using select() to wait for replies.
+  */
+-static swl_rc_ne s_sendMsgSync(wld_nl80211_state_t* state, struct nl_msg* msg, wld_nl80211_handler_f handler, void* priv) {
+-    SAH_TRACEZ_IN(ME);
++/*
++ * Max number of resend attempts when the kernel/socket reports the request's
++ * resources as transiently unavailable (SWL_RC_NOT_AVAILABLE, e.g. EBUSY/ENOBUFS
++ * from a congested sync socket). Bounded and small: this is meant to ride out a
++ * momentary dump-serialization clash on the shared sync socket, not to loop
++ * indefinitely on a request that is genuinely failing.
++ */
++#define SYNC_REQUEST_MAX_RESENDS 3
++
++static swl_rc_ne s_sendMsgSyncOnce(wld_nl80211_state_t* state, struct nl_sock* nlSock, int sockFd,
++                                   struct nl_msg* msg, wld_nl80211_handler_f handler, void* priv) {
+     uint32_t seqId = 0;
+-    struct nl_sock* nlSock = NULL;
+-    int sockFd = -1;
+-    if(s_isValidState(state)) {
+-        nlSock = state->nlSyncSock;
+-        sockFd = state->nlSyncSockFd;
+-    }
+     swl_rc_ne rc = s_sendMsg(state, nlSock, sockFd, msg, handler, priv, REQUEST_SYNC_TIMEOUT, &rc, &seqId);
+     ASSERT_EQUALS(rc, SWL_RC_OK, rc, ME, "Fail to send msg");
+
+@@ -1062,6 +1073,29 @@
+     if(rc >= SWL_RC_OK) {
+         rc = SWL_RC_OK;
+     }
++    return rc;
++}
++
++static swl_rc_ne s_sendMsgSync(wld_nl80211_state_t* state, struct nl_msg* msg, wld_nl80211_handler_f handler, void* priv) {
++    SAH_TRACEZ_IN(ME);
++    struct nl_sock* nlSock = NULL;
++    int sockFd = -1;
++    if(s_isValidState(state)) {
++        nlSock = state->nlSyncSock;
++        sockFd = state->nlSyncSockFd;
++    }
++    swl_rc_ne rc = SWL_RC_ERROR;
++    for(uint32_t attempt = 0; attempt <= SYNC_REQUEST_MAX_RESENDS; attempt++) {
++        rc = s_sendMsgSyncOnce(state, nlSock, sockFd, msg, handler, priv);
++        if(rc != SWL_RC_NOT_AVAILABLE) {
++            break;
++        }
++        SAH_TRACEZ_WARNING(ME, "request resources transiently unavailable (attempt %u/%u): resend",
++                           attempt + 1, SYNC_REQUEST_MAX_RESENDS);
++        //allow the congested sync socket to drain before resending
++        struct timeval backoff = {0, 200000};
++        select(0, NULL, NULL, NULL, &backoff);
++    }
+     SAH_TRACEZ_OUT(ME);
+     return rc;
+ }
