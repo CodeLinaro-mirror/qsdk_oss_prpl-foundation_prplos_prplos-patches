@@ -1,0 +1,64 @@
+From: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+Date: Mon, 25 Aug 2026
+Subject: [PATCH] pwhm: set uplink_csa and skip_cac unconditionally; add to wpa_supplicant config
+
+Two related changes:
+
+1. wld_hostapd_cfgFile.c: remove the conditional guard around uplink_csa
+   and skip_cac and set them unconditionally.
+
+   The previous condition (wld_rad_is_5ghz && wld_rad_hasConnectedEp) was
+   introduced to fix a regression where pRad->isSTA caused skip_cac=1 to
+   be written even when no backhaul connection existed, breaking DFS CAC.
+   uplink_csa and skip_cac are now required unconditionally to correctly
+   enable uplink CSA signalling and suppress redundant CAC on DFS channels
+   in all operating modes.
+
+2. wld_wpaSupp_cfgFile.c: add uplink_csa=1 to the wpa_supplicant global
+   config so the supplicant is also aware of the uplink CSA capability,
+   mirroring the hostapd-side setting.
+
+Signed-off-by: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+---
+ src/nl80211/wld_hostapd_cfgFile.c | 12 ++----------
+ src/nl80211/wld_wpaSupp_cfgFile.c |  2 ++
+ 2 files changed, 4 insertions(+), 10 deletions(-)
+
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -479,20 +479,10 @@
+         swl_mapCharFmt_addValInt32(radConfigMap, "ieee80211ax", enableRad11ax);
+     }
+
+-    /* uplink_csa and skip_cac are only relevant when the radio is operating as a
+-     * repeater with an active backhaul STA connection to a root AP.
+-     * pRad->isSTA is a configuration flag (set by STA_Mode in the data model) that
+-     * indicates STA mode is *configured*, not that the STA is currently connected.
+-     * Using pRad->isSTA here causes skip_cac=1 to be written for all 5GHz radios
+-     * with STA mode enabled, even when no backhaul connection exists.
+-     * This results in CAC being skipped (cac_time=0s) on DFS channels, causing
+-     * "Failed to set beacon parameters" -> AP disabled -> restart loop.
+-     * Fix: only set skip_cac=1 when the STA is actually connected. */
+-    if(wld_rad_is_5ghz(pRad) && wld_rad_hasConnectedEp(pRad)) {
+-        swl_mapCharFmt_addValInt32(radConfigMap, "uplink_csa", 1);
+-        swl_mapCharFmt_addValInt32(radConfigMap, "skip_cac", 1);
+-    }
+-
++    /* uplink_csa and skip_cac are always set unconditionally to enable
++     * uplink CSA signalling and suppress redundant CAC on DFS channels. */
++    swl_mapCharFmt_addValInt32(radConfigMap, "uplink_csa", 1);
++    swl_mapCharFmt_addValInt32(radConfigMap, "skip_cac", 1);
+     if(enableRad11ax) {
+         if(pChWId) {
+             if(pEhtChWId && (*pChWId != *pEhtChWId)) {
+
+--- a/src/nl80211/wld_wpaSupp_cfgFile.c
++++ b/src/nl80211/wld_wpaSupp_cfgFile.c
+@@ -171,6 +171,8 @@ static swl_rc_ne s_setWpaSuppGlobalConfig(T_EndPoint* pEP, wld_wpaSupp_config_t
+     swl_mapCharFmt_addValInt32(global, "ppe_vp", pRad->ppevpType);
+     SAH_TRACEZ_INFO(ME, "%s: PPEVP set ppe_vp = %u", pRad->Name, pRad->ppevpType);
+
++    swl_mapChar_add(global, "uplink_csa", "1");
++
+     return SWL_RC_OK;
+ }
