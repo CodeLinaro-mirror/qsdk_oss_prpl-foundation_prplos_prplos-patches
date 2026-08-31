@@ -62,3 +62,27 @@ Signed-off-by: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
 +
      return SWL_RC_OK;
  }
+
+--- a/src/Plugin/wifiGen_rad.c
++++ b/src/Plugin/wifiGen_rad.c
+@@ -111,7 +111,7 @@
+               {-1, 0},
+               ));
+
+-static const char* s_defaultRegDomain = "DE";
++static const char* s_defaultRegDomain = "US";
+
+ static void s_radScanStatusUpdateCb(wld_scanEvent_t* event);
+ static wld_event_callback_t s_radScanStatusCbContainer = {
+--- a/src/Plugin/wifiGen_fsm.c
++++ b/src/Plugin/wifiGen_fsm.c
+@@ -1345,6 +1345,9 @@
+     wifiGen_zwdfs_deinit(pRad);
+     wifiGen_zwdfs_init(pRad);
+     pRad->pFA->mfn_wrad_regdomain(pRad, NULL, 0, SET | DIRECT);
++    // refresh possible channels list (used e.g for wpa_supplicant freq_list)
++    // against the newly applied country code, instead of the stale one
++    pRad->pFA->mfn_wrad_poschans(pRad, NULL, 0);
+     return true;
+ }
+
