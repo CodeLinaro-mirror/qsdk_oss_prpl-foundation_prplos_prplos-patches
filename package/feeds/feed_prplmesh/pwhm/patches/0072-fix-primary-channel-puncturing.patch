@@ -1,0 +1,76 @@
+From cefb72c8ad75ce8f9b9de7927b57eeafe4717cb1 Mon Sep 17 00:00:00 2001
+From: Atchaya R <ratchaya@qti.qualcomm.com>
+Date: Tue, 1 Sep 2026 14:39:10 +0530
+Subject: [PATCH] pwhm: fix primary channel puncturing during bandwidth change
+
+If primary channel is punctured, its not applied, but if bandwidth
+change is attempted post that, primary channel puncturing bitmap is
+applied which is causing incomplete bandwidth change channel switch
+
+Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
+---
+ src/wld_radio.c | 41 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 41 insertions(+)
+
+diff --git a/src/wld_radio.c b/src/wld_radio.c
+index 4e15134..6702c83 100644
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -7244,6 +7244,37 @@ amxd_status_t wld_rad_validateDisabledSubChannels(T_Radio* pRad, swl_channel_t*
+         }
+     }
+ 
++    /* Determine the secondary 20MHz channel in the primary 40MHz pair.
++     * 802.11be prohibits puncturing both the primary 20MHz and the secondary 20MHz
++     * in the primary 40MHz pair (the channel adjacent to the primary in the 40MHz block).
++     *
++     * Use frequency-based calculation to correctly handle all bandwidths (80/160/320MHz)
++     * for both 5GHz and 6GHz.  wld_channel_getExtensionChannel() is unreliable for
++     * 320MHz, so derive sec_channel_offset directly from the center frequency:
++     *   (center_freq - primary_freq) % 40 == 30  →  secondary above  (offset = +1)
++     *   (center_freq - primary_freq) % 40 == 10  →  secondary below  (offset = -1) */
++    swl_chanspec_t primaryChspec = wld_rad_getSwlChanspec(pRad);
++    swl_channel_t secChannel = 0;
++    {
++        uint32_t primaryFreq = 0;
++        uint32_t centerFreq = 0;
++        swl_chanspec_t centerChspec = primaryChspec;
++        centerChspec.channel = swl_chanspec_getCentreChannel(&primaryChspec);
++        if((swl_chanspec_channelToMHz(&primaryChspec, &primaryFreq) == SWL_RC_OK) &&
++           (swl_chanspec_channelToMHz(&centerChspec, &centerFreq) == SWL_RC_OK) &&
++           (primaryFreq > 0) && (centerFreq > 0)) {
++            int diff = (int)((centerFreq - primaryFreq) % 40);
++            if(diff < 0) diff += 40;
++            if(diff == 30) {
++                /* Center is 30 MHz above primary in 40MHz alignment → secondary above */
++                secChannel = (swl_channel_t)(pRad->channel + 4);
++            } else if(diff == 10 && pRad->channel > 4) {
++                /* Center is 10 MHz above primary in 40MHz alignment → secondary below */
++                secChannel = (swl_channel_t)(pRad->channel - 4);
++            }
++        }
++    }
++
+     if(!nPunctChans) {
+         SAH_TRACEZ_INFO(ME, "%s: no DisabledSubChannels in (%s)", pRad->Name, punctChansStr);
+         status = amxd_status_ok;
+@@ -7252,6 +7283,16 @@ amxd_status_t wld_rad_validateDisabledSubChannels(T_Radio* pRad, swl_channel_t*
+         status = amxd_status_not_supported;
+     } else if(!wld_rad_isChannelSubset(pRad, (uint8_t*) pPunctChans, nPunctChans)) {
+         SAH_TRACEZ_ERROR(ME, "%s: DisabledSubChannels(%s) are not a subset of Possible Channels", pRad->Name, punctChansStr);
++    } else if(swl_typeUInt8_arrayContains(pPunctChans, nPunctChans, (swl_channel_t) pRad->channel)) {
++        /* 802.11be: puncturing the primary 20MHz channel is not allowed */
++        SAH_TRACEZ_ERROR(ME, "%s: DisabledSubChannels(%s) cannot include primary channel %d",
++                         pRad->Name, punctChansStr, pRad->channel);
++        status = amxd_status_invalid_value;
++    } else if(secChannel > 0 && swl_typeUInt8_arrayContains(pPunctChans, nPunctChans, secChannel)) {
++        /* 802.11be: puncturing the secondary 20MHz channel (primary 40MHz pair partner) is not allowed */
++        SAH_TRACEZ_ERROR(ME, "%s: DisabledSubChannels(%s) cannot include secondary channel %d (primary 40MHz pair)",
++                         pRad->Name, punctChansStr, secChannel);
++        status = amxd_status_invalid_value;
+     } else if(swl_chanspec_fetchBaseChanspecOfPunctChannels(pRad->operatingFrequencyBand, nPunctChans, pPunctChans, &baseChspec) < SWL_RC_OK) {
+         SAH_TRACEZ_ERROR(ME, "%s: DisabledSubChannels(%s) are not allowed", pRad->Name, punctChansStr);
+     } else if(!baseChspec.bandwidth || (baseChspec.bandwidth > pRad->maxChannelBandwidth)) {
+-- 
+2.34.1
+
