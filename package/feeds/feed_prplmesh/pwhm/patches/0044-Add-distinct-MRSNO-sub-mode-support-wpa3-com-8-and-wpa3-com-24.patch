@@ -119,9 +119,9 @@ Signed-off-by: Kartheek E <karte@qti.qualcomm.com>
  
 -        if(!is6g) { /* AKM:8 for RSNO1; not advertised on 6GHz */
 +        bool applyRsno1 = !is6g && (pAP->mrsnoSubMode != WLD_MRSNO_SUBMODE_COM_24);
-+        bool applyRsno2 = enableVap11be &&
++        bool applyRsno2 = (
 +                          ((!is6g && pAP->mrsnoSubMode != WLD_MRSNO_SUBMODE_COM_8) ||
-+                           (is6g && pAP->mrsnoSubMode == WLD_MRSNO_SUBMODE_COM_8_24));
++                           (is6g && pAP->mrsnoSubMode == WLD_MRSNO_SUBMODE_COM_8_24)));
 +
 +        if(applyRsno1) {
              s_checkAndSetParamValueStr(pAP->wpaCtrlInterface, vapConfigMap, "rsn_override_key_mgmt", "SAE");
