@@ -1,0 +1,25 @@
+From: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+Date: Mon, 25 Aug 2026
+Subject: [PATCH] pwhm: fix wifi8 interface up issue with mldunit=-1
+
+When a VAP has no MLD unit (mldunit=-1, non-MLO mode), hostapd needs
+both disable_11be=1 and disable_11bn=1 to correctly disable Wi-Fi 7
+(EHT) and Wi-Fi 8 (UHR/11bn) capabilities. Without disable_11bn=1,
+the VAP may attempt to advertise 11bn capabilities even when MLO is
+not configured, causing interface bring-up failures on wifi8 hardware.
+
+Signed-off-by: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+---
+ src/nl80211/wld_hostapd_cfgFile.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -1486,6 +1486,7 @@
+         } else {
+             /* if no MLO, then no 11BE */
+             swl_mapCharFmt_addValInt32(vapConfigMap, "disable_11be", 1);
++            swl_mapCharFmt_addValInt32(vapConfigMap, "disable_11bn", 1);
+             swl_mapCharFmt_addValInt32(vapConfigMap, "mld_ap", 0);
+             s_checkAndSetParamValueInt32(pAP->wpaCtrlInterface, vapConfigMap, "ttlm_enable", 0);
+             enableVap11be = false;
