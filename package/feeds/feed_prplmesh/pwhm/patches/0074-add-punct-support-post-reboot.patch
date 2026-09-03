@@ -1,0 +1,31 @@
+From 14fba8168785a9e3fd064ed55ad153a41868b7cc Mon Sep 17 00:00:00 2001
+From: Atchaya R <ratchaya@qti.qualcomm.com>
+Date: Thu, 3 Sep 2026 16:24:23 +0530
+Subject: [PATCH] pwhm: add check for punct bitmap after reboot to restore the
+ puncturing bitmap
+
+Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
+---
+ src/ChannelManagement/wld_chanmgt.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/ChannelManagement/wld_chanmgt.c b/src/ChannelManagement/wld_chanmgt.c
+index b453784..1b25238 100644
+--- a/src/ChannelManagement/wld_chanmgt.c
++++ b/src/ChannelManagement/wld_chanmgt.c
+@@ -703,6 +703,12 @@ swl_rc_ne wld_chanmgt_setTargetChanspec(T_Radio* pR, swl_chanspec_t chanspec, bo
+     if(!wld_rad_hasConnectedEp(pR) && (reason != CHAN_REASON_EP_MOVE)
+        && (reason != CHAN_REASON_PERSISTANCE)) {
+         s_adaptFronthaulTgtChanspec(pR, &tgtChanspec);
++    } else if((tgtChanspec.punctBitmap == 0) && (pR->nrDisabledSubChannels > 0)) {
++        /* PERSISTANCE reason skips s_adaptFronthaulTgtChanspec (to avoid BW reduction on boot),
++         * but user-configured static puncturing must still be applied.
++         * Build punctBitmap from disabledSubchannels so the conf file and CHAN_SWITCH
++         * include punct_bitmap on reboot. */
++        swl_chanspec_buildPunctBitmapFromPunctChannels(&tgtChanspec, pR->nrDisabledSubChannels, pR->disabledSubchannels, &tgtChanspec.punctBitmap);
+     }
+ 
+     const char* checkReason = s_isTargetChanspecValid(pR, tgtChanspec, &rc);
+-- 
+2.34.1
+
