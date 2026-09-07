@@ -1,0 +1,471 @@
+From: Kartheek E <karte@qti.qualcomm.com>
+Date: Mon, 8 Sep 2026
+Subject: [PATCH] pWHM: beacon WiFi 7 EHT IEs based on MLDUnitSetting behavior
+
+Introduce Radio.IEEE80211be.MLDUnitSetting (Required/NotRequired/Assumed)
+to control whether Wi-Fi 7 (EHT/MLD) beacon IEs are advertised when a VAP
+has no valid MLDUnit configured:
+ - Required: WiFi7 disabled (fallback to WiFi6) if MLDUnit is invalid
+ - NotRequired: EHT-only (no MLD IEs) if MLDUnit is invalid
+ - Assumed (default): full WiFi7/MLD assumed whenever the radio is
+   MLO-capable, even without an explicit MLDUnit
+
+Signed-off-by: Kartheek E <karte@qti.qualcomm.com>
+---
+ include/wld/wld.h                  |    2 +
+ include/wld/wld_radio.h            |   11 +++++
+ include/wld/wld_types.h            |   12 ++++++
+ odl/wld_radio.odl                  |   14 +++++++
+ src/Plugin/wifiGen_eventHandlers.c |    4 +-
+ src/Plugin/wifiGen_mld.c           |   16 ++++++--
+ src/Plugin/wifiGen_vap.c           |    2 -
+ src/nl80211/wld_hostapd_ap_api.c   |    3 +
+ src/nl80211/wld_hostapd_cfgFile.c  |   68 ++++++++++++++++++++++++++-----------
+ src/wld.c                          |    1 
+ src/wld_accesspoint.c              |   18 +++++----
+ src/wld_radio.c                    |   62 +++++++++++++++++++++++++++++++--
+ 12 files changed, 174 insertions(+), 39 deletions(-)
+
+--- a/include/wld/wld.h
++++ b/include/wld/wld.h
+@@ -1614,6 +1614,7 @@ struct WLD_RADIO {
+     swl_80211_hecap_phyCapInfo_t hePhyCapabilities;                         /* HE(High Efficiency) 802.11ax phy capabilities */
+     swl_80211_hecap_MCSCap_t heMcsCaps[SWL_80211_HECAP_MCS_CAP_ARRAY_SIZE]; /* The Supported HE-MCS and NSS Set */
+     swl_80211_ehtcap_phyCapInfo_t ehtPhyCapabilities;                       /* EHT(Extremely High Throughput) 802.11be capabilities*/
++    wld_rad_mld_unit_setting_e mldUnitSetting;                              /* Behavior when radio VAPs have invalid MLDUnit*/
+     wld_rifs_mode_e RIFSEnabled;
+     bool airtimeFairnessEnabled;                                            /* Enable airtime fairness feature */
+     bool intAirtimeSchedEnabled;                                            /* Enable intelligent airtime scheduling*/
+@@ -2059,6 +2060,7 @@ struct S_ACCESSPOINT {
+     int32_t savedMldUnit11ax; /* Saved SSID.mldUnit before Disable11ax=true; -1 means no saved value */
+     bool disable11ax;  /* disable_11ax=1 in hostapd BSS config */
+     bool disable11bn;  /* disable_11bn=1 in hostapd BSS config */
++    bool disable11be;  /* disable_11be=1 in hostapd BSS config */
+     bool qbssEnable;                /* QBSS Load feature enable flag */
+     uint32_t bssLoadUpdatePeriod;   /* BSS Load Update Period in TUs (only used when qbssEnable=true) */
+     uint32_t chanUtilAvgPeriod;     /* Channel Utilization Averaging Period in TUs (only used when qbssEnable=true) */
+--- a/include/wld/wld_radio.h
++++ b/include/wld/wld_radio.h
+@@ -256,6 +256,17 @@ bool wld_rad_hasUsableApMld(T_Radio* pRa
+ swl_rc_ne wld_rad_resetApMldLinks(T_Radio* pRad);
+ bool wld_rad_is11beUsable(T_Radio* pRad);
+ bool wld_rad_is11bnUsable(T_Radio* pRad);
++
++/**
++ * @Brief Returns true when a valid SSID.MLDUnits is required in order
++ * to enable Ieee80211.be on this Radio.
++ *
++ * @param pRad pointer to radio structure
++ *
++ * @return true if 'Valid MLDUnit' is required in order to enable 11be, false otherwise
++ */
++bool wld_rad_is11beMldUnitRequired(T_Radio* pRad);
++
+ bool wld_rad_hasIntfEnableSyncMissing(T_Radio* pRad);
+
+ uint32_t wld_rad_getFirstEnabledIfaceIndex(T_Radio* pRad);
+--- a/include/wld/wld_types.h
++++ b/include/wld/wld_types.h
+@@ -146,6 +146,18 @@ typedef enum {
+     FSM_MAX          /* Max value, not actually handled in FSM */
+ } FSM_STATE;
+
++/**
++ * @brief Radio behavior when SSID.MLDUnit is invalid,
++ * i.e. SSID.MLDUnit==(-1)
++ */
++typedef enum {
++    RAD_MLDUNIT_SETTING_REQUIRED,     /* WiFi7 is disabled; if invalid MLDUnit*/
++    RAD_MLDUNIT_SETTING_NOT_REQUIRED, /* WiFi7- EHT Only; if invalid MLDUnit*/
++    RAD_MLDUNIT_SETTING_ASSUMED,      /* WiFi7- full; even if invalid MLDUnit*/
++    RAD_MLDUNIT_SETTING_MAX,
++} wld_rad_mld_unit_setting_e;
++extern const char* wld_rad_mldUnitSetting_str[];
++
+ typedef struct wld_stats T_Stats;
+ typedef struct wld_stats {
+     uint64_t BytesSent;
+--- a/odl/wld_radio.odl
++++ b/odl/wld_radio.odl
+@@ -4109,6 +4109,20 @@ define probelist_t{
+ 				on action validate call check_range { min = 5, max = 50 };
+ 				default 5;
+ 			}
++
++			/**
++			 * Configuration pertaining to the WiFi7 behavior, with respect to available SSID.MLDUnit values
++			 * EHT-only means only EHT Capabilities and EHT Operation Information Elements are added to beacons
++			 * Full WiFi7 means both EHT and Multi-link IEs are added to beacons; WFA interpretation of WiFi7;
++			 * Expected Behaviors are:
++			 *  Required : WiFi6 if MLDUnit is not configured; Full WiFi7 if MLDUnit is configured;
++			 *  NotRequired : EHT-only if MLDUnit is not configured; Full WiFi7 if MLDUnit is configured;
++			 *  Assumed : Full WiFi7 if driver supports MLO; WiFi6 otherwise;
++			 */
++			%persistent string MLDUnitSetting {
++				on action validate call check_enum ["Required", "NotRequired", "Assumed"];
++				default "Assumed";
++			}
+ 		}
+  
+ 	} /* object Radio */
+--- a/src/nl80211/wld_hostapd_ap_api.c
++++ b/src/nl80211/wld_hostapd_ap_api.c
+@@ -307,6 +307,7 @@ SWL_TABLE(sHapdCfgParamsActionMap,
+               {"bss", SECDMN_ACTION_OK_NEED_RE_ADD_LINK},
+               {"mld_ap", SECDMN_ACTION_OK_NEED_RE_ADD_LINK},
+               {"disable_11be", SECDMN_ACTION_OK_NEED_RE_ADD_LINK},
++              {"mld_addr", SECDMN_ACTION_OK_NEED_RE_ADD_LINK},
+               //params set and applied with main iface toggle
+               {"wpa_group_rekey", SECDMN_ACTION_OK_NEED_TOGGLE},
+               {"wpa", SECDMN_ACTION_OK_NEED_TOGGLE},
+@@ -840,7 +841,7 @@ wld_secDmn_action_rc_ne wld_ap_hostapd_s
+     swl_mapChar_t* pNewVapParams = wld_hostapd_getConfigMapByBssid(pNewCfg, (swl_macBin_t*) pAP->pSSID->BSSID);
+     wld_secDmn_action_rc_ne action = SECDMN_ACTION_OK_DONE;
+     const char* params[] = {
+-        "interface", "bss", "mld_ap", "disable_11be",
++        "interface", "bss", "mld_ap", "disable_11be", "mld_addr",
+     };
+     s_setChangedMultiParams(pAP, pCurrVapParams, pNewVapParams,
+                             params, SWL_ARRAY_SIZE(params), &action);
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -1457,8 +1457,6 @@ static bool s_setVapCommonConfig(T_Acces
+         swl_mapChar_add(vapConfigMap, "qos_map_set", pAP->cfg11u.qosMapSet);
+     }
+
+-    bool enableRad11be = wld_rad_is11beUsable(pRad);
+-    bool enableVap11be = enableRad11be;
+     bool enableRad11ax = (wld_rad_checkEnabledRadStd(pRad, SWL_RADSTD_AX) ||
+                           wld_rad_checkEnabledRadStd(pRad, SWL_RADSTD_BE));
+     if(pAP->disable11ax && enableRad11ax) {
+@@ -1467,22 +1467,56 @@ static bool s_setVapCommonConfig(T_AccessPoint* pAP, swl_mapChar_t* vapConfigMap)
+-    if(enableRad11be && wld_rad_isMloCapable(pRad)) {
+-        if(wld_mld_isLinkUsable(pSSID->pMldLink)) {
+-            wld_mld_t* pMld = pSSID->pMldLink->pMld;
+-            /* AP MLD - Whether this AP is a part of an AP MLD
+-             * 0 = no (no MLO)
+-             * 1 = yes (MLO) */
+-            swl_mapCharFmt_addValInt32(vapConfigMap, "mld_ap", 1);
+-            swl_mapCharFmt_addValInt32(vapConfigMap, "disable_11be", 0);
+-            s_checkAndSetParamValueInt32(pAP->wpaCtrlInterface, vapConfigMap, "ttlm_enable", (pMld->tidLinkMapConfig.mode != TID_LINK_MAP_CONFIG_MODE_DISABLED));
+-            T_SSID* linkIfSSID = wld_ssid_getSsidByIfName(linkIfName);
+-            swl_macBin_t* linkIfMac = linkIfSSID ? (swl_macBin_t*) linkIfSSID->MACAddress : NULL;
+-            if(!swl_mac_binIsNull(linkIfMac)) {
+-                s_checkAndSetParamValueStr(pAP->wpaCtrlInterface, vapConfigMap, "mld_addr", swl_typeMacBin_toBuf32Ref(linkIfMac).buf);
+-            }
+-        } else {
+-            /* if no MLO, then no 11BE */
+-            swl_mapCharFmt_addValInt32(vapConfigMap, "disable_11be", 1);
+-            swl_mapCharFmt_addValInt32(vapConfigMap, "mld_ap", 0);
+-            s_checkAndSetParamValueInt32(pAP->wpaCtrlInterface, vapConfigMap, "ttlm_enable", 0);
+-            enableVap11be = false;
+-        }
+-    }
++    bool enableRad11beConfig = wld_rad_is11beUsable(pRad);
++    bool enableVap11be = enableRad11beConfig && !wld_rad_is11beMldUnitRequired(pRad);
++
++    if(enableRad11beConfig) {
++        if(wld_mld_isLinkUsable(pSSID->pMldLink) ||
++           ((pRad->mldUnitSetting == RAD_MLDUNIT_SETTING_ASSUMED) &&
++            (wld_rad_isMloCapable(pRad)) &&
++            (wld_mld_countNeighEnabledLinks(pAP->pSSID->pMldLink) <= 1))) {
++
++            /* AP MLD - Whether this AP is a part of an AP MLD
++             * 0 = no (no MLO)
++             * 1 = yes (MLO) */
++            if(pAP->disable11be) {
++                swl_mapCharFmt_addValInt32(vapConfigMap, "mld_ap", 0);
++                swl_mapCharFmt_addValInt32(vapConfigMap, "disable_11be", 1);
++                swl_mapCharFmt_addValInt32(vapConfigMap, "disable_11bn", 1);
++                enableVap11be = false;
++                s_checkAndSetParamValueInt32(pAP->wpaCtrlInterface, vapConfigMap, "ttlm_enable", 0);
++            } else {
++                swl_mapCharFmt_addValInt32(vapConfigMap, "mld_ap", 1);
++                swl_mapCharFmt_addValInt32(vapConfigMap, "disable_11be", 0);
++                if(pAP->disable11bn) {
++                    swl_mapCharFmt_addValInt32(vapConfigMap, "disable_11bn", 1);
++                } else {
++                    swl_mapCharFmt_addValInt32(vapConfigMap, "disable_11bn", 0);
++                }
++
++                if((pSSID->pMldLink != NULL) && (pSSID->pMldLink->pMld != NULL)) {
++                    wld_mld_t* pMld = pSSID->pMldLink->pMld;
++                    s_checkAndSetParamValueInt32(pAP->wpaCtrlInterface, vapConfigMap, "ttlm_enable", (pMld->tidLinkMapConfig.mode != TID_LINK_MAP_CONFIG_MODE_DISABLED));
++                }
++                T_SSID* linkIfSSID = wld_ssid_getSsidByIfName(linkIfName);
++                swl_macBin_t* linkIfMac = NULL;
++                if(wld_mld_isLinkUsable(pSSID->pMldLink) && (linkIfSSID != NULL)) {
++                    linkIfMac = (swl_macBin_t*) linkIfSSID->MACAddress;
++                }
++
++                if((linkIfMac != NULL) && !swl_mac_binIsNull(linkIfMac)) {
++                    s_checkAndSetParamValueStr(pAP->wpaCtrlInterface, vapConfigMap, "mld_addr", swl_typeMacBin_toBuf32Ref(linkIfMac).buf);
++                }
++                enableVap11be = true;
++            }
++        } else {
++            /* if no MLO, then no 11BE */
++            int32_t disable_11be = (pAP->disable11be || (pRad->mldUnitSetting == RAD_MLDUNIT_SETTING_NOT_REQUIRED)) ? 0 : 1;
++
++            swl_mapCharFmt_addValInt32(vapConfigMap, "disable_11be", disable_11be);
++            swl_mapCharFmt_addValInt32(vapConfigMap, "disable_11bn", disable_11be);
++            enableVap11be = !disable_11be;
++            if(wld_rad_isMloCapable(pRad)) {
++                // do not explicitly set mld_ap if no MLO support
++                swl_mapCharFmt_addValInt32(vapConfigMap, "mld_ap", 0);
++            }
++            s_checkAndSetParamValueInt32(pAP->wpaCtrlInterface, vapConfigMap, "ttlm_enable", 0);
++        }
++    }
+--- a/src/Plugin/wifiGen_eventHandlers.c
++++ b/src/Plugin/wifiGen_eventHandlers.c
+@@ -1763,10 +1763,10 @@ static void s_handleAssocMsgAffiliatedSt
+
+     wld_affiliatedSta_t* afSta = wld_ad_getOrAddAffiliatedSta(pAD, pAP);
+     ASSERT_NOT_NULL(afSta, , ME, "%s: create affiliatedSta (linkId:%u,mac:%s) failed for sta(%s)!", pAP->alias,
+-                    wld_mld_getLinkId(pAP->pSSID->pMldLink), swl_typeMacBin_toBuf32Ref(mac).buf,
++                    wld_ssid_getMLDLinkID(pAP->pSSID), swl_typeMacBin_toBuf32Ref(mac).buf,
+                     pAD->Name);
+     afSta->mac = *mac;
+-    afSta->linkId = wld_mld_getLinkId(pAP->pSSID->pMldLink);
++    afSta->linkId = wld_ssid_getMLDLinkID(pAP->pSSID);
+     afSta->lastDataDownlinkRate = pWirelessDevIE->maxDownlinkRateSupported;
+     afSta->lastDataUplinkRate = pWirelessDevIE->maxUplinkRateSupported;
+     wld_ad_activateAfSta(pAD, afSta);
+--- a/src/Plugin/wifiGen_mld.c
++++ b/src/Plugin/wifiGen_mld.c
+@@ -140,6 +140,11 @@ static T_SSID* s_fetchLinkSSID(const cha
+     T_SSID* pSSID = wld_ssid_getSsidByIfName(mldIface);
+     ASSERT_NOT_NULL(pSSID, NULL, ME, "no ssid is matching iface(%s) linkId(%d) of sock(%s)",
+                     mldIface, linkId, sockName);
++
++    T_Radio* pRad = pSSID->RADIO_PARENT;
++    ASSERT_NOT_NULL(pRad, NULL, ME, "no radio mapped to iface(%s) linkId(%d) of sock(%s)",
++                    mldIface, linkId, sockName);
++
+     if(linkId < 0) {
+         ASSERTI_FALSE(wld_mld_isLinkEnabled(pSSID->pMldLink), NULL,
+                       ME, "skip sock(%s): wait for mld link socket for ssid %s", sockName, pSSID->Name);
+@@ -147,8 +152,12 @@ static T_SSID* s_fetchLinkSSID(const cha
+                         mldIface, linkId, sockName, pSSID->Name);
+         return pSSID;
+     }
+-    ASSERT_TRUE(pSSID->mldUnit >= 0, NULL, ME, "iface(%s) linkId(%d) sock(%s) => ssid(%s) is not mld member",
+-                mldIface, linkId, sockName, pSSID->Name);
++
++    if(wld_rad_is11beMldUnitRequired(pRad)) {
++        ASSERT_TRUE(pSSID->mldUnit >= 0, NULL, ME, "iface(%s) linkId(%d) sock(%s) => ssid(%s) is not mld member",
++                    mldIface, linkId, sockName, pSSID->Name);
++    }
++
+     if(((pSSID = s_fetchLinkSSIDWithNl80211(mldIface, linkId)) != NULL) ||
+        ((pSSID = s_fetchLinkSSIDWithWpaCtrl(mldIface, linkId, sockName)) != NULL)) {
+         return pSSID;
+@@ -157,7 +166,6 @@ static T_SSID* s_fetchLinkSSID(const cha
+     return NULL;
+ }
+
+-
+ T_SSID* wifiGen_mld_fetchSockLinkSSID(wld_wpaCtrlMngr_t* pMgr, const char* sockName) {
+     ASSERT_STR(sockName, NULL, ME, "empty socket name");
+     const char* refIface = wld_wpaCtrlInterface_getName(wld_wpaCtrlMngr_getFirstInterface(pMgr));
+@@ -187,7 +195,7 @@ T_SSID* wifiGen_mld_fetchSockLinkSSID(wl
+     if((pMgr == wld_wpaCtrlInterface_getMgr(wld_ssid_getWpaCtrlIface(pLinkSSID))) &&
+        ((pLinkSSID->pMldLink == NULL) ||
+         (wld_mld_isLinkConfigured(pLinkSSID->pMldLink) &&
+-         (wld_mld_getLinkId(pLinkSSID->pMldLink) != linkId)))) {
++         (wld_ssid_getMLDLinkID(pLinkSSID) != linkId)))) {
+         SAH_TRACEZ_INFO(ME, "%s: saving MLD info (mldIface:%s) (linkId:%d)", pLinkSSID->Name, mldIface, linkId);
+         wld_ssid_setMLDLinkID(pLinkSSID, linkId);
+         swl_mlo_role_e mldRole;
+--- a/src/Plugin/wifiGen_vap.c
++++ b/src/Plugin/wifiGen_vap.c
+@@ -302,7 +302,7 @@ static uint32_t s_getNetlinkAllStaInfo(T
+         T_AssociatedDevice* pAD = NULL;
+         wld_nl80211_stationInfo_t* pStationInfo = &pAllStaInfo[id];
+         if((pStationInfo->nrLinks <= 1) ||
+-           ((pStationInfo->linkId >= 0) && (wld_mld_getLinkId(pAP->pSSID->pMldLink) == pStationInfo->linkId)) ||
++           ((pStationInfo->linkId >= 0) && (wld_ssid_getMLDLinkID(pAP->pSSID) == pStationInfo->linkId)) ||
+            ((pStationInfo->linkId < 0) && (wld_ap_hostapd_isMainStaMldLink(pAP, &pStationInfo->macAddr)))) {
+             pAD = wld_vap_findOrCreateAssociatedDevice(pAP, &pStationInfo->macAddr);
+         } else {
+--- a/src/wld.c
++++ b/src/wld.c
+@@ -445,6 +445,7 @@ T_Radio* wld_createRadio(const char* nam
+     pR->bgdfs_config.enable = false;
+     pR->bgdfs_config.channel = 0;
+     pR->autoBwSelectMode = BW_SELECT_MODE_DEFAULT;
++    pR->mldUnitSetting = RAD_MLDUNIT_SETTING_ASSUMED;
+
+     /* Update our RO driver parameters in this T_Radio structure */
+     pR->pFA->mfn_wrad_supports(pR, NULL, 0);
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -131,6 +131,10 @@ const char* Rad_SupGI[] = {"Auto", "400n
+
+ const char* wld_rad_autoBwSelectMode_str[] = {"MaxAvailable", "MaxCleared", "Default", NULL};
+
++const char* wld_rad_mldUnitSetting_str[] = {"Required", "NotRequired", "Assumed"};
++SWL_ASSERT_STATIC(SWL_ARRAY_SIZE(wld_rad_mldUnitSetting_str) == RAD_MLDUNIT_SETTING_MAX,
++                  "wld_rad_mldUnitSetting_str not correctly defined");
++
+ const char* cstr_chanmgt_rad_state[CM_RAD_MAX + 1] = {
+     "Unknown",
+     "Down",
+@@ -5225,18 +5229,31 @@ bool wld_rad_hasMloSupport(T_Radio* pRad
+     return (wld_rad_isMloCapable(pRad) && wld_rad_checkEnabledRadStd(pRad, SWL_RADSTD_BE));
+ }
+
++bool wld_rad_is11beMldUnitRequired(T_Radio* pRad) {
++    ASSERTS_NOT_NULL(pRad, false, ME, "NULL");
++    return pRad->mldUnitSetting == RAD_MLDUNIT_SETTING_REQUIRED;
++}
++
+ /*
+  * returns whether 11BE can be used on radio:
+  * 0) 11be connection established on backhaul
++ *  OR
+  * 1) 11be operating standard supported and enabled on fronthaul
+- * 1.0) MLO not supported
+- * 1.1) or rad has at least 1 usable APMLD link (shared mldunit, ssid, secConf ...)
++ *    AND
++ *       1.0) MLO not supported
++ *       OR
++ *       1.1) MLDUnit not required for 11be
++ *       OR
++ *       1.2) has at least 1 usable APMLD link (shared mldunit, ssid, secConf ...)
++ *            implies MLO is supported
+  */
+ bool wld_rad_is11beUsable(T_Radio* pRad) {
+     ASSERTS_NOT_NULL(pRad, false, ME, "NULL");
+     if(wld_rad_hasConnectedEpWithRadStd(pRad, SWL_RADSTD_BE) ||
+        (wld_rad_checkEnabledRadStd(pRad, SWL_RADSTD_BE) &&
+-        (!wld_rad_isMloCapable(pRad) || wld_rad_hasUsableApMld(pRad, 1)))) {
++        (!wld_rad_isMloCapable(pRad) ||
++         !wld_rad_is11beMldUnitRequired(pRad) ||
++         wld_rad_hasUsableApMld(pRad, 1)))) {
+         return true;
+     }
+     return false;
+@@ -6903,9 +6920,46 @@ static void s_setMLReconfigurationCount_
+     pRad->mLReconfigurationCount = mLReconfigurationCount;
+ }
+ 
++/**
++ * Callback invoked for events "*" on Radio.IEEE80211be.MLDUnitSeting
++ * if new value is valid and different from current value, trigger appropriate reconfiguration
++ *
++ * @param object - datamodel object Radio.i.IEEE80211be; parent_of(object) == radio instance
++ * @param newValue - amxc variant holding new value of MLDUnitSetting child field of IEEE80211be, in string representation
++ */
++static void s_setMLDUnitSetting_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++    T_Radio* pR = wld_rad_fromObj(amxd_object_get_parent(object));
++    ASSERT_NOT_NULL(pR, , ME, "NULL");
++
++    const char* newValStr = GET_CHAR(newValue, NULL);
++
++    wld_rad_mld_unit_setting_e newVal = swl_conv_charToEnum(newValStr, wld_rad_mldUnitSetting_str, RAD_MLDUNIT_SETTING_MAX, RAD_MLDUNIT_SETTING_MAX);
++
++    ASSERT_TRUE((newVal < RAD_MLDUNIT_SETTING_MAX), , ME, "Invalid value");
++
++    SAH_TRACEZ_INFO(ME, "%s: MLDUnitSetting oldValue:[%s] newValue:[%s]",
++                    pR->Name, wld_rad_mldUnitSetting_str[pR->mldUnitSetting],
++                    wld_rad_mldUnitSetting_str[newVal]);
++
++    if(pR->mldUnitSetting != newVal) {
++        pR->mldUnitSetting = newVal;
++        wld_rad_doSync(pR);
++        wld_rad_setAllMldLinksUnconfigured(pR);
++    }
++}
++
+ SWLA_DM_HDLRS(sRadio11beDmHdlrs,
+-              ARR(SWLA_DM_PARAM_HDLR("MLReconfigurationCount", s_setMLReconfigurationCount_pwf)));
++              ARR(SWLA_DM_PARAM_HDLR("MLReconfigurationCount", s_setMLReconfigurationCount_pwf),
++                  SWLA_DM_PARAM_HDLR("MLDUnitSetting", s_setMLDUnitSetting_pwf)));
+ 
++/**
++ * Callback invoked for events "*" on Radio.IEEE802.11be subtree
++ *
++ * @param sig_name signal name
++ * @param data event data including the altered object (and eventually list of changed parameters)
++ * @param priv private user data
++ */
+ void _wld_rad_11be_setConf_ocf(const char* const sigName,
+                                const amxc_var_t* const data,
+                                void* const priv) {
+--- a/src/wld_accesspoint.c
++++ b/src/wld_accesspoint.c
+@@ -1527,6 +1527,7 @@ static void s_setDisable11be_pwf(void* p
+     ASSERT_NOT_NULL(pAP, , ME, "INVALID");
+
+     bool disable = amxc_var_dyncast(bool, newValue);
++    pAP->disable11be = disable;
+
+     if(!pAP->pSSID) {
+         SAH_TRACEZ_ERROR(ME, "%s: pSSID is NULL - cannot change MLDUnit", pAP->alias);
+@@ -1552,11 +1553,11 @@ static void s_setDisable11be_pwf(void* p
+              * before the reboot - do not overwrite it. */
+             SAH_TRACEZ_INFO(ME, "%s: Disable11be=1 on-boot: SavedMLDUnit11be=%d persisted",
+                             pAP->alias, savedInDM);
+-            if(pAP->pSSID->mldUnit >= 0) {
++            if(pAP->pSSID->mldUnit >= 0 || pAP->pRadio->mldUnitSetting == RAD_MLDUNIT_SETTING_ASSUMED) {
+                 amxd_trans_t trans;
+                 ASSERT_TRANSACTION_INIT(pAP->pSSID->pBus, &trans, , ME,
+                                         "%s: trans init failed", pAP->alias);
+-                amxd_trans_set_value(int32_t, &trans, "MLDUnit", -1);
++                amxd_trans_set_value(int32_t, &trans, "MLDUnit", -3);
+                 ASSERT_TRANSACTION_LOCAL_DM_END(&trans, , ME,
+                                                 "%s: trans failed MLDUnit=-1", pAP->alias);
+             }
+@@ -1574,11 +1575,11 @@ static void s_setDisable11be_pwf(void* p
+         ASSERT_TRANSACTION_LOCAL_DM_END(&apTrans, , ME,
+                                         "%s: AP trans failed SavedMLDUnit11be=%d",
+                                         pAP->alias, curMldUnit);
+-        if(curMldUnit >= 0) {
++        if(curMldUnit >= 0 || pAP->pRadio->mldUnitSetting == RAD_MLDUNIT_SETTING_ASSUMED) {
+             amxd_trans_t ssiTrans;
+             ASSERT_TRANSACTION_INIT(pAP->pSSID->pBus, &ssiTrans, , ME,
+                                     "%s: SSID trans init failed", pAP->alias);
+-            amxd_trans_set_value(int32_t, &ssiTrans, "MLDUnit", -1);
++            amxd_trans_set_value(int32_t, &ssiTrans, "MLDUnit", -3);
+             ASSERT_TRANSACTION_LOCAL_DM_END(&ssiTrans, , ME,
+                                             "%s: SSID trans failed MLDUnit=-1", pAP->alias);
+         }
+@@ -1619,6 +1620,7 @@ static void s_setDisable11ax_pwf(void* p
+     ASSERT_NOT_NULL(pAP, , ME, "INVALID");
+
+     bool disable = amxc_var_dyncast(bool, newValue);
++    pAP->disable11ax = disable;
+
+     if(!pAP->pSSID) {
+         SAH_TRACEZ_ERROR(ME, "%s: pSSID is NULL - cannot change MLDUnit", pAP->alias);
+@@ -1650,11 +1652,11 @@ static void s_setDisable11ax_pwf(void* p
+         if(savedInDM != -2) {
+             SAH_TRACEZ_INFO(ME, "%s: Disable11ax=1 on-boot: SavedMLDUnit11ax=%d persisted",
+                             pAP->alias, savedInDM);
+-            if(pAP->pSSID->mldUnit >= 0) {
++            if(pAP->pSSID->mldUnit >= 0) {
+                 amxd_trans_t trans;
+                 ASSERT_TRANSACTION_INIT(pAP->pSSID->pBus, &trans, , ME,
+                                         "%s: trans init failed", pAP->alias);
+-                amxd_trans_set_value(int32_t, &trans, "MLDUnit", -1);
++                amxd_trans_set_value(int32_t, &trans, "MLDUnit", -3);
+                 ASSERT_TRANSACTION_LOCAL_DM_END(&trans, , ME,
+                                                 "%s: trans failed MLDUnit=-1", pAP->alias);
+             } else {
+@@ -1673,11 +1675,11 @@ static void s_setDisable11ax_pwf(void* p
+         ASSERT_TRANSACTION_LOCAL_DM_END(&apTrans, , ME,
+                                         "%s: AP trans failed SavedMLDUnit11ax=%d",
+                                         pAP->alias, curMldUnit);
+-        if(curMldUnit >= 0) {
++        if(curMldUnit >= 0) {
+             amxd_trans_t ssiTrans;
+             ASSERT_TRANSACTION_INIT(pAP->pSSID->pBus, &ssiTrans, , ME,
+                                     "%s: SSID trans init failed", pAP->alias);
+-            amxd_trans_set_value(int32_t, &ssiTrans, "MLDUnit", -1);
++            amxd_trans_set_value(int32_t, &ssiTrans, "MLDUnit", -3);
+             ASSERT_TRANSACTION_LOCAL_DM_END(&ssiTrans, , ME,
+                                             "%s: SSID trans failed MLDUnit=-1", pAP->alias);
+         } else {
