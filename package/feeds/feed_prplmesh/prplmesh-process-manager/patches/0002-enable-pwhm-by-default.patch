@@ -1,0 +1,23 @@
+From a4b1e3f8a44781d60971d83947a1912851464254 Mon Sep 17 00:00:00 2001
+From: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+Date: Mon, 7 Sep 2026 14:27:20 +0530
+Subject: [PATCH] pwhm: Enable pwhm during boot
+
+During reboot, AMX ODL persistence and PCM files were sharing the same storage path (/etc/config/prplmesh-process-manager).
+The presence of pcm/prplmesh-process-manager-del.json caused AMX to treat the persistence store asnon-empty and skip applying 00_services_defaults.odl,
+resulting in PWHM.Enable being restored as false. Consequently, prplmesh_whm was not started after reboot.
+
+Signed-off-by: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+---
+diff --git a/odl/prplmesh-process-manager.odl.in b/odl/prplmesh-process-manager.odl.in
+index 07bbd76..28a770e 100644
+--- a/odl/prplmesh-process-manager.odl.in
++++ b/odl/prplmesh-process-manager.odl.in
+@@ -24,6 +24,7 @@
+     dm-events-before-start = true;
+ 
+     odl = {
++        directory = "${storage-path}/odl",
+         dm-defaults = "defaults.d/",
+         dm-load = true,
+         dm-save = true,
