@@ -1,0 +1,459 @@
+From: Sandeep Tomer <stomer@qti.qualcomm.com>
+Date: 16 Sep 2026 16:00:00 +0530
+Subject: [PATCH] pwhm: add prplMesh DPP command, event, and BSS support
+
+Expose the DPP wpa_ctrl operations needed by the prplMesh WHM adapter,
+forward DPP credential/status events, and replay DPP credentials in the
+per-BSS hostapd configuration.
+
+Signed-off-by: Sandeep Tomer <stomer@qti.qualcomm.com>
+---
+ 8 files changed
+--- a/odl/wld_endpoint.odl
++++ b/odl/wld_endpoint.odl
+@@ -823,6 +823,23 @@
+ 
+ 			/** Triggers a chirp message to start authentication */
+-			bool chirp(%in uint32 id);
++			bool chirp(%in uint32 id, %in string netrole, %in uint32 iterations);
++
++			/** Generates bootstrap info for prplMesh and returns "id=<id>\nuri=<uri>". */
++			string dpp_bootstrap_gen_info(%in string curve, %in uint32 chan,
++			                              %in uint32 operatingclass, %in string key);
++
++			/** Sets an extra DPP configuration request field in wpa_supplicant. */
++			bool setDppExtraConfReq(%in string name, %in string value);
++
++			/** Lists the configured wpa_supplicant networks for DPP recovery. */
++			string listDppNetworks();
++
++			/** Reads a supported DPP value from a configured network. */
++			string getDppNetworkValue(%in uint32 id, %in string field);
++
++			/** Reads the global 1905 DPP connector. */
++			string getDpp1905Connector();
++
+ 		}
+ 		
+ 		/**
+--- a/odl/wld_accesspoint.odl
++++ b/odl/wld_accesspoint.odl
+@@ -1063,6 +1063,12 @@
+ 				default "QR";
+ 				on action validate call check_enum ["QR", "PKEX", "NFC"];
+ 			}
++			/** DPP connector installed for this BSS. */
++			%persistent string Connector;
++			/** DPP C-sign-key installed for this BSS. */
++			%persistent string CSign;
++			/** DPP network-access key installed for this BSS. */
++			%persistent string NetAccessKey;
+ 
+ 			/**
+ 			 * configureDPP 
+--- a/src/wld_endpoint.c
++++ b/src/wld_endpoint.c
+@@ -2789,11 +2789,19 @@ amxd_status_t _chirp(amxd_object_t* obj,
+ 
+     uint32_t id = GET_UINT32(args, "id");
+-    char cmd[128] = {0};
++    const char* netrole = GET_CHAR(args, "netrole");
++    uint32_t iterations = GET_UINT32(args, "iterations");
++    char cmd[256] = {0};
+     
+-    snprintf(cmd, sizeof(cmd), "DPP_CHIRP own=%u", id);
++    int len = snprintf(cmd, sizeof(cmd), "DPP_CHIRP own=%u", id);
++    if(iterations > 0) {
++        len += snprintf(cmd + len, sizeof(cmd) - len, " iter=%u", iterations);
++    }
++    if(!swl_str_isEmpty(netrole)) {
++        snprintf(cmd + len, sizeof(cmd) - len, " netrole=%s", netrole);
++    }
+     bool bRet = wld_wpaCtrl_sendCmdCheckResponse(pEP->wpaCtrlInterface, cmd, "OK");
+     if (!bRet) {
+         SAH_TRACEZ_ERROR(ME, "DPP_CHIRP failed");
+         amxc_var_set(bool, retMap, false);
+         return amxd_status_unknown_error;
+     }
+@@ -3069,6 +3069,140 @@
+    return amxd_status_ok;
+ }
+ 
++static bool s_dppCtrlReady(T_EndPoint* pEP) {
++    return (pEP != NULL) && wld_wpaCtrlInterface_isReady(pEP->wpaCtrlInterface);
++}
++
++amxd_status_t _dpp_bootstrap_gen_info(amxd_object_t* obj,
++                                       amxd_function_t* func _UNUSED,
++                                       amxc_var_t* args,
++                                       amxc_var_t* retMap) {
++    T_EndPoint* pEP = wld_ep_fromObj(amxd_object_get_parent(obj));
++    ASSERTS_TRUE(s_dppCtrlReady(pEP), amxd_status_not_supported, ME,
++                 "DPP wpa_ctrl is not ready");
++
++    const char* curve = GET_CHAR(args, "curve");
++    uint32_t chan = GET_UINT32(args, "chan");
++    uint32_t operatingclass = GET_UINT32(args, "operatingclass");
++    const char* key = GET_CHAR(args, "key");
++
++    if(swl_str_isEmpty(curve)) {
++        curve = "P-256";
++    }
++
++    char cmd[1024] = {0};
++    char idReply[64] = {0};
++    int len = snprintf(cmd, sizeof(cmd), "DPP_BOOTSTRAP_GEN type=qrcode curve=%s", curve);
++    if((chan != 0) && (operatingclass != 0)) {
++        len += snprintf(cmd + len, sizeof(cmd) - len, " chan=%u/%u", operatingclass, chan);
++    }
++    if(!swl_str_isEmpty(key)) {
++        snprintf(cmd + len, sizeof(cmd) - len, " key=%s", key);
++    }
++
++    swl_rc_ne ret = wld_wpaCtrl_sendCmdFmtGetResponse(pEP->wpaCtrlInterface, idReply,
++                                                      sizeof(idReply), "%s", cmd);
++    if((ret != SWL_RC_OK) || swl_str_isEmpty(idReply) || swl_str_matches(idReply, "FAIL")) {
++        SAH_TRACEZ_ERROR(ME, "DPP_BOOTSTRAP_GEN failed");
++        return amxd_status_unknown_error;
++    }
++
++    uint32_t id = atoi(idReply);
++    if(id == 0) {
++        SAH_TRACEZ_ERROR(ME, "DPP_BOOTSTRAP_GEN returned invalid id: %s", idReply);
++        return amxd_status_unknown_error;
++    }
++
++    char uriReply[1024] = {0};
++    snprintf(cmd, sizeof(cmd), "DPP_BOOTSTRAP_GET_URI %u", id);
++    ret = wld_wpaCtrl_sendCmdFmtGetResponse(pEP->wpaCtrlInterface, uriReply,
++                                            sizeof(uriReply), "%s", cmd);
++    if((ret != SWL_RC_OK) || swl_str_isEmpty(uriReply) || swl_str_matches(uriReply, "FAIL")) {
++        SAH_TRACEZ_ERROR(ME, "DPP_BOOTSTRAP_GET_URI failed");
++        return amxd_status_unknown_error;
++    }
++
++    char result[1200] = {0};
++    snprintf(result, sizeof(result), "id=%u\nuri=%s", id, uriReply);
++    amxc_var_set(cstring_t, retMap, result);
++    return amxd_status_ok;
++}
++
++amxd_status_t _setDppExtraConfReq(amxd_object_t* obj,
++                                   amxd_function_t* func _UNUSED,
++                                   amxc_var_t* args,
++                                   amxc_var_t* retMap) {
++    T_EndPoint* pEP = wld_ep_fromObj(amxd_object_get_parent(obj));
++    ASSERTS_TRUE(s_dppCtrlReady(pEP), amxd_status_not_supported, ME,
++                 "DPP wpa_ctrl is not ready");
++
++    const char* name = GET_CHAR(args, "name");
++    const char* value = GET_CHAR(args, "value");
++    ASSERTS_TRUE(swl_str_matches(name, "bSTAList"), amxd_status_invalid_arg, ME,
++                 "unsupported DPP extra request name");
++    ASSERT_NOT_NULL(value, amxd_status_invalid_arg, ME, "missing DPP extra request value");
++
++    bool ok = wld_wpaCtrl_sendCmdCheckResponse(pEP->wpaCtrlInterface,
++                                               "SET dpp_extra_conf_req_name bSTAList", "OK");
++    if(ok) {
++        ok = wld_wpaCtrl_sendCmdFmtCheckResponse(pEP->wpaCtrlInterface, "OK",
++                                                  "SET dpp_extra_conf_req_value %s", value);
++    }
++    amxc_var_set(bool, retMap, ok);
++    return ok ? amxd_status_ok : amxd_status_unknown_error;
++}
++
++static amxd_status_t s_dppGetReply(T_EndPoint* pEP, const char* cmd, amxc_var_t* retMap) {
++    char reply[8192] = {0};
++    swl_rc_ne ret = wld_wpaCtrl_sendCmdFmtGetResponse(pEP->wpaCtrlInterface,
++                                                      reply, sizeof(reply), "%s", cmd);
++    if((ret != SWL_RC_OK) || swl_str_isEmpty(reply) || swl_str_matches(reply, "FAIL")) {
++        return amxd_status_unknown_error;
++    }
++    amxc_var_set(cstring_t, retMap, reply);
++    return amxd_status_ok;
++}
++
++amxd_status_t _listDppNetworks(amxd_object_t* obj,
++                               amxd_function_t* func _UNUSED,
++                               amxc_var_t* args _UNUSED,
++                               amxc_var_t* retMap) {
++    T_EndPoint* pEP = wld_ep_fromObj(amxd_object_get_parent(obj));
++    ASSERTS_TRUE(s_dppCtrlReady(pEP), amxd_status_not_supported, ME,
++                 "DPP wpa_ctrl is not ready");
++    return s_dppGetReply(pEP, "LIST_NETWORKS", retMap);
++}
++
++amxd_status_t _getDppNetworkValue(amxd_object_t* obj,
++                                  amxd_function_t* func _UNUSED,
++                                  amxc_var_t* args,
++                                  amxc_var_t* retMap) {
++    T_EndPoint* pEP = wld_ep_fromObj(amxd_object_get_parent(obj));
++    ASSERTS_TRUE(s_dppCtrlReady(pEP), amxd_status_not_supported, ME,
++                 "DPP wpa_ctrl is not ready");
++
++    uint32_t id = GET_UINT32(args, "id");
++    const char* field = GET_CHAR(args, "field");
++    ASSERTS_TRUE(swl_str_matches(field, "dpp_connector") ||
++                 swl_str_matches(field, "dpp_netaccesskey") ||
++                 swl_str_matches(field, "dpp_csign"),
++                 amxd_status_invalid_arg, ME, "unsupported DPP network field");
++
++    char cmd[128] = {0};
++    snprintf(cmd, sizeof(cmd), "GET_NETWORK %u %s", id, field);
++    return s_dppGetReply(pEP, cmd, retMap);
++}
++
++amxd_status_t _getDpp1905Connector(amxd_object_t* obj,
++                                   amxd_function_t* func _UNUSED,
++                                   amxc_var_t* args _UNUSED,
++                                   amxc_var_t* retMap) {
++    T_EndPoint* pEP = wld_ep_fromObj(amxd_object_get_parent(obj));
++    ASSERTS_TRUE(s_dppCtrlReady(pEP), amxd_status_not_supported, ME,
++                 "DPP wpa_ctrl is not ready");
++    return s_dppGetReply(pEP, "GET dpp_1905_connector", retMap);
++}
++
+ void _wld_ep_setDppConf_ocf(const char* const sig_name,
+                                 const amxc_var_t* const data,
+                                 void* const priv) {
+--- a/include/wld/wld.h
++++ b/include/wld/wld.h
+@@ -1943,6 +1943,9 @@ struct S_ACCESSPOINT {
+     bool DPP_Enable;                                /* DPP enabled? */
+     char DPP_Role[16];
+     char DPP_BootstrapType[16];
++    char* dppPendingConnector;
++    char* dppPendingCSign;
++    char* dppPendingNetAccessKey;
+     bool DPP_IsRelay;                             /* true when DPP.Role="Relay" */
+ 
+     uint32_t DCS_Enable;                            /* DCS enable bitmask: bit0=CW, bit1=WLAN, bit2=AWGN, bit4=OBSS */
+--- a/src/wld_accesspoint.c
++++ b/src/wld_accesspoint.c
+@@ -316,6 +316,10 @@ static void s_deinitAP(T_AccessPoint* pAP) {
+     amxp_timer_delete(&pAP->MF_SyncTimer);
+     W_SWL_FREE(pAP->MF_AddressList);
+ 
++    W_SWL_FREE(pAP->dppPendingConnector);
++    W_SWL_FREE(pAP->dppPendingCSign);
++    W_SWL_FREE(pAP->dppPendingNetAccessKey);
++
+     free(pAP->dbgOutput);
+     pAP->dbgOutput = NULL;
+ 
+--- a/src/Plugin/wifiGen_eventHandlers.c
++++ b/src/Plugin/wifiGen_eventHandlers.c
+@@ -111,6 +111,17 @@
+     "BEACON-RESP-RX",
+     "ACL-DENY",
+     "DPP-CHIRP-RX",
++    "DPP-CONNECTOR",
++    "DPP-NET-ACCESS-KEY",
++    "DPP-C-SIGN-KEY",
++    "DPP-MAP-DFCOUNTER",
++    "DPP-1905-CONNECTOR",
++    "DPP-1905-NET-ACCESS-KEY",
++    "DPP-1905-C-SIGN-KEY",
++    "DPP-1905-DF-COUNTER-THRESHOLD",
++    "DPP-AUTH-SUCCESS",
++    "DPP-FAIL",
++    "DPP-CONF-FAILED",
+     "CTRL-EVENT-CONNECTION-FAIL"
+ };
+ 
+@@ -159,6 +170,120 @@ static void s_notifyWpaCtrlEvent(amxd_object_t* object, char* ifName, char* eventName,
+     }
+ }
+ 
++static void s_clearPendingDppCredentials(T_AccessPoint* pAP) {
++    ASSERTS_NOT_NULL(pAP, , ME, "NULL");
++    W_SWL_FREE(pAP->dppPendingConnector);
++    W_SWL_FREE(pAP->dppPendingCSign);
++    W_SWL_FREE(pAP->dppPendingNetAccessKey);
++}
++
++static const char* s_getDppEventPayload(const char* msgData, const char* eventName) {
++    ASSERTS_NOT_NULL(msgData, "", ME, "NULL");
++    ASSERTS_NOT_NULL(eventName, msgData, ME, "NULL");
++
++    const char* payload = msgData;
++    if(payload[0] == '<') {
++        const char* end = strchr(payload, '>');
++        if(end) {
++            payload = end + 1;
++        }
++    }
++
++    size_t eventLen = strlen(eventName);
++    if(strncmp(payload, eventName, eventLen) == 0) {
++        payload += eventLen;
++        if(payload[0] == ' ') {
++            payload++;
++        }
++    }
++
++    return payload;
++}
++
++static bool s_isDppWhitespace(char c) {
++    return (c == ' ') || (c == '\t') || (c == '\r') || (c == '\n');
++}
++
++static void s_storePendingDppCredential(char** field, const char* value, bool firstTokenOnly) {
++    ASSERTS_NOT_NULL(field, , ME, "NULL");
++    ASSERTS_NOT_NULL(value, , ME, "NULL");
++    if(swl_str_isEmpty(value)) {
++        return;
++    }
++
++    size_t len = strlen(value);
++    while((len > 0) && s_isDppWhitespace(value[len - 1])) {
++        len--;
++    }
++    if(firstTokenOnly) {
++        for(size_t i = 0; i < len; i++) {
++            if(s_isDppWhitespace(value[i])) {
++                len = i;
++                break;
++            }
++        }
++    }
++    if(len == 0) {
++        return;
++    }
++
++    char* copy = calloc(1, len + 1);
++    ASSERTS_NOT_NULL(copy, , ME, "NULL");
++    memcpy(copy, value, len);
++
++    W_SWL_FREE(*field);
++    *field = copy;
++}
++
++static void s_persistCompleteDppCredentials(T_AccessPoint* pAP) {
++    ASSERTS_NOT_NULL(pAP, , ME, "NULL");
++    ASSERTS_NOT_NULL(pAP->pBus, , ME, "%s: missing AP object", pAP->alias);
++    ASSERTS_TRUE(!swl_str_isEmpty(pAP->dppPendingConnector) &&
++                 !swl_str_isEmpty(pAP->dppPendingCSign) &&
++                 !swl_str_isEmpty(pAP->dppPendingNetAccessKey),
++                 , ME, "%s: DPP credential set is incomplete", pAP->alias);
++
++    amxd_object_t* dppObj = amxd_object_findf(pAP->pBus, "DPP");
++    ASSERTS_NOT_NULL(dppObj, , ME, "%s: DPP object not found", pAP->alias);
++
++    amxd_trans_t trans;
++    ASSERT_TRANSACTION_INIT(dppObj, &trans, , ME, "%s: trans init failure", pAP->alias);
++    amxd_trans_set_cstring_t(&trans, "Connector", pAP->dppPendingConnector);
++    amxd_trans_set_cstring_t(&trans, "CSign", pAP->dppPendingCSign);
++    amxd_trans_set_cstring_t(&trans, "NetAccessKey", pAP->dppPendingNetAccessKey);
++    ASSERT_TRANSACTION_LOCAL_DM_END(&trans, , ME, "%s: DPP credential persist failure", pAP->alias);
++
++    SAH_TRACEZ_INFO(ME, "%s: persisted complete DPP credential set", pAP->alias);
++    s_clearPendingDppCredentials(pAP);
++}
++
++static void s_handleDppCredentialEvent(T_AccessPoint* pAP, char* eventName, char* msgData) {
++    ASSERTS_NOT_NULL(pAP, , ME, "NULL");
++    ASSERTS_NOT_NULL(eventName, , ME, "NULL");
++    ASSERTS_NOT_NULL(msgData, , ME, "NULL");
++
++    bool updated = false;
++    if(swl_str_matches(eventName, "DPP-CONNECTOR")) {
++        s_storePendingDppCredential(&pAP->dppPendingConnector, s_getDppEventPayload(msgData, eventName), false);
++        updated = true;
++    } else if(swl_str_matches(eventName, "DPP-C-SIGN-KEY")) {
++        s_storePendingDppCredential(&pAP->dppPendingCSign, s_getDppEventPayload(msgData, eventName), false);
++        updated = true;
++    } else if(swl_str_matches(eventName, "DPP-NET-ACCESS-KEY")) {
++        s_storePendingDppCredential(&pAP->dppPendingNetAccessKey, s_getDppEventPayload(msgData, eventName), true);
++        updated = true;
++    } else if(swl_str_matches(eventName, "DPP-AUTH-SUCCESS") ||
++              swl_str_matches(eventName, "DPP-FAIL") ||
++              swl_str_matches(eventName, "DPP-CONF-FAILED")) {
++        s_clearPendingDppCredentials(pAP);
++        return;
++    }
++
++    if(updated) {
++        s_persistCompleteDppCredentials(pAP);
++    }
++}
++
+ static void s_wpaCtrlIfaceStdEvt(void* userData, char* ifName, char* eventName, char* msgData) {
+     ASSERT_NOT_NULL(ifName, , ME, "NULL");
+     ASSERT_NOT_NULL(eventName, , ME, "NULL");
+@@ -169,7 +275,10 @@ static void s_wpaCtrlIfaceStdEvt(void* userData, char* ifName, char* eventName, char* msgData) {
+     T_EndPoint* pEP = (T_EndPoint*) userData;
+     if(debugIsVapPointer(pAP)) {
+         object = pAP->pBus;
++        if(pAP->DPP_Enable) {
++            s_handleDppCredentialEvent(pAP, eventName, msgData);
++        }
+     } else if(debugIsEpPointer(pEP)) {
+         object = pEP->pBus;
+     }
+ 
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -2207,6 +2207,40 @@
+         swl_mapChar_add(vapConfigMap, "dpp_configurator_connectivity", "1");
+     }
+ 
++    /* DPP credentials are per-BSS and must be replayed after hostapd restart. */
++    if(pAP->DPP_Enable && pAP->pBus) {
++        amxd_object_t* dppObj = amxd_object_findf(pAP->pBus, "DPP");
++        if(dppObj) {
++            char* connector = amxd_object_get_cstring_t(dppObj, "Connector", NULL);
++            char* csign = amxd_object_get_cstring_t(dppObj, "CSign", NULL);
++            char* netAccessKey = amxd_object_get_cstring_t(dppObj, "NetAccessKey", NULL);
++            bool hasConnector = (connector && connector[0]);
++            bool hasCSign = (csign && csign[0]);
++            bool hasNetAccessKey = (netAccessKey && netAccessKey[0]);
++            if(hasConnector && hasCSign && hasNetAccessKey) {
++                swl_mapChar_add(vapConfigMap, "dpp_connector", connector);
++                swl_mapChar_add(vapConfigMap, "dpp_csign", csign);
++                swl_mapChar_add(vapConfigMap, "dpp_netaccesskey", netAccessKey);
++
++                /* A BSS holding a DPP Connector must also advertise the DPP AKM in its
++                 * RSN IE, or a peer using that Connector can never associate. */
++                char* curKeyMgmt = swl_mapChar_get(vapConfigMap, "wpa_key_mgmt");
++                if(!swl_str_isEmpty(curKeyMgmt)) {
++                    char keyMgmtBuf[128] = {0};
++                    swl_str_copy(keyMgmtBuf, sizeof(keyMgmtBuf), curKeyMgmt);
++                    swl_mapCharFmt_addValStr(vapConfigMap, "wpa_key_mgmt", "%s DPP", keyMgmtBuf);
++                }
++            } else if(hasConnector || hasCSign || hasNetAccessKey) {
++                SAH_TRACEZ_WARNING(ME,
++                                   "%s: incomplete persistent DPP credential set, skipping replay",
++                                   pAP->alias);
++            }
++            free(connector);
++            free(csign);
++            free(netAccessKey);
++        }
++    }
++
+     /* DCS: write dcs_enable bitmask to hostapd config when non-zero.
+      * Bit 0 = CW, Bit 1 = WLAN, Bit 2 = AWGN, Bit 4 = OBSS */
+     if(pAP->DCS_Enable) {
+--- a/acl/admin/pwhm.json
++++ b/acl/admin/pwhm.json
+@@ -26,6 +26,16 @@
+         "Order": 2,
+         "Param": "rw-n"
+     },
++    "Device.WiFi.AccessPoint.*.DPP.": {
++        "Order": 2,
++        "Param": "rw-n",
++        "CommandEvent": "rwxn"
++    },
++    "Device.WiFi.EndPoint.*.DPP.": {
++        "Order": 2,
++        "Param": "rw-n",
++        "CommandEvent": "rwxn"
++    },
+     "Device.WiFi.SSID.*.SSID": {
+         "Order": 2,
+         "Param": "rw-n"
+-- 
+2.39.2
