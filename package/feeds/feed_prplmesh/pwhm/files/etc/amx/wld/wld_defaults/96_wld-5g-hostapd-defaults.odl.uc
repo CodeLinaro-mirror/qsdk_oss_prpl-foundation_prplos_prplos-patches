@@ -9,7 +9,6 @@
                 parameter Channel = 40;
                 parameter OperatingChannelBandwidth = "160MHz";
                 parameter BeaconPeriod = 100;
-                parameter PreambleType = "short";
                 parameter ExplicitBeamFormingEnabled = true;
                 parameter ImplicitBeamFormingEnabled = true;
                 parameter MultiUserMIMOEnabled = true;
