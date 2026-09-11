@@ -31,15 +31,3 @@ Signed-off-by: Kartheek E <karte@qti.qualcomm.com>
      SAH_TRACEZ_INFO(ME, "%s: adding BSS config for AP %s", pRad->Name, pAP->alias);
      swl_rc_ne rc = wld_ap_hostapd_addBssConf(pAP);
      if(!swl_rc_isOk(rc)) {
-@@ -1969,7 +1974,10 @@ static void s_syncOnEpStartConn(void* userData, char* ifName, const char* ssid,
-                                );
-             wld_chanmgt_setTargetChanspec(pRad, chanSpec, true, CHAN_REASON_EP_MOVE, "ep preConnect");
-             if((swl_typeChanspec_equals(wld_chanmgt_getTgtChspec(pRad), chanSpec)) &&
--               (pRad->targetChanspec.isApplied == SWL_TRL_TRUE)) {
-+               (pRad->targetChanspec.isApplied != SWL_TRL_FALSE)) {
-+                /* Channel switch was initiated (CSA in-flight or cold-apply queued):
-+                 * skip disabling FH here to avoid a double-disable that would leave
-+                 * hostapd in an inconsistent state and trigger a dual-home channel. */
-                 return;
-             }
-         }
