@@ -1,0 +1,46 @@
+From: Abhi Teja Cholleti <acholleti@qti.qualcomm.com>
+Subject: [PATCH] wifiGen_fsm: disable FH on MLO neighbour radio in s_syncOnEpStartConnFail
+
+In s_syncOnEpStartConnFail(), when a bSTA connect fails with -EBUSY,
+s_disableFronthaul() is called on pRad to release radio control to
+wpa_supplicant.  In MLO configurations the last distinct neighbour
+radio in the MLD link set may also need to be disabled.
+
+Iterate the MLD neighbour links to find the last distinct neighbour
+radio (pNgRad, hoisted outside the loop for post-loop use):
+  - if no distinct neighbour found (NULL or same as pRad): disable pRad.
+  - otherwise: disable pNgRad.
+
+Signed-off-by: Abhi Teja Cholleti <acholleti@qti.qualcomm.com>
+---
+--- a/src/Plugin/wifiGen_fsm.c
++++ b/src/Plugin/wifiGen_fsm.c
+@@ -1999,7 +1999,27 @@
+         SAH_TRACEZ_WARNING(ME, "%s: disable fronthaul to allow wpa_supplicant to connect on chspec %s to %s",
+                            pEP->Name, swl_typeChanspecExt_toBuf32(chanSpec).buf,
+                            swl_typeMacBin_toBuf32Ref(bssid).buf);
+-        s_disableFronthaul(pRad);
++        /* Also disable fronthaul on each MLO neighbour radio so none of them
++         * block the wpa_supplicant connection attempt on this radio. */
++        T_SSID* pSSID = pEP->pSSID;
++        T_Radio* pNgRad = NULL;
++        if(pSSID && pSSID->pMldLink) {
++            wld_for_eachNeighMldLink_safe(pNgLink, pSSID->pMldLink) {
++                T_SSID* pNgSSID = wld_mld_getLinkSsid(pNgLink);
++                if(!pNgSSID || (pNgSSID == pSSID)) {
++                    continue;
++                }
++                pNgRad = pNgSSID->RADIO_PARENT;
++                if(!pNgRad || (pNgRad == pRad)) {
++                    continue;
++                }
++            }
++        }
++        if(!pNgRad || (pNgRad == pRad)) {
++            s_disableFronthaul(pRad);
++        } else {
++            s_disableFronthaul(pNgRad);
++        }
+     }
+ }
+ 
