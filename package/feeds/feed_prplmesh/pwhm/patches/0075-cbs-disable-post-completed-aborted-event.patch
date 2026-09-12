@@ -1,0 +1,178 @@
+From cc0115b7ef1dcdb896aae064d9de6cae181ed626 Mon Sep 17 00:00:00 2001
+From: Atchaya R <ratchaya@qti.qualcomm.com>
+Date: Thu, 10 Sep 2026 16:55:43 +0530
+Subject: [PATCH] pwhm: add support for CBS enable and disable with correct
+ values based on CBS-COMPLETED and CBS-ABORTED events.
+
+Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
+---
+ include/wld/wld.h                  |  1 +
+ odl/wld_radio.odl                  |  1 -
+ src/Plugin/wifiGen_eventHandlers.c | 20 ++++++++
+ src/wld_radio.c                    | 76 +++++++++---------------------
+ 4 files changed, 43 insertions(+), 55 deletions(-)
+
+diff --git a/include/wld/wld.h b/include/wld/wld.h
+index 957ae14..f0a0f72 100644
+--- a/include/wld/wld.h
++++ b/include/wld/wld.h
+@@ -1748,6 +1748,7 @@ struct WLD_RADIO {
+    uint32_t nrUserPuncturedSubChannels;                         /* Nr of user-punctured sub channels */
+    bool radarUpdatingDisabledSubChannels;                       /* True while radar path is updating DisabledSubChannels DM */
+    bool pendingUserPuncturingReapply;                           /* True when a re-apply CSA for user puncturing is pending (deferred until current CSA completes) */
++   bool cbsEventUpdating;                                       /* True when CBS event callback is updating CBS.Enable DM — skip wpa_ctrl command */
+ };
+ 
+ typedef struct {
+diff --git a/odl/wld_radio.odl b/odl/wld_radio.odl
+index 08921a8..ceb3da0 100644
+--- a/odl/wld_radio.odl
++++ b/odl/wld_radio.odl
+@@ -1180,7 +1180,6 @@ define probelist_t{
+ 			 */
+ 			uint32 Enable {
+ 				on action validate call check_range { min = 0, max = 2 };
+-				on action read call wld_rad_getCbsEnable_prf;
+ 				default 0;
+ 			}
+ 
+diff --git a/src/Plugin/wifiGen_eventHandlers.c b/src/Plugin/wifiGen_eventHandlers.c
+index 8717096..e91adce 100644
+--- a/src/Plugin/wifiGen_eventHandlers.c
++++ b/src/Plugin/wifiGen_eventHandlers.c
+@@ -1035,6 +1035,19 @@ static void s_cbsCompletedCb(void* userData, char* ifName, char* params) {
+     SAH_TRACEZ_WARNING(ME, "%s: notify wpaCtrlEvents CBS-COMPLETED eventData=%s", pRad->Name, msgData);
+     amxd_object_trigger_signal(pRad->pBus, "wpaCtrlEvents", &eventData);
+     amxc_var_clean(&eventData);
++    /* Reset CBS.Enable to 0 only for mode 1 (scan once).
++     * hostapd resets cbs_enable to 0 only when it was 1 (see cbs.c:
++     *   if (cbs_enable == 1) cbs_enable = 0; then CBS_EVENT_COMPLETED).
++     * For mode 2 (continuous), cbs_enable stays 2 — CBS is still running. */
++    amxd_object_t* cbsObj = amxd_object_findf(pRad->pBus, "CBS");
++    if(cbsObj != NULL) {
++        uint32_t curEnable = amxd_object_get_uint32_t(cbsObj, "Enable", NULL);
++        if(curEnable == 1) {
++            /* Set flag so s_setCbsEnable_pwf skips the wpa_ctrl command */
++            pRad->cbsEventUpdating = true;
++            swl_typeUInt32_commitObjectParam(cbsObj, "Enable", 0);
++        }
++    }
+ }
+ 
+ static void s_cbsAbortedCb(void* userData, char* ifName, char* params) {
+@@ -1057,6 +1070,13 @@ static void s_cbsAbortedCb(void* userData, char* ifName, char* params) {
+     SAH_TRACEZ_WARNING(ME, "%s: notify wpaCtrlEvents CBS-ABORTED eventData=%s", pRad->Name, msgData);
+     amxd_object_trigger_signal(pRad->pBus, "wpaCtrlEvents", &eventData);
+     amxc_var_clean(&eventData);
++    /* Reset CBS.Enable to 0 in the DM — scan was aborted */
++    amxd_object_t* cbsObj = amxd_object_findf(pRad->pBus, "CBS");
++    if(cbsObj != NULL) {
++        /* Set flag so s_setCbsEnable_pwf skips the wpa_ctrl command */
++        pRad->cbsEventUpdating = true;
++        swl_typeUInt32_commitObjectParam(cbsObj, "Enable", 0);
++    }
+ }
+ 
+ static void s_acsCompletedCb(void* userData, char* ifName _UNUSED, swl_chanspec_t* chanSpec, char* params) {
+diff --git a/src/wld_radio.c b/src/wld_radio.c
+index 6702c83..de537a2 100644
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -3928,14 +3928,33 @@ static T_AccessPoint* s_getCbsAp(T_Radio* pRad) {
+  * val=2: enable CBS scan continuously (keep scanning in background)
+  */
+ static void s_setCbsEnable_pwf(void* priv _UNUSED, amxd_object_t* object,
+-                                amxd_param_t* param _UNUSED,
++                                amxd_param_t* param,
+                                 const amxc_var_t* const newValue) {
+     T_Radio* pRad = wld_rad_fromObj(amxd_object_get_parent(object));
+     ASSERTI_NOT_NULL(pRad, , ME, "NULL");
+     uint32_t val = amxc_var_dyncast(uint32_t, newValue);
+-    ASSERTI_TRUE(wld_rad_isActive(pRad), , ME, "%s: CBS.Enable: radio not active", pRad->Name);
++
++    /* Skip wpa_ctrl command when DM is updated from a CBS event callback */
++    if(pRad->cbsEventUpdating) {
++        pRad->cbsEventUpdating = false;
++        SAH_TRACEZ_INFO(ME, "%s: CBS.Enable=%u skipped (event-initiated DM update)", pRad->Name, val);
++        return;
++    }
++
++    /* Error: radio must be active before enabling CBS */
++    if (!wld_rad_isActive(pRad)) {
++        SAH_TRACEZ_ERROR(ME, "%s: CBS.Enable=%u rejected: radio not active", pRad->Name, val);
++        amxc_var_set(uint32_t, &param->value, 0);
++        return;
++    }
+     T_AccessPoint* pAP = s_getCbsAp(pRad);
+-    ASSERTI_NOT_NULL(pAP, , ME, "%s: CBS.Enable: no AP available", pRad->Name);
++    /* Error: at least one VAP must be available before enabling CBS */
++    if (pAP == NULL) {
++        SAH_TRACEZ_ERROR(ME, "%s: CBS.Enable=%u rejected: no AP available", pRad->Name, val);
++        amxc_var_set(uint32_t, &param->value, 0);
++        return;
++    }
++
+     SAH_TRACEZ_INFO(ME, "%s: CBS.Enable=%u via %s", pRad->Name, val, pAP->alias);
+     wld_wpaCtrl_sendCmdFmtCheckResponse(pAP->wpaCtrlInterface, "OK",
+                                         "CBS enable %u", val);
+@@ -4047,57 +4066,6 @@ static void s_setCbsTotalDwell_pwf(void* priv _UNUSED, amxd_object_t* object,
+                                         "CBS totaldwell %u", val);
+ }
+ 
+-/* --- CBS.Enable read action (active read from hostapd) --- */
+-
+-/**
+- * @brief Read action for CBS.Enable — queries "CBS g_enable" from hostapd.
+- *
+- * Returns the current CBS enable state as reported by hostapd.
+- * Falls back to the stored DM value if the radio is not active.
+- *
+- * hostapd response format: "CBS enable: <val>\n"
+- * where val is 0 (disabled), 1 (scan once), or 2 (continuous).
+- */
+-amxd_status_t _wld_rad_getCbsEnable_prf(amxd_object_t* object,
+-                                          amxd_param_t* param,
+-                                          amxd_action_t reason,
+-                                          const amxc_var_t* const args _UNUSED,
+-                                          amxc_var_t* const retval,
+-                                          void* priv _UNUSED) {
+-    ASSERTS_NOT_NULL(param, amxd_status_unknown_error, ME, "NULL");
+-    ASSERTS_EQUALS(reason, action_param_read, amxd_status_function_not_implemented,
+-                   ME, "not impl");
+-
+-    /* CBS object is child of Radio instance */
+-    T_Radio* pRad = wld_rad_fromObj(amxd_object_get_parent(object));
+-    ASSERTS_NOT_NULL(pRad, amxd_status_ok, ME, "no radio mapped");
+-
+-    /* Default: return the stored/persisted value */
+-    uint32_t value = amxc_var_dyncast(uint32_t, &param->value);
+-
+-    T_AccessPoint* pAP = s_getCbsAp(pRad);
+-    if(pAP != NULL && wld_rad_isActive(pRad)) {
+-        char reply[256] = {0};
+-        swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtGetResponse(
+-            pAP->wpaCtrlInterface, reply, sizeof(reply), "CBS g_enable");
+-        if(swl_rc_isOk(rc)) {
+-            /*
+-             * hostapd response format (from hostapd_cbs_get_enable):
+-             * "CBS enable: <val>\n"
+-             */
+-            unsigned int cbsEnable = 0;
+-            if(sscanf(reply, "CBS enable: %u", &cbsEnable) == 1) {
+-                value = cbsEnable;
+-                SAH_TRACEZ_INFO(ME, "%s: CBS.Enable read from hostapd: %u",
+-                                pRad->Name, value);
+-            }
+-        }
+-    }
+-
+-    amxc_var_set(uint32_t, retval, value);
+-    return amxd_status_ok;
+-}
+-
+ /* --- CBS SWLA_DM_HDLRS --- */
+ 
+ SWLA_DM_HDLRS(sRadioCbsDmHdlrs,
+-- 
+2.34.1
+
