@@ -1,0 +1,569 @@
+From 355ce35147c992e0190e8aa90b00319ba2869680 Mon Sep 17 00:00:00 2001
+From: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+Date: Tue, 15 Sep 2026 16:38:42 +0530
+Subject: [PATCH] WPS onboarding fails on controller
+
+Change-Id: I25754523981e3a0e935c0c8cc8a69ebe8c3c3b2f
+Signed-off-by: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+---
+
+diff --git a/include/wld/wld_hostapd_ap_api.h b/include/wld/wld_hostapd_ap_api.h
+index 8be815e..5d28518 100644
+--- a/include/wld/wld_hostapd_ap_api.h
++++ b/include/wld/wld_hostapd_ap_api.h
+@@ -72,6 +72,8 @@ typedef enum {
+     SECDMN_ACTION_OK_DONE = 0,
+     SECDMN_ACTION_OK_NEED_UPDATE_BEACON,
+     SECDMN_ACTION_OK_NEED_RELOAD_SECKEY, // Only WPA-PSK Security key params on specific AP
++    SECDMN_ACTION_OK_NEED_RELOAD_BSS,    // Reload BSS config (already SET) from memory
++    SECDMN_ACTION_OK_NEED_RELOAD,        // Reload interface and child BSSs configs (already SET) from memory
+     SECDMN_ACTION_OK_NEED_SIGHUP,
+     SECDMN_ACTION_OK_NEED_TOGGLE,        // Like a restart, but keeps available wpactrl sockets
+     SECDMN_ACTION_OK_NEED_RE_ADD_LINK,   // gets specific link iface conf be removed and added again
+@@ -102,6 +104,24 @@ wld_secDmn_action_rc_ne wld_ap_hostapd_setMldParams(T_AccessPoint* pAP);
+ wld_secDmn_action_rc_ne wld_ap_hostapd_setEnableVap(T_AccessPoint* pAP, bool enable);
+ wld_secDmn_action_rc_ne wld_ap_hostapd_enableVap(T_AccessPoint* pAP, bool enable);
+ 
++/**
++ * @brief reload hostapd bss config from memory
++ *
++ * @param pAP AccessPoint context
++ * @return SWL_RC_OK when the Hostapd bss memory config is reloaded. Otherwise error code.
++ */
++swl_rc_ne wld_ap_hostapd_reloadBss(T_AccessPoint* pAP);
++
++/**
++ * @brief set the backhaul SSID of AccessPoint
++ *
++ * @param pAP accesspoint context
++ * @param bhSsid the new backhaul ssid
++ * @return - action > SECDMN_ACTION_DONE when bh ssid is SET
++ *         - Otherwise SECDMN_ACTION_ERROR in case of error
++ */
++wld_secDmn_action_rc_ne wld_ap_hostapd_setBhSsid(T_AccessPoint* pAP, const char* bhSsid);
++
+ swl_rc_ne wld_ap_hostapd_kickStation(T_AccessPoint* pAP, swl_macBin_t* mac, swl_IEEE80211deauthReason_ne reason);
+ swl_rc_ne wld_ap_hostapd_cleanStation(T_AccessPoint* pAP, swl_macBin_t* mac);
+ swl_rc_ne wld_ap_hostapd_deauthAllStations(T_AccessPoint* pAP);
+diff --git a/include/wld/wld_hostapd_cfgFile.h b/include/wld/wld_hostapd_cfgFile.h
+index 8a79569..b03c408 100644
+--- a/include/wld/wld_hostapd_cfgFile.h
++++ b/include/wld/wld_hostapd_cfgFile.h
+@@ -64,6 +64,8 @@
+ #define __WLD_HOSTAPD_CFG_FILE_H__
+ 
+ #define HOSTAPD_CTRL_IFACE_DIR "/var/run/hostapd"
++#define M_HOSTAPD_MULTI_AP_BBSS     0x1
++#define M_HOSTAPD_MULTI_AP_FBSS     0x2
+ 
+ void wld_hostapd_cfgFile_create(T_Radio* pRad, char* cfgFileName);
+ void wld_hostapd_cfgFile_createExt(T_Radio* pRad);
+diff --git a/include/wld/wld_hostapd_cfgManager.h b/include/wld/wld_hostapd_cfgManager.h
+index 3629244..a088650 100644
+--- a/include/wld/wld_hostapd_cfgManager.h
++++ b/include/wld/wld_hostapd_cfgManager.h
+@@ -91,6 +91,30 @@ const char* wld_hostapd_getConfigParamValStr(wld_hostapd_config_t* conf, char* b
+ swl_mapChar_t* wld_hostapd_getConfigMapByBssid(wld_hostapd_config_t* conf, swl_macBin_t* bssid);
+ const char* wld_hostapd_getConfigParamByBssidValStr(wld_hostapd_config_t* conf, swl_macBin_t* bssid, const char* key);
+ 
++/**
++ * @brief handler of multi-ap fronthaul bss
++ *
++ * @param pAP vap ctx
++ * @param vapInfo hostapd bss info
++ * @param userData
++ *
++ * @return void
++ */
++typedef void (* wld_hostapd_procMultiApDep_f)(T_AccessPoint* pAP, wld_hostapdVapInfo_t* vapInfo, void* userData);
++
++/**
++ * @brief match FH BSSs referring to given multi ap backhaul ssid, in hostapd config map,
++ * and call handler to take reconf action
++ *
++ * @param hapdCfg hostapd configuration context including all VAP configs for one radio
++ * @param bhSsid multi ap backhaul ssid we look for in another VAPs config
++ * @param userData data passed to handler
++ * @param hdlr optional handler called for each fh VAP matching multi-ap bh ssid
++ *
++ * @return count of co-located fh BSSs matching same backhaul ssid, swl_rc_ne error code otherwise
++ */
++int32_t wld_hostapd_forEachMultiApDep(wld_hostapd_config_t* hapdCfg, const char* bhSsid, void* userData, wld_hostapd_procMultiApDep_f hdlr);
++
+ /**
+  * @brief Create a per-BSS configuration structure for a single access point
+  *
+diff --git a/include_priv/Plugin/wifiGen_fsm.h b/include_priv/Plugin/wifiGen_fsm.h
+index bd152e6..6ab89fe 100644
+--- a/include_priv/Plugin/wifiGen_fsm.h
++++ b/include_priv/Plugin/wifiGen_fsm.h
+@@ -82,6 +82,8 @@ typedef enum {
+     GEN_FSM_MOD_HOSTAPD,          /* Write config of hostapd */
+     GEN_FSM_MOD_WPASUPP,          /* Write config of wpa_supplicant */
+     GEN_FSM_RELOAD_AP_SECKEY,     /* reload AP security secret key */
++    GEN_FSM_RELOAD_AP,            /* reload hostapd bss config in memory */
++    GEN_FSM_RELOAD_HOSTAPD,       /* reload hostapd config in memory */
+     GEN_FSM_MOD_EP_MACADDR,       /* apply ep mac address */
+     GEN_FSM_UPDATE_BEACON,        /* Start/Refresh AP Beacon */
+     GEN_FSM_UPDATE_WPASUPP,       /* Update wpa_supplicant */
+diff --git a/src/Plugin/wifiGen_fsm.c b/src/Plugin/wifiGen_fsm.c
+index 17418d6..294ac8c 100644
+--- a/src/Plugin/wifiGen_fsm.c
++++ b/src/Plugin/wifiGen_fsm.c
+@@ -65,6 +65,7 @@
+ #include "wld/wld_linuxIfUtils.h"
+ #include "wld/wld_rad_hostapd_api.h"
+ #include "wld/wld_hostapd_ap_api.h"
++#include "wld/wld_hostapd_cfgManager.h"
+ #include "wld/wld_hostapd_cfgFile.h"
+ #include "wld/wld_wpaSupp_ep_api.h"
+ #include "wld/wld_wpaCtrl_api.h"
+@@ -98,6 +99,8 @@ typedef struct {
+     swl_chanspec_t chanspec;
+ } chanspecInfo_t;
+ 
++static void s_syncMultiApDepsOnBhAdd(T_AccessPoint* pAP, T_Radio* pRad);
++
+ /*
+  * List of actions that can be used to apply hostapd configuration,
+  * starting from the most global (most critical)
+@@ -107,6 +110,8 @@ static const wifiGen_fsmStates_e sApplyActions[] = {
+     GEN_FSM_ADD_HOSTAPD,      // leads to re-adding hostapd iface config
+     GEN_FSM_UPDATE_HOSTAPD,   // leads to refreshing hostpad with SIGHUP (reloads conf file)
+     GEN_FSM_ENABLE_HOSTAPD,   // leads to enabling (usually toggling) hostapd main interface
++    GEN_FSM_RELOAD_HOSTAPD,   // leads to reloading hostpad conf from memory
++    GEN_FSM_RELOAD_AP,        // leads to reloading AP conf from memory
+     GEN_FSM_RELOAD_AP_SECKEY, // leads to reloading AP secret key conf from memory
+     GEN_FSM_UPDATE_BEACON,    // leads to refresh AP beacon frame from mem conf
+ };
+@@ -533,6 +538,19 @@ static void s_schedNextAction(wld_secDmn_action_rc_ne action, T_AccessPoint* pAP
+     case SECDMN_ACTION_OK_NEED_SIGHUP:
+         s_setApplyAction(pRad->fsmRad.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_UPDATE_HOSTAPD, radFsmBit);
+         break;
++    case SECDMN_ACTION_OK_NEED_RELOAD:
++        s_setApplyAction(pRad->fsmRad.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_RELOAD_HOSTAPD, radFsmBit);
++        break;
++    case SECDMN_ACTION_OK_NEED_RELOAD_BSS:
++        if(s_fetchHigherApplyAction(pRad->fsmRad.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_RELOAD_AP, radFsmBit) >= 0) {
++            return;
++        }
++        if(s_setApplyAction(pAP->fsm.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_RELOAD_AP, vapFsmBit)) {
++            setBitLongArray(pRad->fsmRad.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_RELOAD_AP);
++            setBitLongArray(pAP->fsm.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_UPDATE_BEACON);
++            setBitLongArray(pRad->fsmRad.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_UPDATE_BEACON);
++        }
++        break;
+     case SECDMN_ACTION_OK_NEED_RELOAD_SECKEY:
+         if(s_fetchHigherApplyAction(pRad->fsmRad.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_RELOAD_AP_SECKEY, radFsmBit) >= 0) {
+             return;
+@@ -697,6 +715,7 @@ static bool s_doAddLink(T_AccessPoint* pAP, T_Radio* pRad) {
+     }
+ 
+     SAH_TRACEZ_INFO(ME, "%s: BSS config for AP %s added successfully", pRad->Name, pAP->alias);
++    s_syncMultiApDepsOnBhAdd(pAP, pRad);
+     wld_wpaCtrlMngr_checkAllIfaces(wld_secDmn_getWpaCtrlMgr(pRad->hostapd));
+     setBitLongArray(pRad->fsmRad.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_SYNC_STATE);
+     wld_vap_updateState(pAP);
+@@ -1359,6 +1378,14 @@ static bool s_doSetBssid(T_AccessPoint* pAP, T_Radio* pRad _UNUSED) {
+     return true;
+ }
+ 
++static void s_setMultiApBhSsid(T_AccessPoint* pAP, wld_hostapdVapInfo_t* vapInfo _UNUSED, void* userData) {
++    const char* bhSsid = (const char*) userData;
++    ASSERTI_STR(bhSsid, , ME, "empty bhSsid");
++    wld_secDmn_action_rc_ne rc = wld_ap_hostapd_setBhSsid(pAP, bhSsid);
++    ASSERT_FALSE(rc < SECDMN_ACTION_OK_DONE, , ME, "%s: fail to set bh ssid", pAP->alias);
++    s_schedNextAction(rc, pAP, pAP->pRadio);
++}
++
+ static bool s_doSetSsid(T_AccessPoint* pAP, T_Radio* pRad _UNUSED) {
+     ASSERTS_NOT_NULL(pAP, true, ME, "NULL");
+     ASSERTI_TRUE(wld_wpaCtrlInterface_isReady(pAP->wpaCtrlInterface), true, ME, "%s: wpaCtrl disconnected", pAP->alias);
+@@ -1374,6 +1401,17 @@ static bool s_doSetSsid(T_AccessPoint* pAP, T_Radio* pRad _UNUSED) {
+     }
+ 
+     s_schedNextAction(rc, pAP, pRad);
++    if((rc > SECDMN_ACTION_OK_DONE) && (rc < SECDMN_ACTION_OK_NEED_SIGHUP) &&
++       SWL_BIT_IS_SET(pAP->multiAPType, MULTIAP_BACKHAUL_BSS)) {
++        wld_hostapd_config_t* config = NULL;
++        if(wld_hostapd_loadConfig(&config, pRad->hostapd->cfgFile)) {
++            const char* savedSsid = wld_hostapd_getConfigParamByBssidValStr(config, (swl_macBin_t*) pAP->pSSID->BSSID, "ssid");
++            if(swl_str_len(savedSsid) > 0) {
++                wld_hostapd_forEachMultiApDep(config, savedSsid, pSSID->SSID, s_setMultiApBhSsid);
++            }
++            wld_hostapd_deleteConfig(config);
++        }
++    }
+     return true;
+ }
+ 
+@@ -1385,6 +1423,43 @@ static bool s_doSetMfList(T_AccessPoint* pAP, T_Radio* pRad _UNUSED) {
+     return true;
+ }
+ 
++static void s_setMultiApBhCreds(T_AccessPoint* pAP, wld_hostapdVapInfo_t* vapInfo _UNUSED, void* userData) {
++    T_AccessPoint* pBhAP = (T_AccessPoint*) userData;
++    ASSERTS_NOT_NULL(pAP, , ME, "NULL");
++    ASSERTS_NOT_NULL(pBhAP, , ME, "NULL");
++
++    bool ret = false;
++    if(!swl_str_isEmpty(pBhAP->keyPassPhrase)) {
++        const char* keyParam = ((swl_str_len(pBhAP->keyPassPhrase) + 1) == PSK_KEY_SIZE_LEN) ?
++            "multi_ap_backhaul_wpa_psk" : "multi_ap_backhaul_wpa_passphrase";
++        ret = wld_ap_hostapd_setParamValue(pAP, keyParam, pBhAP->keyPassPhrase, "multiApBhCreds");
++    } else if(!swl_str_isEmpty(pBhAP->preSharedKey)) {
++        ret = wld_ap_hostapd_setParamValue(pAP, "multi_ap_backhaul_wpa_psk", pBhAP->preSharedKey, "multiApBhCreds");
++    }
++
++    ASSERT_TRUE(ret, , ME, "%s: fail to set bh creds from %s", pAP->alias, pBhAP->alias);
++    s_schedNextAction(SECDMN_ACTION_OK_NEED_RELOAD_BSS, pAP, pAP->pRadio);
++}
++
++static void s_syncMultiApDepsOnBhAdd(T_AccessPoint* pAP, T_Radio* pRad) {
++    ASSERTS_NOT_NULL(pAP, , ME, "NULL");
++    ASSERTS_NOT_NULL(pRad, , ME, "NULL");
++    ASSERTI_TRUE(SWL_BIT_IS_ONLY_SET(pAP->multiAPType, MULTIAP_BACKHAUL_BSS), , ME, "%s: not a pure backhaul BSS", pAP->alias);
++    ASSERTS_NOT_NULL(pAP->pSSID, , ME, "%s: no ssid ctx", pAP->alias);
++
++    wld_hostapd_config_t* config = NULL;
++    if(wld_hostapd_createConfig(&config, pRad)) {
++        int32_t nDeps = wld_hostapd_forEachMultiApDep(config, pAP->pSSID->SSID, pAP->pSSID->SSID, s_setMultiApBhSsid);
++        if(nDeps > 0) {
++            wld_hostapd_forEachMultiApDep(config, pAP->pSSID->SSID, pAP, s_setMultiApBhCreds);
++        }
++        if(nDeps > 0) {
++            SAH_TRACEZ_INFO(ME, "%s: scheduled Multi-AP BH config refresh for %d fronthaul BSSs", pAP->alias, nDeps);
++        }
++        wld_hostapd_deleteConfig(config);
++    }
++}
++
+ static bool s_doSetApSec(T_AccessPoint* pAP, T_Radio* pRad) {
+     ASSERTS_NOT_NULL(pAP, true, ME, "NULL");
+     ASSERTI_TRUE(wld_wpaCtrlInterface_isReady(pAP->wpaCtrlInterface), true, ME, "%s: wpaCtrl disconnected", pAP->alias);
+@@ -1396,6 +1471,14 @@ static bool s_doSetApSec(T_AccessPoint* pAP, T_Radio* pRad) {
+         rc = SECDMN_ACTION_OK_NEED_RE_ADD_LINK;
+     }
+     s_schedNextAction(rc, pAP, pRad);
++    if((rc > SECDMN_ACTION_OK_DONE) && (rc < SECDMN_ACTION_OK_NEED_SIGHUP) &&
++       SWL_BIT_IS_SET(pAP->multiAPType, MULTIAP_BACKHAUL_BSS)) {
++        wld_hostapd_config_t* config = NULL;
++        if(wld_hostapd_createConfig(&config, pRad)) {
++            wld_hostapd_forEachMultiApDep(config, pAP->pSSID->SSID, pAP, s_setMultiApBhCreds);
++            wld_hostapd_deleteConfig(config);
++        }
++    }
+     return true;
+ }
+ 
+@@ -2072,7 +2155,7 @@ static bool s_doConfWpaSupp(T_EndPoint* pEP, T_Radio* pRad _UNUSED) {
+     return true;
+ }
+ 
+-static bool s_doReloadWpaSupp(T_EndPoint* pEP, T_Radio* pRad _UNUSED) {
++static bool s_doUpdateWpaSupp(T_EndPoint* pEP, T_Radio* pRad _UNUSED) {
+     ASSERTS_TRUE(wifiGen_wpaSupp_isRunning(pEP), true, ME, "%s: wpa_supplicant stopped", pEP->Name);
+     SAH_TRACEZ_INFO(ME, "%s: try to reconfigure wpa_supplicant", pEP->Name);
+     if((!wifiGen_wpaSupp_isAlive(pEP)) || (wld_wpaSupp_ep_reconfigure(pEP) < SWL_RC_OK)) {
+@@ -2082,6 +2165,28 @@ static bool s_doReloadWpaSupp(T_EndPoint* pEP, T_Radio* pRad _UNUSED) {
+     pRad->fsmRad.timeout_msec = 500;
+     return true;
+ }
++
++static bool s_doReloadAp(T_AccessPoint* pAP, T_Radio* pRad _UNUSED) {
++    ASSERTS_NOT_NULL(pAP, true, ME, "NULL");
++    ASSERTI_TRUE(wld_wpaCtrlInterface_isReady(pAP->wpaCtrlInterface), true, ME, "%s: wpaCtrl disconnected", pAP->alias);
++    swl_rc_ne rc = wld_ap_hostapd_reloadBss(pAP);
++    if(rc == SWL_RC_NOT_IMPLEMENTED) {
++        s_schedNextAction(SECDMN_ACTION_OK_NEED_RELOAD, pAP, pRad);
++    }
++    return true;
++}
++
++static bool s_doReloadHostapd(T_Radio* pRad) {
++    ASSERTI_TRUE(wifiGen_hapd_isRunning(pRad), true, ME, "%s: hostapd stopped", pRad->Name);
++    ASSERTI_TRUE(wifiGen_hapd_isStarted(pRad), true, ME, "%s: hostapd instance not started", pRad->Name);
++    if(wld_secDmn_isGrpRestarting(pRad->hostapd)) {
++        SAH_TRACEZ_WARNING(ME, "%s: hostapd group is restarting: skip immediate reload", pRad->Name);
++        return true;
++    }
++    wld_rad_hostapd_reload(pRad);
++    return true;
++}
++
+ /*
+  * Check if we need to do radio up down actions. Need to happen if it's first interface that goes up.
+  */
+@@ -2253,9 +2358,11 @@ wld_fsmMngr_action_t actions[GEN_FSM_MAX] = {
+     {FSM_ACTION(GEN_FSM_MOD_HOSTAPD), .doRadFsmAction = s_doConfHostapd},
+     {FSM_ACTION(GEN_FSM_MOD_WPASUPP), .doEpFsmAction = s_doConfWpaSupp},
+     {FSM_ACTION(GEN_FSM_RELOAD_AP_SECKEY), .doVapFsmAction = s_doReloadApSecKey},
++    {FSM_ACTION(GEN_FSM_RELOAD_AP), .doVapFsmAction = s_doReloadAp},
++    {FSM_ACTION(GEN_FSM_RELOAD_HOSTAPD), .doRadFsmAction = s_doReloadHostapd},
+     {FSM_ACTION(GEN_FSM_MOD_EP_MACADDR), .doEpFsmAction = s_doSetEpMAC},
+     {FSM_ACTION(GEN_FSM_UPDATE_BEACON), .doVapFsmAction = s_doUpdateBeacon},
+-    {FSM_ACTION(GEN_FSM_UPDATE_WPASUPP), .doEpFsmAction = s_doReloadWpaSupp},
++    {FSM_ACTION(GEN_FSM_UPDATE_WPASUPP), .doEpFsmAction = s_doUpdateWpaSupp},
+     {FSM_ACTION(GEN_FSM_ENABLE_HOSTAPD), .doRadFsmAction = s_doEnableHostapd},
+     {FSM_ACTION(GEN_FSM_ENABLE_RAD), .doRadFsmAction = s_doRadEnable},
+     {FSM_ACTION(GEN_FSM_ENABLE_AP), .doVapFsmAction = s_doEnableAp},
+diff --git a/src/Plugin/wifiGen_hapd.c b/src/Plugin/wifiGen_hapd.c
+index e00e657..32c7c5e 100644
+--- a/src/Plugin/wifiGen_hapd.c
++++ b/src/Plugin/wifiGen_hapd.c
+@@ -391,6 +391,12 @@ void wifiGen_hapd_initDynCfgParamSupp(T_Radio* pRad) {
+     wld_secDmn_detectCfgParamsSupp(pRad->hostapd, (const char* []) {"mld_addr"}, 1, NULL);
+     wld_secDmn_detectCfgParamsSupp(pRad->hostapd, (const char* []) {"mbssid_max", "mbssid_index"}, 2, "mbssid_");
+     wld_secDmn_detectCfgParamsSupp(pRad->hostapd, (const char* []) {"ttlm_enable"}, 1, NULL);
++    swl_trl_e supp = wld_secDmn_getCmdSupp(pRad->hostapd, "RELOAD_BSS");
++    if(supp == SWL_TRL_UNKNOWN) {
++        if(wld_secDmn_learnCmdSuppFromHelpMsg("hostapd_cli", "-h", "reload_bss", &supp)) {
++            wld_secDmn_setCmdSupp(pRad->hostapd, "RELOAD_BSS", supp);
++        }
++    }
+ }
+ 
+ swl_rc_ne wifiGen_hapd_init(T_Radio* pRad) {
+diff --git a/src/nl80211/wld_hostapd_ap_api.c b/src/nl80211/wld_hostapd_ap_api.c
+index 6a564f6..1b7d0e9 100644
+--- a/src/nl80211/wld_hostapd_ap_api.c
++++ b/src/nl80211/wld_hostapd_ap_api.c
+@@ -122,6 +122,28 @@ bool wld_ap_hostapd_reloadSecKey(T_AccessPoint* pAP, const char* reason) {
+     return s_sendHostapdCommand(pAP, "RELOAD_WPA_PSK", reason);
+ }
+ 
++swl_rc_ne wld_ap_hostapd_reloadBss(T_AccessPoint* pAP) {
++    ASSERT_NOT_NULL(pAP, SWL_RC_INVALID_PARAM, ME, "NULL");
++    T_Radio* pR = pAP->pRadio;
++    ASSERT_NOT_NULL(pR, SWL_RC_INVALID_PARAM, ME, "NULL");
++    wld_wpaCtrlMngr_t* pMgr = wld_secDmn_getWpaCtrlMgr(pR->hostapd);
++    wld_secDmn_t* pSecDmn = wld_wpaCtrlMngr_getSecDmn(pMgr);
++    ASSERT_NOT_NULL(pSecDmn, SWL_RC_INVALID_STATE, ME, "NULL");
++    wld_wpaCtrlInterface_t* pIface = pAP->wpaCtrlInterface;
++    ASSERT_NOT_NULL(pIface, SWL_RC_INVALID_STATE, ME, "%s: hostapd bss has no wpactrl iface available", pAP->alias);
++    swl_trl_e trl = wld_secDmn_getCmdSupp(pSecDmn, "RELOAD_BSS");
++    ASSERTI_NOT_EQUALS(trl, SWL_TRL_FALSE, SWL_RC_NOT_IMPLEMENTED, ME, "%s: cmd not supported", pAP->alias);
++    swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtCheckResponseExt(pIface, 100, "OK", "RELOAD_BSS");
++    //the call may timeout while being applied, but that only happens on success
++    if(rc == SWL_RC_NOT_AVAILABLE) {
++        rc = SWL_RC_OK;
++    }
++    if(wld_secDmn_deduceCmdSuppFromExecRc(rc, &trl)) {
++        wld_secDmn_setCmdSupp(pSecDmn, "RELOAD_BSS", trl);
++    }
++    return rc;
++}
++
+ swl_rc_ne wld_ap_hostapd_dumpNeighborList(T_AccessPoint* pAP, swl_macBin_t* list, uint32_t maxLen, uint32_t* pLen) {
+     ASSERT_NOT_NULL(pAP, SWL_RC_INVALID_PARAM, ME, "NULL");
+     ASSERTS_TRUE(wld_wpaCtrlInterface_isReady(pAP->wpaCtrlInterface), SWL_RC_INVALID_STATE, ME, "%s: wpaCtrl disconnected", pAP->alias);
+@@ -334,9 +356,6 @@ SWL_TABLE(sHapdCfgParamsActionMap,
+               {"ap_pin", SECDMN_ACTION_OK_NEED_SIGHUP},
+               {"mbo", SECDMN_ACTION_OK_NEED_SIGHUP},
+               {"multi_ap", SECDMN_ACTION_OK_NEED_SIGHUP},
+-              {"multi_ap_backhaul_ssid", SECDMN_ACTION_OK_NEED_SIGHUP},
+-              {"multi_ap_backhaul_wpa_psk", SECDMN_ACTION_OK_NEED_SIGHUP},
+-              {"multi_ap_backhaul_wpa_passphrase", SECDMN_ACTION_OK_NEED_SIGHUP},
+               {"ap_max_inactivity", SECDMN_ACTION_OK_NEED_SIGHUP},
+               {"rrm_neighbor_report", SECDMN_ACTION_OK_NEED_SIGHUP},
+               {"rrm_beacon_report", SECDMN_ACTION_OK_NEED_SIGHUP},
+@@ -346,6 +365,10 @@ SWL_TABLE(sHapdCfgParamsActionMap,
+               {"rsn_override_mfp_2", SECDMN_ACTION_OK_NEED_SIGHUP},
+               {"rsn_override_key_mgmt_2", SECDMN_ACTION_OK_NEED_SIGHUP},
+               {"rsn_override_pairwise_2", SECDMN_ACTION_OK_NEED_SIGHUP},
++              //params set and applied on bss with reload conf from memory
++              {"multi_ap_backhaul_ssid", SECDMN_ACTION_OK_NEED_RELOAD_BSS},
++              {"multi_ap_backhaul_wpa_psk", SECDMN_ACTION_OK_NEED_RELOAD_BSS},
++              {"multi_ap_backhaul_wpa_passphrase", SECDMN_ACTION_OK_NEED_RELOAD_BSS},
+               //params set and applied on bss with reload_wpa_psk and update_beacon
+               {"ssid", SECDMN_ACTION_OK_NEED_RELOAD_SECKEY},
+               {"wpa_psk", SECDMN_ACTION_OK_NEED_RELOAD_SECKEY},
+@@ -443,43 +466,13 @@ static bool s_setChangedMultiParams(T_AccessPoint* pAP, swl_mapChar_t* pCurrVapP
+     return ret;
+ }
+ 
+-/**
+- *  @brief return true if the @param ssid_key is present in another vap config as multi_ap_backhaul_ssid
+- *
+- * @param cfg_llist linked list with all VAP configs for one radio
+- * @param ssid_key ssid we look for in another VAPs config
+- * @return true if SSID is present at least in another VAP config, false otherwise
+- */
+-static bool s_cfgHasTransversalDeps(T_AccessPoint* pAP, wld_hostapd_config_t* cfg_llist, const char* ssid_key) {
+-
+-    ASSERTS_NOT_NULL(cfg_llist, false, ME, "NULL");
+-    ASSERTS_FALSE(swl_str_isEmpty(ssid_key), false, ME, "EMPTY");
+-    ASSERTS_NOT_NULL(pAP, SECDMN_ACTION_ERROR, ME, "NULL");
+-
+-    if(!SWL_BIT_IS_SET(pAP->multiAPType, MULTIAP_BACKHAUL_BSS)) {
+-        return false;
+-    }
+-
+-    char* curr_ssid = "";
+-    amxc_llist_for_each(it, &cfg_llist->vaps) {
+-        wld_hostapdVapInfo_t* vapInfo = amxc_llist_it_get_data(it, wld_hostapdVapInfo_t, it);
+-
+-        curr_ssid = swl_mapChar_get(&(vapInfo->vapParams), "multi_ap_backhaul_ssid");
+-        if(swl_str_matches(curr_ssid, ssid_key)) {
+-            return true;
+-        }
+-    }
+-    return false;
+-}
+-
+ /**
+  * @brief set the SSID in the hostapd
+  *
+  * @param pAP accesspoint
+  * @param ssid the new ssid
+- * @return - SECDMN_ACTION_OK_NEED_UPDATE_BEACON when the SSID is updated for the hostapd config file and the hostapd context
+- *         - SECDMN_ACTION_OK_NEED_SIGHUP  when the SSID is updated for the hostapd context but not for the hostapd config file
+- *         - Otherwise SECDMN_ACTION_ERROR.
++ * @return - action > SECDMN_ACTION_DONE when ssid is SET in hostapd context but need complementary applying action
++ *         - Otherwise SECDMN_ACTION_ERROR in case of error
+  */
+ wld_secDmn_action_rc_ne wld_ap_hostapd_setSsid(T_AccessPoint* pAP, const char* ssid) {
+     ASSERTS_NOT_NULL(pAP, SECDMN_ACTION_ERROR, ME, "NULL");
+@@ -496,31 +489,30 @@ wld_secDmn_action_rc_ne wld_ap_hostapd_setSsid(T_AccessPoint* pAP, const char* s
+     ASSERTI_TRUE(ret, SECDMN_ACTION_ERROR, ME, "no saved config");
+ 
+     swl_mapChar_t* pCurrVapParams = wld_hostapd_getConfigMapByBssid(config, (swl_macBin_t*) pAP->pSSID->BSSID);
+-
+-    //hostapd requires backhaul_ssid included in double quotes
+-    char bhSsid[SSID_NAME_LEN + 2] = "\"\"";
+-
+     if(pCurrVapParams != NULL) {
+-        if(!swl_str_matches(swl_mapChar_get(pCurrVapParams, "wps_state"), "0")) {
+-            action = SWL_MAX(action, SECDMN_ACTION_OK_NEED_SIGHUP);
+-        }
+-
+-        if(swl_mapChar_has(pCurrVapParams, "ssid")) {
+-            snprintf(bhSsid, sizeof(bhSsid), "\"%s\"", swl_mapChar_get(pCurrVapParams, "ssid"));
++        if(swl_typeUInt8_fromCharDef(swl_mapChar_get(pCurrVapParams, "wps_state"), 0) > 0) {
++            action = SWL_MAX(action, SECDMN_ACTION_OK_NEED_RELOAD_BSS);
+         }
+     } else {
+         action = SECDMN_ACTION_ERROR;
+     }
+ 
+-    if((swl_str_len(bhSsid) > 2) && s_cfgHasTransversalDeps(pAP, config, bhSsid)) {
+-        action = SWL_MAX(action, SECDMN_ACTION_OK_NEED_SIGHUP);
+-        SAH_TRACEZ_INFO(ME, "need SIGHUP for multiap_wps");
+-    }
+-
+     wld_hostapd_deleteConfig(config);
+     return action;
+ }
+ 
++wld_secDmn_action_rc_ne wld_ap_hostapd_setBhSsid(T_AccessPoint* pAP, const char* bhSsid) {
++    ASSERTS_NOT_NULL(pAP, SECDMN_ACTION_ERROR, ME, "NULL");
++    ASSERT_STR(bhSsid, SECDMN_ACTION_ERROR, ME, "empty bh ssid");
++    // set the bhSsid field in the hostapd context
++    wld_secDmn_action_rc_ne action = SECDMN_ACTION_OK_DONE;
++    // hostapd requires backhaul_ssid included in double quotes
++    char bhSsidQuoted[swl_str_len(bhSsid) + 3];
++    snprintf(bhSsidQuoted, sizeof(bhSsidQuoted), "\"%s\"", bhSsid);
++    bool ret = s_setParam(pAP, "multi_ap_backhaul_ssid", bhSsidQuoted, &action);
++    ASSERT_TRUE(ret, SECDMN_ACTION_ERROR, ME, "%s: failed for setting BH SSID %s", pAP->alias, bhSsidQuoted);
++    return action;
++}
+ /**
+  * @brief update the secret key in the hostapd runtime conf
+  * This function updates wep_keyx, wpa_psk, wpa_passphrase and sae_password keys
+@@ -587,7 +579,11 @@ static wld_secDmn_action_rc_ne s_ap_hostapd_setSecretKeyExt(T_AccessPoint* pAP,
+     break;
+     case SWL_SECURITY_APMODE_NONE:
+     default:
+-        break;
++        return action;
++    }
++    if((pNewVapParams != NULL) &&
++       (swl_typeUInt8_fromCharDef(swl_mapChar_get(pNewVapParams, "wps_state"), 0) > 0)) {
++        action = SWL_MAX(action, SECDMN_ACTION_OK_NEED_RELOAD_BSS);
+     }
+     return action;
+ }
+@@ -681,18 +677,6 @@ wld_secDmn_action_rc_ne wld_ap_hostapd_setSecParams(T_AccessPoint* pAP) {
+         goto cleanup;
+     }
+ 
+-    //hostapd requires backhaul_ssid included in double quotes
+-    char bhSsid[SSID_NAME_LEN + 2] = "\"\"";
+-
+-    if(swl_mapChar_has(pNewVapParams, "ssid")) {
+-        snprintf(bhSsid, sizeof(bhSsid), "\"%s\"", swl_mapChar_get(pNewVapParams, "ssid"));
+-    }
+-
+-    if((swl_str_len(bhSsid) > 2) && s_cfgHasTransversalDeps(pAP, config, bhSsid)) {
+-        action = SECDMN_ACTION_OK_NEED_SIGHUP;
+-        SAH_TRACEZ_INFO(ME, "need SIGHUP for multiap_wps");
+-    }
+-
+     action = SWL_MAX(action, s_ap_hostapd_setSecurityModeExt(pAP, pCurrVapParams, pNewVapParams));
+     action = SWL_MAX(action, s_ap_hostapd_setSecretKeyExt(pAP, pCurrVapParams, pNewVapParams));
+ 
+diff --git a/src/nl80211/wld_hostapd_cfgFile.c b/src/nl80211/wld_hostapd_cfgFile.c
+index 8f8fdc5..32bac5b 100644
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -1224,8 +1224,6 @@ static void s_setSecKeyCacheConf(T_AccessPoint* pAP, swl_mapChar_t* vapConfigMap
+     }
+ }
+ 
+-#define M_HOSTAPD_MULTI_AP_BBSS     0x1
+-#define M_HOSTAPD_MULTI_AP_FBSS     0x2
+ 
+ #define MIN_VLAN_ID 1
+ #define MAX_VLAN_ID 4094
+diff --git a/src/nl80211/wld_hostapd_cfgManager.c b/src/nl80211/wld_hostapd_cfgManager.c
+index 09c5470..8a26eb7 100644
+--- a/src/nl80211/wld_hostapd_cfgManager.c
++++ b/src/nl80211/wld_hostapd_cfgManager.c
+@@ -69,6 +69,7 @@
+ #include "wld_hostapd_cfgFile.h"
+ #include "wld_radio.h"
+ #include "wld_rad_hostapd_api.h"
++#include "wld_accesspoint.h"
+ 
+ #define ME "fileMgr"
+ 
+@@ -588,3 +589,39 @@ const char* wld_hostapd_getConfigParamByBssidValStr(wld_hostapd_config_t* conf,
+     return swl_map_getEntryValueValue(configMap, entry);
+ }
+ 
++int32_t wld_hostapd_forEachMultiApDep(wld_hostapd_config_t* hapdCfg, const char* bhSsid, void* userData, wld_hostapd_procMultiApDep_f hdlr) {
++    ASSERTS_NOT_NULL(hapdCfg, SWL_RC_INVALID_PARAM, ME, "NULL");
++    ASSERTS_FALSE(swl_str_isEmpty(bhSsid), SWL_RC_INVALID_PARAM, ME, "EMPTY");
++    uint32_t cntDeps = 0;
++    amxc_llist_for_each(it, &hapdCfg->vaps) {
++        wld_hostapdVapInfo_t* vapInfo = amxc_llist_it_get_data(it, wld_hostapdVapInfo_t, it);
++        swl_mapChar_t* currCfg = &(vapInfo->vapParams);
++        char* multiAp = swl_mapChar_get(currCfg, "multi_ap");
++        uint32_t hapdMultiApType = swl_typeUInt32_fromCharDef(multiAp, 0);
++        if(!(hapdMultiApType & M_HOSTAPD_MULTI_AP_FBSS)) {
++            continue;
++        }
++        char* wpsState = swl_mapChar_get(currCfg, "wps_state");
++        bool vapWpsEnable = (swl_typeUInt8_fromCharDef(wpsState, 0) > 0);
++        if(!vapWpsEnable) {
++            continue;
++        }
++        // hostapd requires backhaul_ssid included in double quotes
++        char bhSsidQuoted[swl_str_len(bhSsid) + 3];
++        snprintf(bhSsidQuoted, sizeof(bhSsidQuoted), "\"%s\"", bhSsid);
++        const char* currBhSsidQuoted = swl_mapChar_get(currCfg, "multi_ap_backhaul_ssid");
++        if(!currBhSsidQuoted || !swl_str_matches(currBhSsidQuoted, bhSsidQuoted)) {
++            continue;
++        }
++        swl_macBin_t bssid = SWL_MAC_BIN_NEW();
++        T_AccessPoint* pAP = NULL;
++        if(!swl_typeMacBin_fromChar(&bssid, swl_mapChar_get(currCfg, "bssid")) ||
++           swl_mac_binIsNull(&bssid) || ((pAP = wld_ap_getVapByBssid(&bssid)) == NULL)) {
++            continue;
++        }
++        SWL_CALL(hdlr, pAP, vapInfo, userData);
++        cntDeps++;
++    }
++    return cntDeps;
++}
++
