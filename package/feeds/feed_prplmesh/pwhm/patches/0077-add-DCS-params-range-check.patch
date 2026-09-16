@@ -1,0 +1,81 @@
+From fc9ce10f6aa3f3550d7d1d764e1eae88c9b5abac Mon Sep 17 00:00:00 2001
+From: Atchaya R <ratchaya@qti.qualcomm.com>
+Date: Wed, 16 Sep 2026 13:35:18 +0530
+Subject: [PATCH] pwhm: add correct range check for DCS params
+
+Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
+---
+ include/wld/wld.h       |  6 +++---
+ odl/wld_accesspoint.odl | 14 +++++++-------
+ 2 files changed, 10 insertions(+), 10 deletions(-)
+
+diff --git a/include/wld/wld.h b/include/wld/wld.h
+index f0a0f72..c6357a7 100644
+--- a/include/wld/wld.h
++++ b/include/wld/wld.h
+@@ -1949,11 +1949,11 @@ struct S_ACCESSPOINT {
+     bool DPP_IsRelay;                             /* true when DPP.Role="Relay" */
+ 
+     uint32_t DCS_Enable;                            /* DCS enable bitmask: bit0=CW, bit1=WLAN, bit2=AWGN, bit4=OBSS */
+-    uint32_t DCS_WlanIntrDetectionThreshold;        /* DCS WLAN interference detection threshold (0-6) */
++    uint32_t DCS_WlanIntrDetectionThreshold;        /* DCS WLAN interference detection threshold (0-300) */
+     uint32_t DCS_WlanIntrTxErrThreshold;            /* DCS WLAN TX error threshold (0-300) */
+     uint32_t DCS_WlanIntrPhyErrThreshold;           /* DCS WLAN PHY error threshold (0-300) */
+-    uint32_t DCS_WlanIntrCochIntrThreshold;         /* DCS co-channel interference threshold (0-30) */
+-    uint32_t DCS_MaxcuValue;                        /* DCS maximum channel utilization value (0-50) */
++    uint32_t DCS_WlanIntrCochIntrThreshold;         /* DCS co-channel interference threshold (0-255, hostapd u8) */
++    uint32_t DCS_MaxcuValue;                        /* DCS maximum channel utilization value (0-100, percentage) */
+     uint32_t DCS_BwReductionCtrl;                   /* DCS BW reduction ctrl bitmask: CW:0x0001, WLAN:0x0002, AWGN:0x0004, OBSS:0x0010 */
+     uint32_t DCS_SetAfcChanSelConfig;               /* AFC channel selection config (afc set_afc_chan_sel_config) */
+     uint32_t DCS_RandomChanBitmap;                  /* DCS random channel bitmap bitmask: CW:0x0001, WLAN:0x0002, AWGN:0x0004, OBSS:0x0010 */
+diff --git a/odl/wld_accesspoint.odl b/odl/wld_accesspoint.odl
+index 544afca..8a77d7c 100644
+--- a/odl/wld_accesspoint.odl
++++ b/odl/wld_accesspoint.odl
+@@ -1098,11 +1098,11 @@ define rrm_t{
+ 			 *   hostapd_cli -i wlanX [-l Y] DCS set_wlan_intr_params intr_detection_threshold <value>
+ 			 * Not persistent: applied dynamically via hostapd_cli.
+ 			 * hostapd default: 6 (DCS_INTR_DETECTION_THR)
+-			 * Valid range: 0 to 6
++			 * Valid range: 0 to 300
+ 			 */
+ 			uint32 WlanIntrDetectionThreshold {
+ 				default 6;
+-				on action validate call check_range { min = 0, max = 6 };
++				on action validate call check_range { min = 0, max = 300 };
+ 			}
+ 
+ 			/**
+@@ -1137,24 +1137,24 @@ define rrm_t{
+ 			 *   hostapd_cli -i wlanX [-l Y] DCS set_wlan_intr_params coch_intr_threshold <value>
+ 			 * Not persistent: applied dynamically via hostapd_cli.
+ 			 * hostapd default: 30 (DCS_COCH_INTR_THRESHOLD)
+-			 * Valid range: 0 to 30
++			 * Valid range: 0 to 255 (hostapd stores as u8)
+ 			 */
+ 			uint32 WlanIntrCochIntrThreshold {
+ 				default 30;
+-				on action validate call check_range { min = 0, max = 30 };
++				on action validate call check_range { min = 0, max = 255 };
+ 			}
+ 
+ 			/**
+-			 * Maximum channel utilization value.
++			 * Maximum channel utilization value (percentage).
+ 			 * When changed, automatically sends:
+ 			 *   hostapd_cli -i wlanX [-l Y] DCS set_wlan_intr_params user_max_cu <value>
+ 			 * Not persistent: applied dynamically via hostapd_cli.
+ 			 * hostapd default: 50 (DCS_USER_MAX_CU)
+-			 * Valid range: 0 to 50
++			 * Valid range: 0 to 100 (percentage; hostapd stores as u8)
+ 			 */
+ 			uint32 MaxcuValue {
+ 				default 50;
+-				on action validate call check_range { min = 0, max = 50 };
++				on action validate call check_range { min = 0, max = 100 };
+ 			}
+ 
+ 			/**
+-- 
+2.34.1
+
