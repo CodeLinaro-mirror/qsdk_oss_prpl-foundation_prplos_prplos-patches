@@ -1,0 +1,506 @@
+From: Kartheek E <karte@qti.qualcomm.com>
+Date: 16 Sep 2026
+Subject: [PATCH] pwhm: add 11bi CPE security configurations for AP mode
+
+WiFi8/11bi: Add 11bi Client Privacy Enhancement (CPE)
+support in AP
+New Security object parameters under WiFi.AccessPoint.{i}.Security:
+  - EPPKE: Enable EPPKE AKM in RSNE of beacons/probe responses
+  - AssocFrameEncryption: (Re)Association frame encryption support
+  - PMKSACachingPrivacy: PMKID caching privacy to prevent device tracking
+  - KEKInPASN: Unauthenticated EPPKE without base AKM
+  - EAPUsingAuthenticationFrames: EAP using 802.11 authentication frames (enterprise)
+  - SAEPwIdNum/SAEPwIdKey: SAE password identifier changing support
+  - PASNGroups: PASN elliptic curve groups for EPPKE authentication
+  - RadSecEnable/RadSecCACert/RadSecClientCert/RadSecPrivateKey: RADSec
+    (RADIUS over TLS, RFC 6614) for enterprise deployments
+
+Signed-off-by: Karteek E <karte@qti.qualcomm.com>
+---
+ include/wld/wld.h                 | 14 ++++++
+ odl/wld_accesspoint.odl           | 128 ++++++++++++++++++++++++++++++++++++
+ src/ApMgt/wld_ap_security.c       | 29 +++++++++++++++++
+ src/nl80211/wld_hostapd_cfgFile.c | 63 +++++++++++++++++++++++++++++++--
+ src/wld_accesspoint.c             | 28 +++++++++++++++++
+ src/nl80211/wld_hostapd_ap_api.c  | 12 +++++++++
+ src/Plugin/wifiGen_fsm.c           |  6 ++++++
+ 7 files changed, 274 insertions(+), 6 deletions(-)
+
+
+--- a/include/wld/wld.h
++++ b/include/wld/wld.h
+@@ -2044,6 +2044,20 @@
+     uint8_t vlanNaming;
+     char wpaPskFile[128];
+     char saePasswordFile[128];
++    /* 11bi Client Privacy Enhancements (CPE) - AP mode */
++    bool eppke;                             /* EPPKE AKM in RSNE of beacons/probe responses */
++    bool assocFrameEncryption;              /* (Re)Association frame encryption support */
++    bool pmksaCachingPrivacy;               /* PMKID Caching privacy support */
++    bool kekInPasn;                         /* Derive KEK in PASN */
++    bool eapUsingAuthFrames;                /* EAP using 802.11 authentication frames (enterprise) */
++    uint32_t saePwIdNum;                    /* SAE Password Identifier change count */
++    char saePwIdKey[65];                    /* SAE Password Identifier AES-SIV key (64-char hex) */
++    char pasnGroups[64];                    /* PASN elliptic curve groups (space-separated DH IDs) */
++    /* RADSec (RADIUS over TLS, RFC 6614) */
++    bool radSecEnable;                      /* RADSec (RADIUS over TLS) enabled */
++    char radSecCACert[256];                 /* RADSec CA certificate file path */
++    char radSecClientCert[256];             /* RADSec client certificate file path */
++    char radSecPrivateKey[256];             /* RADSec private key file path */
+ 
+     char beaconRate[128];
+     char supportedRates[128];
+--- a/odl/wld_accesspoint.odl
++++ b/odl/wld_accesspoint.odl
+@@ -895,6 +895,134 @@
+                                on action validate call check_range { min = -1, max = 2 };
+ 				default -1;
+ 			}
++
++			/**
++			 * Enable EPPKE (Enhanced Privacy Protection Key Exchange) AKM in AP mode.
++			 * When set to true, the AP includes EPPKE AKM in RSNE of beacons and probe responses,
++			 * enabling clients to perform encrypted (re)association per IEEE 802.11bi.
++			 * @version 11.0
++			 */
++			%persistent bool EPPKE {
++				default false;
++			}
++
++			/**
++			 * Enable (Re)Association frame encryption.
++			 * When set, the AP advertises support for encrypted (Re)Association frames per IEEE 802.11bi,
++			 * preventing passive observers from fingerprinting devices through association frame contents.
++			 * Requires EPPKE to be enabled.
++			 * @version 11.0
++			 */
++			%persistent bool AssocFrameEncryption {
++				default false;
++			}
++
++			/**
++			 * Enable PMKID Caching Privacy.
++			 * Prevents PMKID-based device tracking by anonymizing PMKID values in association frames.
++			 * Requires AssocFrameEncryption to be enabled.
++			 * @version 11.0
++			 */
++			%persistent bool PMKSACachingPrivacy {
++				default false;
++			}
++
++			/**
++			 * Enable Unauthenticated EPPKE.
++			 * Allows EPPKE without a base AKM (no mutual authentication).
++			 * The PTK is derived using PMK set to "PMKz" as per IEEE 802.11bi clause 12.13.8.
++			 * @version 11.0
++			 */
++			%persistent bool KEKInPASN {
++				default false;
++			}
++
++			/**
++			 * Enable EAP using Authentication Frames.
++			 * Enables IEEE 802.1X authentication utilizing 802.11 authentication frames
++			 * instead of EAPOL over data frames (IEEE 802.11bi enterprise mode).
++			 * Applicable when ModeEnabled is an Enterprise type.
++			 * @version 11.0
++			 */
++			%persistent bool EAPUsingAuthenticationFrames {
++				default false;
++			}
++
++			/**
++			 * SAE Password Identifier change count.
++			 * Specifies the number of alternative single-use SAE password identifiers to generate
++			 * and distribute to clients during the 4-Way Handshake, preventing passive observers
++			 * from correlating reconnections via static password identifiers.
++			 * Set to 0 to disable SAE Password Identifier changing.
++			 * @version 11.0
++			 */
++			%persistent uint32 SAEPwIdNum {
++				default 0;
++			}
++
++			/**
++			 * SAE Password Identifier AES-SIV encryption key.
++			 * A 256-bit key expressed as a 64-character hexadecimal string, used to generate
++			 * encrypted alternative SAE password identifiers. Required when SAEPwIdNum > 0.
++			 * <i>When read, this parameter returns an empty string, regardless of the actual value.</i>
++			 * @version 11.0
++			 */
++			%persistent string SAEPwIdKey {
++				default "";
++			}
++
++			/**
++			 * PASN elliptic curve groups for EPPKE authentication.
++			 * Space-separated list of DH group identifiers (e.g. "19 20 21").
++			 * Specifies supported elliptic curve groups for PASN-based EPPKE authentication.
++			 * Leave empty to use hostapd defaults.
++			 * @version 11.0
++			 */
++			%persistent string PASNGroups {
++				default "";
++			}
++
++			/**
++			 * Enable RADSec (RADIUS over TLS, RFC 6614).
++			 * When enabled, RADIUS authentication traffic is transported over a TLS-protected
++			 * TCP connection to the AAA server, providing confidentiality and certificate-based
++			 * server authentication. Applicable when ModeEnabled is an Enterprise type.
++			 * Requires RadiusServerPort set to 2083 and certificate paths configured.
++			 * @version 11.0
++			 */
++			%persistent bool RadSecEnable {
++				default false;
++			}
++
++			/**
++			 * RADSec CA certificate file path.
++			 * Absolute path to the CA certificate used to validate the RADIUS/TLS server certificate.
++			 * Required when RadSecEnable is true.
++			 * @version 11.0
++			 */
++			%persistent string RadSecCACert {
++				default "";
++			}
++
++			/**
++			 * RADSec client certificate file path.
++			 * Absolute path to the client certificate used for mutual TLS authentication
++			 * with the RADIUS server. Required when RadSecEnable is true.
++			 * @version 11.0
++			 */
++			%persistent string RadSecClientCert {
++				default "";
++			}
++
++			/**
++			 * RADSec private key file path.
++			 * Absolute path to the private key corresponding to RadSecClientCert.
++			 * Required when RadSecEnable is true.
++			 * @version 11.0
++			 */
++			%persistent string RadSecPrivateKey {
++				default "";
++			}
+ 		}
+ 
+ 		/** This object contains parameters related to MAC-address based filtering for this access point.  */
+--- a/src/ApMgt/wld_ap_security.c
++++ b/src/ApMgt/wld_ap_security.c
+@@ -561,6 +561,35 @@
+             pAP->encryptionModeEnabled = swl_conv_charToEnum(newMode, cstr_AP_EncryptionMode, APEMI_MAX, APEMI_DEFAULT);
+         } else if(swl_str_matches(pname, "SPPAmsdu")) {
+             pAP->sppAmsdu = amxc_var_dyncast(int32_t, newValue);
++        } else if(swl_str_matches(pname, "EPPKE")) {
++            pAP->eppke = amxc_var_dyncast(bool, newValue);
++        } else if(swl_str_matches(pname, "AssocFrameEncryption")) {
++            pAP->assocFrameEncryption = amxc_var_dyncast(bool, newValue);
++        } else if(swl_str_matches(pname, "PMKSACachingPrivacy")) {
++            pAP->pmksaCachingPrivacy = amxc_var_dyncast(bool, newValue);
++        } else if(swl_str_matches(pname, "KEKInPASN")) {
++            pAP->kekInPasn = amxc_var_dyncast(bool, newValue);
++        } else if(swl_str_matches(pname, "EAPUsingAuthenticationFrames")) {
++            pAP->eapUsingAuthFrames = amxc_var_dyncast(bool, newValue);
++        } else if(swl_str_matches(pname, "SAEPwIdNum")) {
++            pAP->saePwIdNum = amxc_var_dyncast(uint32_t, newValue);
++        } else if(swl_str_matches(pname, "SAEPwIdKey")) {
++            valStr = amxc_var_dyncast(cstring_t, newValue);
++            swl_str_copy(pAP->saePwIdKey, sizeof(pAP->saePwIdKey), valStr);
++        } else if(swl_str_matches(pname, "PASNGroups")) {
++            valStr = amxc_var_dyncast(cstring_t, newValue);
++            swl_str_copy(pAP->pasnGroups, sizeof(pAP->pasnGroups), valStr);
++        } else if(swl_str_matches(pname, "RadSecEnable")) {
++            pAP->radSecEnable = amxc_var_dyncast(bool, newValue);
++        } else if(swl_str_matches(pname, "RadSecCACert")) {
++            valStr = amxc_var_dyncast(cstring_t, newValue);
++            swl_str_copy(pAP->radSecCACert, sizeof(pAP->radSecCACert), valStr);
++        } else if(swl_str_matches(pname, "RadSecClientCert")) {
++            valStr = amxc_var_dyncast(cstring_t, newValue);
++            swl_str_copy(pAP->radSecClientCert, sizeof(pAP->radSecClientCert), valStr);
++        } else if(swl_str_matches(pname, "RadSecPrivateKey")) {
++            valStr = amxc_var_dyncast(cstring_t, newValue);
++            swl_str_copy(pAP->radSecPrivateKey, sizeof(pAP->radSecPrivateKey), valStr);
+         } else {
+             continue;
+         }
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -1760,6 +1760,23 @@
+         if(pAP->radiusChargeableUserId) {
+             swl_mapChar_add(vapConfigMap, "radius_request_cui", "1");
+         }
++        /* RADSec: RADIUS over TLS (RFC 6614) */
++        if(pAP->radSecEnable) {
++            swl_mapChar_add(vapConfigMap, "auth_server_type", "TLS");
++            if(!swl_str_isEmpty(pAP->radSecCACert)) {
++                swl_mapChar_add(vapConfigMap, "auth_server_ca_cert", pAP->radSecCACert);
++            }
++            if(!swl_str_isEmpty(pAP->radSecClientCert)) {
++                swl_mapChar_add(vapConfigMap, "auth_server_client_cert", pAP->radSecClientCert);
++            }
++            if(!swl_str_isEmpty(pAP->radSecPrivateKey)) {
++                swl_mapChar_add(vapConfigMap, "auth_server_private_key", pAP->radSecPrivateKey);
++            }
++        }
++        /* EAP using 802.11 authentication frames (IEEE 802.11bi enterprise) */
++        if(pAP->eapUsingAuthFrames) {
++            swl_mapCharFmt_addValInt32(vapConfigMap, "eap_using_authentication_frames", 1);
++        }
+         swl_mapCharFmt_addValInt32(vapConfigMap, "ieee80211w", mfp);
+         swl_mapCharFmt_addValInt32(vapConfigMap, "ieee8021x", 1);
+         break;
+@@ -1768,6 +1785,31 @@
+         break;
+     }
+     s_setSecKeyCacheConf(pAP, vapConfigMap);
++    /* 11bi Client Privacy Enhancements (CPE) - BSS-level params */
++    if(pAP->eppke && pAP->assocFrameEncryption) {
++        swl_mapCharFmt_addValInt32(vapConfigMap, "assoc_frame_encryption", 1);
++    }
++    if(pAP->eppke && pAP->assocFrameEncryption && pAP->pmksaCachingPrivacy) {
++        swl_mapCharFmt_addValInt32(vapConfigMap, "pmksa_caching_privacy", 1);
++    }
++    if(pAP->eppke && !swl_str_isEmpty(pAP->pasnGroups)) {
++        swl_mapChar_add(vapConfigMap, "pasn_groups", pAP->pasnGroups);
++    }
++    if(pAP->eppke && pAP->kekInPasn) {
++        /* Unauthenticated EPPKE: no base AKM, PASN-only key exchange (AP_EPPKE) */
++        swl_mapCharFmt_addValInt32(vapConfigMap, "kek_in_pasn", 1);
++        swl_mapChar_addOrSet(vapConfigMap, "wpa", "2");
++        swl_mapChar_addOrSet(vapConfigMap, "wpa_pairwise", "CCMP GCMP-256");
++        swl_mapChar_addOrSet(vapConfigMap, "wpa_key_mgmt", "EPPKE");
++        swl_mapChar_addOrSet(vapConfigMap, "ieee80211w", "2");
++    }
++    /* SAE Password Identifier changing support (IEEE 802.11bi) */
++    if(pAP->saePwIdNum > 0) {
++        swl_mapCharFmt_addValInt32(vapConfigMap, "sae_pw_id_num", pAP->saePwIdNum);
++        if(!swl_str_isEmpty(pAP->saePwIdKey)) {
++            swl_mapChar_add(vapConfigMap, "sae_pw_id_key", pAP->saePwIdKey);
++        }
++    }
+     if(pAP->HotSpot2.enable) {
+         swl_mapCharFmt_addValInt32(vapConfigMap, "hs20", true);
+         swl_mapCharFmt_addValInt32(vapConfigMap, "disable_dgaf", pAP->HotSpot2.dgaf_disable);
+--- a/src/wld_accesspoint.c
++++ b/src/wld_accesspoint.c
+@@ -178,6 +179,20 @@
+     pAP->radiusNASIdentifier[0] = '\0';
+     pAP->radiusCalledStationId[0] = '\0';
+     pAP->radiusChargeableUserId = 0;
++    /* 11bi Client Privacy Enhancements (CPE) - defaults */
++    pAP->eppke = false;
++    pAP->assocFrameEncryption = false;
++    pAP->pmksaCachingPrivacy = false;
++    pAP->kekInPasn = false;
++    pAP->eapUsingAuthFrames = false;
++    pAP->saePwIdNum = 0;
++    pAP->saePwIdKey[0] = '\0';
++    pAP->pasnGroups[0] = '\0';
++    /* RADSec defaults */
++    pAP->radSecEnable = false;
++    pAP->radSecCACert[0] = '\0';
++    pAP->radSecClientCert[0] = '\0';
++    pAP->radSecPrivateKey[0] = '\0';
+     pAP->rekeyingInterval = WLD_SEC_PER_H;
+     pAP->retryLimit = 3;
+     pAP->SSIDAdvertisementEnabled = 1;
+@@ -1009,6 +1024,20 @@
+         amxd_trans_set_cstring_t(&trans, "RadiusNASIdentifier", pAP->radiusNASIdentifier);
+         amxd_trans_set_cstring_t(&trans, "RadiusCalledStationId", pAP->radiusCalledStationId);
+         amxd_trans_set_int32_t(&trans, "RadiusChargeableUserId", pAP->radiusChargeableUserId);
++        /* 11bi Client Privacy Enhancements (CPE) */
++        amxd_trans_set_bool(&trans, "EPPKE", pAP->eppke);
++        amxd_trans_set_bool(&trans, "AssocFrameEncryption", pAP->assocFrameEncryption);
++        amxd_trans_set_bool(&trans, "PMKSACachingPrivacy", pAP->pmksaCachingPrivacy);
++        amxd_trans_set_bool(&trans, "KEKInPASN", pAP->kekInPasn);
++        amxd_trans_set_bool(&trans, "EAPUsingAuthenticationFrames", pAP->eapUsingAuthFrames);
++        amxd_trans_set_uint32_t(&trans, "SAEPwIdNum", pAP->saePwIdNum);
++        amxd_trans_set_cstring_t(&trans, "SAEPwIdKey", pAP->saePwIdKey);
++        amxd_trans_set_cstring_t(&trans, "PASNGroups", pAP->pasnGroups);
++        /* RADSec */
++        amxd_trans_set_bool(&trans, "RadSecEnable", pAP->radSecEnable);
++        amxd_trans_set_cstring_t(&trans, "RadSecCACert", pAP->radSecCACert);
++        amxd_trans_set_cstring_t(&trans, "RadSecClientCert", pAP->radSecClientCert);
++        amxd_trans_set_cstring_t(&trans, "RadSecPrivateKey", pAP->radSecPrivateKey);
+ 
+         amxd_trans_select_object(&trans, amxd_object_findf(object, "DPP"));
+         amxd_trans_set_bool(&trans, "Enable", pAP->DPP_Enable);
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -1647,11 +1647,15 @@
+     }
+     case SWL_SECURITY_APMODE_WPA3_P_TM:
+     case SWL_SECURITY_APMODE_WPA2_WPA3_P: {
++        if(pAP->eppke) {
++            mfp = SWL_SECURITY_MFPMODE_REQUIRED;
++        }
+         swl_mapChar_add(vapConfigMap, "wpa", "2");
+-        swl_mapCharFmt_addValStr(vapConfigMap, "wpa_key_mgmt", "%s%s%s",
++        swl_mapCharFmt_addValStr(vapConfigMap, "wpa_key_mgmt", "%s%s%s%s",
+                                  ((mfp != SWL_SECURITY_MFPMODE_REQUIRED) ? "WPA-PSK " : ""),
+                                  ((mfp == SWL_SECURITY_MFPMODE_REQUIRED) ? "WPA-PSK-SHA256 " : ""),
+-                                 (enableVap11be ? "SAE SAE-EXT-KEY" : "SAE"));
++                                 (enableVap11be ? "SAE SAE-EXT-KEY" : "SAE"),
++                                 (pAP->eppke ? " EPPKE" : ""));
+         swl_mapChar_add(vapConfigMap, "wpa_pairwise", enableVap11be ? "CCMP GCMP-256" : "CCMP");
+         swl_mapChar_add(vapConfigMap, "rsn_pairwise", enableVap11be ? "CCMP GCMP-256" : "CCMP");
+         swl_mapCharFmt_addValInt32(vapConfigMap, "wpa_group_rekey", pAP->rekeyingInterval);
+@@ -1676,9 +1680,10 @@
+     }
+     case SWL_SECURITY_APMODE_WPA3_P: {
+         swl_mapChar_add(vapConfigMap, "wpa", "2");
+-        swl_mapCharFmt_addValStr(vapConfigMap, "wpa_key_mgmt", "%s%s",
++        swl_mapCharFmt_addValStr(vapConfigMap, "wpa_key_mgmt", "%s%s%s",
+                                  (enableVap11be ? "SAE SAE-EXT-KEY" : "SAE"),
+-                                 (pAP->IEEE80211rEnable ? (enableVap11be ? " FT-SAE FT-SAE-EXT-KEY" : " FT-SAE") : ""));
++                                 (pAP->IEEE80211rEnable ? (enableVap11be ? " FT-SAE FT-SAE-EXT-KEY" : " FT-SAE") : ""),
++                                 (pAP->eppke ? " EPPKE" : ""));
+         swl_mapChar_add(vapConfigMap, "wpa_pairwise", enableVap11be ? "CCMP GCMP-256" : "CCMP");
+         swl_mapChar_add(vapConfigMap, "rsn_pairwise", enableVap11be ? "CCMP GCMP-256" : "CCMP");
+         swl_mapCharFmt_addValInt32(vapConfigMap, "wpa_group_rekey", pAP->rekeyingInterval);
+@@ -1731,12 +1736,16 @@
+     case SWL_SECURITY_APMODE_WPA2_E:
+     case SWL_SECURITY_APMODE_WPA_WPA2_E: {
+         mfp = (pAP->mboEnable ? SWL_SECURITY_MFPMODE_OPTIONAL : mfp);
++        if(pAP->eppke) {
++            mfp = SWL_SECURITY_MFPMODE_REQUIRED;
++        }
+         tval = (pAP->secModeEnabled - SWL_SECURITY_APMODE_WPA_E) + 1;
+         swl_mapCharFmt_addValInt32(vapConfigMap, "wpa", tval);
+-        swl_mapCharFmt_addValStr(vapConfigMap, "wpa_key_mgmt", "%s%s%s",
++        swl_mapCharFmt_addValStr(vapConfigMap, "wpa_key_mgmt", "%s%s%s%s",
+                                  ((mfp != SWL_SECURITY_MFPMODE_REQUIRED) ? "WPA-EAP " : ""),
+                                  ((mfp == SWL_SECURITY_MFPMODE_REQUIRED) ? "WPA-EAP-SHA256 " : ""),
+-                                 (pAP->IEEE80211rEnable ? "FT-EAP " : ""));
++                                 (pAP->IEEE80211rEnable ? "FT-EAP " : ""),
++                                 (pAP->eppke ? "EPPKE " : ""));
+         swl_mapCharFmt_addValStr(vapConfigMap, "wpa_pairwise", "%s %s", (tval & 1) ? "TKIP" : "", (tval & 2) ? "CCMP" : "");
+         swl_mapCharFmt_addValStr(vapConfigMap, "rsn_pairwise", "%s %s", (tval & 1) ? "TKIP" : "", (tval & 2) ? "CCMP" : "");
+         swl_mapChar_add(vapConfigMap, "auth_server_addr", *pAP->radiusServerIPAddr ? pAP->radiusServerIPAddr : "127.0.0.1");
+--- a/src/nl80211/wld_hostapd_ap_api.c
++++ b/src/nl80211/wld_hostapd_ap_api.c
+@@ -340,6 +340,14 @@
+               {"ap_max_inactivity", SECDMN_ACTION_OK_NEED_SIGHUP},
+               {"rrm_neighbor_report", SECDMN_ACTION_OK_NEED_SIGHUP},
+               {"rrm_beacon_report", SECDMN_ACTION_OK_NEED_SIGHUP},
++              /* 11bi Client Privacy Enhancements (CPE) */
++              {"assoc_frame_encryption", SECDMN_ACTION_OK_NEED_SIGHUP},
++              {"pmksa_caching_privacy", SECDMN_ACTION_OK_NEED_SIGHUP},
++              {"pasn_groups", SECDMN_ACTION_OK_NEED_SIGHUP},
++              {"kek_in_pasn", SECDMN_ACTION_OK_NEED_SIGHUP},
++              {"sae_pw_id_num", SECDMN_ACTION_OK_NEED_SIGHUP},
++              {"sae_pw_id_key", SECDMN_ACTION_OK_NEED_SIGHUP},
++              {"eap_using_authentication_frames", SECDMN_ACTION_OK_NEED_SIGHUP},
+               {"rsn_override_key_mgmt", SECDMN_ACTION_OK_NEED_SIGHUP},
+               {"rsn_override_pairwise", SECDMN_ACTION_OK_NEED_SIGHUP},
+               {"rsn_override_mfp", SECDMN_ACTION_OK_NEED_SIGHUP},
+--- a/src/nl80211/wld_hostapd_ap_api.c
++++ b/src/nl80211/wld_hostapd_ap_api.c
+@@ -706,6 +706,10 @@
+         "mobility_domain",
+         "wps_state",
+         "disable_pmksa_caching", "wpa_disable_eapol_key_retries", "okc",
++        /* 11bi Client Privacy Enhancements (CPE) */
++        "assoc_frame_encryption", "pmksa_caching_privacy", "pasn_groups",
++        "kek_in_pasn", "sae_pw_id_num", "sae_pw_id_key",
++        "eap_using_authentication_frames",
+     };
+     s_setChangedMultiParams(pAP, pCurrVapParams, pNewVapParams,
+                             secParams, SWL_ARRAY_SIZE(secParams), &action);
+--- a/include/wld/wld.h
++++ b/include/wld/wld.h
+@@ -2202,6 +2202,8 @@
+     char keyPassPhrase[PSK_KEY_SIZE_LEN];
+     char saePassphrase[SAE_KEY_SIZE_LEN];
+     swl_security_mfpMode_e mfpConfig;
++    bool eppke;                         /* EPPKE AKM requested by the Endpoint */
++    bool pmksaCachingPrivacy;           /* PMKSA caching privacy requested by the Endpoint */
+     amxc_llist_it_t it;
+     amxd_object_t* pBus;
+     T_EndPoint* endpoint;
+--- a/odl/wld_endpoint.odl
++++ b/odl/wld_endpoint.odl
+@@ -708,6 +708,16 @@
+ 							"Required"];
+ 					default "Disabled";
+ 				}
++
++				/** Request EPPKE when connecting to an EPPKE-capable AP. */
++				%persistent bool EPPKE {
++					default false;
++				}
++
++				/** Request PMKSA caching privacy from the supplicant. */
++				%persistent bool PMKSACachingPrivacy {
++					default false;
++				}
+ 			}
+ 		}
+ 
+--- a/src/EpMgt/wld_epProfile.c
++++ b/src/EpMgt/wld_epProfile.c
+@@ -103,6 +103,8 @@
+     memset(profile->WEPKey, 0, sizeof(profile->WEPKey));
+     memset(profile->preSharedKey, 0, sizeof(profile->preSharedKey));
+     profile->secModeEnabled = SWL_SECURITY_APMODE_NONE;
++    profile->eppke = false;
++    profile->pmksaCachingPrivacy = false;
+ }
+ 
+ /**
+--- a/src/wld_endpoint.c
++++ b/src/wld_endpoint.c
+@@ -1158,6 +1158,18 @@
+     }
+     free(mfp);
++
++    bool eppke = amxd_object_get_bool(secObj, "EPPKE", NULL);
++    if(eppke != pProfile->eppke) {
++        pProfile->eppke = eppke;
++        changed |= 1;
++    }
++
++    bool pmksaCachingPrivacy = amxd_object_get_bool(secObj, "PMKSACachingPrivacy", NULL);
++    if(pmksaCachingPrivacy != pProfile->pmksaCachingPrivacy) {
++        pProfile->pmksaCachingPrivacy = pmksaCachingPrivacy;
++        changed |= 1;
++    }
+
+     if(changed) {
+         s_setProfileStatus(pProfile);
+     }
+--- a/src/nl80211/wld_wpaSupp_cfgFile.c
++++ b/src/nl80211/wld_wpaSupp_cfgFile.c
+@@ -299,11 +299,16 @@
+     case SWL_SECURITY_APMODE_WPA2_WPA3_P:
+     case SWL_SECURITY_APMODE_WPA3_P_TM:
+     {
++        if(epProfile->eppke) {
++            mfp = SWL_SECURITY_MFPMODE_REQUIRED;
++        }
+         swl_mapChar_add(network, "proto", "RSN");
+-        swl_mapCharFmt_addValStr(network, "key_mgmt", "%s%s%s",
++        swl_mapCharFmt_addValStr(network, "key_mgmt", "%s%s%s%s",
+                                  ((mfp != SWL_SECURITY_MFPMODE_REQUIRED) ? "WPA-PSK " : ""),
+                                  ((mfp == SWL_SECURITY_MFPMODE_REQUIRED) ? "WPA-PSK-SHA256 " : ""),
+-                                 (wld_rad_checkEnabledRadStd(pRad, SWL_RADSTD_BE) ? "SAE SAE-EXT-KEY" : "SAE"));
++                                 (wld_rad_checkEnabledRadStd(pRad, SWL_RADSTD_BE) ? "SAE SAE-EXT-KEY" : "SAE"),
++                                 (epProfile->eppke ? " EPPKE" : ""));
++        swl_mapCharFmt_addValInt32(network, "pmksa_privacy", epProfile->pmksaCachingPrivacy ? 1 : 0);
+         swl_mapChar_add(network, "pairwise", wld_rad_checkEnabledRadStd(pRad, SWL_RADSTD_BE) ? "CCMP GCMP-256" : "CCMP");
+         swl_mapChar_add(network, "group", "CCMP");
+         swl_mapChar_add(network, "auth_alg", "OPEN");
+@@ -315,7 +319,10 @@
+     case SWL_SECURITY_APMODE_WPA3_P:
+     {
+         swl_mapChar_add(network, "proto", "RSN");
+-        swl_mapChar_add(network, "key_mgmt", wld_rad_checkEnabledRadStd(pRad, SWL_RADSTD_BE) ? "SAE SAE-EXT-KEY" : "SAE");
++        swl_mapCharFmt_addValStr(network, "key_mgmt", "%s%s",
++                                 (wld_rad_checkEnabledRadStd(pRad, SWL_RADSTD_BE) ? "SAE SAE-EXT-KEY" : "SAE"),
++                                 (epProfile->eppke ? " EPPKE" : ""));
++        swl_mapCharFmt_addValInt32(network, "pmksa_privacy", epProfile->pmksaCachingPrivacy ? 1 : 0);
+         swl_mapChar_add(network, "pairwise", wld_rad_checkEnabledRadStd(pRad, SWL_RADSTD_BE) ? "CCMP GCMP-256" : "CCMP");
+         swl_mapChar_add(network, "group", "CCMP");
+         swl_mapChar_add(network, "auth_alg", "OPEN");
