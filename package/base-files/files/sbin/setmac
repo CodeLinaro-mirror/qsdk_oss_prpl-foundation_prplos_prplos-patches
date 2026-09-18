@@ -96,14 +96,45 @@ fi
 echo -n -e ${str} > /tmp/macaddr
 hexdump -C /tmp/macaddr
 
-art_partition=$(find_mtd_part 0:ART)
-if [ -z "$art_partition" ]; then
-	art_partition=$(find_mmc_part 0:ART)
-else
-	# If we set the delete flag, let's start by erasing the ART sector
-	[ -n "${DELETE}" ] && mtd erase  $(echo $art_partition | sed 's,block,,')
+art_ubi_vol=""
+if [ -f /lib/create_cfg_caldata.sh ]; then
+      . /lib/functions.sh
+      . /lib/functions/system.sh
+      . /lib/create_cfg_caldata.sh
+      if type art_ubifs_enabled >/dev/null 2>&1 && art_ubifs_enabled \
+         && type ensure_art_ubi_ready >/dev/null 2>&1 && ensure_art_ubi_ready; then
+              art_ubi_vol=$(get_art_volume_device 2>/dev/null)
+      fi
 fi
 
-# Find the partition and set the MAC addresses in the flash
-dd if=/tmp/macaddr of=$art_partition bs=64 conv=sync 2>/dev/null
+if [ -n "$art_ubi_vol" ]; then
+      # ART is a UBI static volume - no offset writes allowed, so read the
+      # whole volume, patch in the new MAC bytes at offset 0, and rewrite
+      # the entire volume via write_art_file (ubiupdatevol under the hood).
+      art_size_kb=$(get_art_volume_size_kb)
+      art_full=/tmp/art_full.bin
+
+      dd if="$art_ubi_vol" of="$art_full" bs=1024 count="$art_size_kb" 2>/dev/null
+      dd if=/tmp/macaddr of="$art_full" bs=64 conv=notrunc 2>/dev/null
+
+      if [ -n "${DELETE}" ]; then
+              ubi_init "0:ART" "$(get_art_ubi_vol_name)" "$art_size_kb" --force
+              art_ubi_vol=$(get_art_volume_device 2>/dev/null)
+      fi
+
+      write_art_file "$art_full"
+      rm -f "$art_full"
+else
+      art_partition=$(find_mtd_part 0:ART)
+      if [ -z "$art_partition" ]; then
+              art_partition=$(find_mmc_part 0:ART)
+      else
+              # If we set the delete flag, let's start by erasing the ART sector
+              [ -n "${DELETE}" ] && mtd erase $(echo $art_partition | sed 's,block,,')
+      fi
+
+      # Find the partition and set the MAC addresses in the flash
+      dd if=/tmp/macaddr of=$art_partition bs=64 conv=sync 2>/dev/null
+fi
+
 rm -f /tmp/macaddr
