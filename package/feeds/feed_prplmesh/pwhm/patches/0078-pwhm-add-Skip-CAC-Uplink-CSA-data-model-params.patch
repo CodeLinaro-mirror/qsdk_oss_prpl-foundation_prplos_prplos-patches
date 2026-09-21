@@ -1,0 +1,208 @@
+From: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+Date: Mon, 25 Aug 2026
+Subject: [PATCH] pwhm: add Skip_CAC and Uplink_CSA data-model parameters
+
+Replace hardcoded uplink_csa/skip_cac values with data-model-controlled
+parameters so they can be configured via ubus-cli:
+
+  WiFi.Radio.{i}.Skip_CAC=1      -> writes skip_cac=1  in hostapd config
+  WiFi.Radio.{i}.Uplink_CSA=1    -> writes uplink_csa=1 in hostapd config
+  WiFi.EndPoint.{i}.Uplink_CSA=1 -> writes uplink_csa=1 in wpa_supplicant config
+
+Both keys are only written when the DM param is true -- omitting the key
+is equivalent to disabled in hostapd/wpa_supplicant.
+
+Default values:
+  Radio.Skip_CAC      = true   (preserves existing unconditional behaviour)
+  Radio.Uplink_CSA    = false
+  EndPoint.Uplink_CSA = false
+
+Signed-off-by: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+---
+--- a/include/wld/wld.h	2026-09-21 16:43:52.363432006 +0530
++++ b/include/wld/wld.h	2026-09-21 16:44:03.159964375 +0530
+@@ -1543,6 +1543,9 @@
+     bool isSTASup;                                 /* Is STA supported? Has impact the way we manage the Radio! */
+     bool isWPSEnrol;                               /* Set WPS Enrollee mode when STA is active! */
+ 
++    bool skipCac;                                  /* DM: Radio.Skip_CAC -- write skip_cac to hostapd config */
++    bool uplinkCsa;                                /* DM: Radio.Uplink_CSA -- write uplink_csa to hostapd config */
++
+     char channelsInUse[64];                        /* String presentation of used channels */
+     swl_channel_t channel;                         /* When set we set autoChannelEnable FALSE */
+     wld_channelChangeReason_e channelChangeReason; /* The cause of the last channel change */
+@@ -2256,6 +2259,8 @@
+     bool multiAPEnable;                       /* Set MultiAP BackhaulSTA on this EndPoint */
+     bool toggleBssOnReconnect;                /* Disable hostapd on EP reconnection */
+ 
++    bool uplinkCsa;                           /* DM: EndPoint.Uplink_CSA -- write uplink_csa to wpa_supplicant config */
++
+     wld_multiap_profile_e multiAPProfile;     /* MultiAP profile status */
+     wld_multiap_profile_e peerMultiAPProfile; /* MultiAP profile advertised by peer */
+     uint16_t multiAPVlanId;                   /* Primary VLAN ID config for MultiAP */
+--- a/odl/wld_radio.odl	2026-09-21 16:43:52.367432203 +0530
++++ b/odl/wld_radio.odl	2026-09-21 16:44:23.532968954 +0530
+@@ -698,6 +698,23 @@
+ 		%persistent bool WPS_Enrollee_Mode {
+ 			default false;
+ 		}
++		/**
++		 * <p> When true, skip_cac=1 is written to the hostapd config,
++		 * suppressing redundant CAC on DFS channels. When false the
++		 * key is omitted from the hostapd config. </p>
++		 */
++		%persistent bool Skip_CAC {
++			default true;
++		}
++
++		/**
++		 * <p> When true, uplink_csa=1 is written to the hostapd config,
++		 * enabling uplink CSA signalling on the AP side. When false the
++		 * key is omitted from the hostapd config. </p>
++		 */
++		%persistent bool Uplink_CSA {
++			default false;
++		}
+ 
+ 		/**
+ 		 * <p> Kick a station, when it roams between AP's of the same radio.
+--- a/odl/wld_endpoint.odl	2026-09-21 16:43:52.367432203 +0530
++++ b/odl/wld_endpoint.odl	2026-09-21 16:44:31.621367497 +0530
+@@ -169,6 +169,15 @@
+ 		%persistent bool MultiAPEnable;
+ 
+ 		/**
++		 * <p> When true, uplink_csa=1 is written to the wpa_supplicant
++		 * global config, enabling uplink CSA capability on the STA side.
++		 * When false the key is omitted from the wpa_supplicant config. </p>
++		 */
++		%persistent bool Uplink_CSA {
++			default false;
++		}
++
++		/**
+ 		 * Configured Multi-AP Profile value passed to the backend supplicant.
+ 		 *
+ 		 * The Wi-Fi EasyMesh Multi-AP Profile field defines:
+--- a/src/wld_radio.c	2026-09-21 16:43:52.367432203 +0530
++++ b/src/wld_radio.c	2026-09-21 16:44:55.386538435 +0530
+@@ -581,6 +581,34 @@
+     SAH_TRACEZ_OUT(ME);
+ }
+ 
++static void s_setSkipCac_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_Radio* pR = wld_rad_fromObj(object);
++    ASSERTS_NOT_NULL(pR, , ME, "NULL");
++    bool val = amxc_var_dyncast(bool, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set Skip_CAC %d", pR->Name, val);
++    pR->skipCac = val;
++    pR->fsmRad.FSM_SyncAll = TRUE;
++    wld_autoCommitMgr_notifyRadEdit(pR);
++
++    SAH_TRACEZ_OUT(ME);
++}
++
++static void s_setUplinkCsaRad_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_Radio* pR = wld_rad_fromObj(object);
++    ASSERTS_NOT_NULL(pR, , ME, "NULL");
++    bool val = amxc_var_dyncast(bool, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set Radio.Uplink_CSA %d", pR->Name, val);
++    pR->uplinkCsa = val;
++    pR->fsmRad.FSM_SyncAll = TRUE;
++    wld_autoCommitMgr_notifyRadEdit(pR);
++
++    SAH_TRACEZ_OUT(ME);
++}
++
+ static void s_setExternalAcsMgmt_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
+     SAH_TRACEZ_IN(ME);
+     T_Radio* pRad = wld_rad_fromObj(object);
+@@ -2754,6 +2782,8 @@
+     {TPH_BOOL, "WET_Mode", TPH_BOOL, offsetof(T_Radio, isWET)},
+     {TPH_BOOL, "STASupported_Mode", TPH_BOOL, offsetof(T_Radio, isSTASup)},
+     {TPH_BOOL, "WPS_Enrollee_Mode", TPH_BOOL, offsetof(T_Radio, isWPSEnrol)},
++    {TPH_BOOL, "Skip_CAC", TPH_BOOL, offsetof(T_Radio, skipCac)},
++    {TPH_BOOL, "Uplink_CSA", TPH_BOOL, offsetof(T_Radio, uplinkCsa)},
+     {TPH_INT32, "MaxBitRate", TPH_INT32, offsetof(T_Radio, maxBitRate)},
+     {TPH_STR, "SupportedFrequencyBands", TPH_INT32, offsetof(T_Radio, supportedFrequencyBands)},
+     {TPH_STR, "OperatingFrequencyBand", TPH_INT32, offsetof(T_Radio, operatingFrequencyBand)},
+@@ -6610,6 +6640,8 @@
+                   SWLA_DM_PARAM_HDLR("WET_Mode", s_setWETMode_pwf),
+                   SWLA_DM_PARAM_HDLR("STASupported_Mode", s_setStaSupMode_pwf),
+                   SWLA_DM_PARAM_HDLR("WPS_Enrollee_Mode", s_setWPSEnrolMode_pwf),
++                  SWLA_DM_PARAM_HDLR("Skip_CAC", s_setSkipCac_pwf),
++                  SWLA_DM_PARAM_HDLR("Uplink_CSA", s_setUplinkCsaRad_pwf),
+                   SWLA_DM_PARAM_HDLR("KickRoamingStation", s_setKickRoamSta_pwf),
+                   SWLA_DM_PARAM_HDLR("ExternalAcsMgmt", s_setExternalAcsMgmt_pwf),
+                   SWLA_DM_PARAM_HDLR("AutoChannelEnable", s_setAutoChannelEnable_pwf),
+--- a/src/wld_endpoint.c	2026-09-21 16:43:52.367432203 +0530
++++ b/src/wld_endpoint.c	2026-09-21 16:45:05.687045956 +0530
+@@ -271,6 +271,20 @@
+     SAH_TRACEZ_OUT(ME);
+ }
+ 
++static void s_setUplinkCsaEp_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_EndPoint* pEP = wld_ep_fromObj(object);
++    ASSERT_NOT_NULL(pEP, , ME, "INVALID");
++
++    bool val = amxc_var_dyncast(bool, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set EndPoint.Uplink_CSA %d", pEP->Name, val);
++    pEP->uplinkCsa = val;
++    wld_autoCommitMgr_notifyEpEdit(pEP);
++
++    SAH_TRACEZ_OUT(ME);
++}
++
+ /**
+  * @brief s_setStaDfsEnable_pwf
+  *
+@@ -3242,6 +3256,7 @@
+                   SWLA_DM_PARAM_HDLR("RequiredOperatingStandards", s_setRequiredStandards_pwf),
+                   SWLA_DM_PARAM_HDLR("STADfsEnable", s_setStaDfsEnable_pwf),
+                   SWLA_DM_PARAM_HDLR("CSwOpts", s_setCSwOpts_pwf),
++                  SWLA_DM_PARAM_HDLR("Uplink_CSA", s_setUplinkCsaEp_pwf),
+                   ),
+               .instAddedCb = s_addEpInst_oaf, );
+ 
+--- a/src/nl80211/wld_hostapd_cfgFile.c	2026-09-21 16:43:52.371432400 +0530
++++ b/src/nl80211/wld_hostapd_cfgFile.c	2026-09-21 16:45:18.203662670 +0530
+@@ -487,10 +487,14 @@
+         swl_mapCharFmt_addValInt32(radConfigMap, "ieee80211ax", enableRad11ax);
+     }
+ 
+-    /* uplink_csa and skip_cac are always set unconditionally to enable
+-     * uplink CSA signalling and suppress redundant CAC on DFS channels. */
+-    swl_mapCharFmt_addValInt32(radConfigMap, "uplink_csa", 1);
+-    swl_mapCharFmt_addValInt32(radConfigMap, "skip_cac", 1);
++    /* uplink_csa and skip_cac are controlled via DM: Radio.Uplink_CSA and Radio.Skip_CAC.
++     * Only written when enabled -- omitting the key is equivalent to disabled in hostapd. */
++    if(pRad->uplinkCsa) {
++        swl_mapCharFmt_addValInt32(radConfigMap, "uplink_csa", 1);
++    }
++    if(pRad->skipCac) {
++        swl_mapCharFmt_addValInt32(radConfigMap, "skip_cac", 1);
++    }
+     if(enableRad11ax) {
+         if(pChWId) {
+             if(pEhtChWId && (*pChWId != *pEhtChWId)) {
+--- a/src/nl80211/wld_wpaSupp_cfgFile.c	2026-09-21 16:43:52.371432400 +0530
++++ b/src/nl80211/wld_wpaSupp_cfgFile.c	2026-09-21 16:45:18.219663458 +0530
+@@ -171,7 +171,11 @@
+     swl_mapCharFmt_addValInt32(global, "ppe_vp", pRad->ppevpType);
+     SAH_TRACEZ_INFO(ME, "%s: PPEVP set ppe_vp = %u", pRad->Name, pRad->ppevpType);
+ 
+-    swl_mapChar_add(global, "uplink_csa", "1");
++    /* uplink_csa is controlled via DM: EndPoint.Uplink_CSA.
++     * Only written when enabled -- omitting the key is equivalent to disabled in wpa_supplicant. */
++    if(pEP->uplinkCsa) {
++        swl_mapCharFmt_addValInt32(global, "uplink_csa", 1);
++    }
+ 
+     return SWL_RC_OK;
+ }
