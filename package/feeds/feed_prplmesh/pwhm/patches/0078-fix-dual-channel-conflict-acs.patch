@@ -1,0 +1,45 @@
+From 11271f7b6914c140f96d01f23b42d15c80e699a0 Mon Sep 17 00:00:00 2001
+From: Atchaya R <ratchaya@qti.qualcomm.com>
+Date: Fri, 18 Sep 2026 11:54:19 +0530
+Subject: [PATCH] pwhm: add fix for DUAL HOME Channel conflict issue when ACS
+ is enabled
+
+Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
+---
+ src/nl80211/wld_hostapd_cfgFile.c | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/src/nl80211/wld_hostapd_cfgFile.c b/src/nl80211/wld_hostapd_cfgFile.c
+index 8f8fdc5..d67d493 100644
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -2315,6 +2315,26 @@ static void s_createPerBssCfgFiles(T_Radio* pRad, wld_hostapd_config_t* config)
+     ASSERTS_NOT_NULL(config, , ME, "NULL");
+     ASSERTS_FALSE(amxc_llist_is_empty(&pRad->llAP), , ME, "No vaps");
+ 
++    /* ACS (channel=acs_survey) is a radio-level parameter for the first BSS startup.
++     * Per-BSS config files are used when adding secondary BSSes to an already-running
++     * radio. Writing channel=acs_survey to per-BSS files causes each secondary BSS to
++     * trigger ACS independently, resulting in a dual home channel conflict.
++     * Replace acs_survey with the actual running channel so all BSSes share the same
++     * channel that was selected by ACS. */
++    if(pRad->channel > 0) {
++        swl_mapChar_t* pAcsFixMap = wld_hostapd_getConfigMap(config, NULL);
++        if(pAcsFixMap != NULL) {
++            const char* chanVal = swl_mapChar_get(pAcsFixMap, "channel");
++            if(!swl_str_isEmpty(chanVal) && swl_str_matches(chanVal, "acs_survey")) {
++                char chanStr[16] = {0};
++                snprintf(chanStr, sizeof(chanStr), "%u", pRad->channel);
++                swl_mapChar_addOrSet(pAcsFixMap, "channel", chanStr);
++                SAH_TRACEZ_INFO(ME, "%s: per-BSS config: replaced acs_survey with actual channel %u",
++                                pRad->Name, pRad->channel);
++            }
++        }
++    }
++
+     T_AccessPoint* pAP = NULL;
+     wld_rad_forEachAp(pAP, pRad) {
+         const char* cfgFilePath = wld_wpaCtrlInterface_getCfgFilePath(pAP->wpaCtrlInterface);
+-- 
+2.34.1
+
