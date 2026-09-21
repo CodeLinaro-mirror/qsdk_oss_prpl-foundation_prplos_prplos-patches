@@ -1,0 +1,57 @@
+From 33d3a6980d9a8a05fab2ea8fab2af70080c3eb2d Mon Sep 17 00:00:00 2001
+From: Kartheek E <karte@qti.qualcomm.com>
+Date: Tue, 22 Sep 2026 00:44:47 +0530
+Subject: [PATCH] pwhm: preserve required MFP when MBO is enabled
+
+Signed-off-by: Kartheek E <karte@qti.qualcomm.com>
+---
+ src/nl80211/wld_hostapd_cfgFile.c | 12 +++++++-----
+ 1 file changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/src/nl80211/wld_hostapd_cfgFile.c b/src/nl80211/wld_hostapd_cfgFile.c
+index 13451be..83fb5d5 100644
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -1543,7 +1543,9 @@ static bool s_setVapCommonConfig(T_AccessPoint* pAP, swl_mapChar_t* vapConfigMap
+     case SWL_SECURITY_APMODE_WPA_P:
+     case SWL_SECURITY_APMODE_WPA2_P:
+     case SWL_SECURITY_APMODE_WPA_WPA2_P: {
+-        mfp = (pAP->mboEnable ? SWL_SECURITY_MFPMODE_OPTIONAL : mfp);
++        if (pAP->mboEnable && (mfp < SWL_SECURITY_MFPMODE_OPTIONAL)) {
++                mfp = SWL_SECURITY_MFPMODE_OPTIONAL;
++        }
+         tval = (pAP->secModeEnabled - SWL_SECURITY_APMODE_WPA_P) + 1;
+         swl_mapCharFmt_addValInt32(vapConfigMap, "wpa", tval);
+         if(pAP->keyPassPhrase[0]) {    /* prefer AES key? ontop of TKIP */
+@@ -1560,6 +1562,7 @@ static bool s_setVapCommonConfig(T_AccessPoint* pAP, swl_mapChar_t* vapConfigMap
+                 swl_mapChar_add(vapConfigMap, "rsn_pairwise", (tval == 1) ? "TKIP" : "CCMP");
+             }
+             swl_mapChar_add(vapConfigMap, wpa_key_str, pAP->keyPassPhrase);
++	    swl_mapCharFmt_addValInt32(vapConfigMap, "ieee80211w", mfp);
+         } else {
+             /* Use the Pre Shared Key (PSK) */
+             swl_mapCharFmt_addValStr(vapConfigMap, "wpa_key_mgmt", "%s%s",
+@@ -1732,7 +1735,9 @@ static bool s_setVapCommonConfig(T_AccessPoint* pAP, swl_mapChar_t* vapConfigMap
+     case SWL_SECURITY_APMODE_WPA_E:
+     case SWL_SECURITY_APMODE_WPA2_E:
+     case SWL_SECURITY_APMODE_WPA_WPA2_E: {
+-        mfp = (pAP->mboEnable ? SWL_SECURITY_MFPMODE_OPTIONAL : mfp);
++        if (pAP->mboEnable && (mfp < SWL_SECURITY_MFPMODE_OPTIONAL)) {
++                mfp = SWL_SECURITY_MFPMODE_OPTIONAL;
++        }
+         if(pAP->eppke) {
+             mfp = SWL_SECURITY_MFPMODE_REQUIRED;
+         }
+@@ -2132,9 +2137,6 @@ static bool s_setVapCommonConfig(T_AccessPoint* pAP, swl_mapChar_t* vapConfigMap
+         swl_mapChar_add(vapConfigMap, "qos_map_set", "0,0,2,16,1,1,255,255,18,22,24,38,40,40,44,46,48,56");
+         swl_mapChar_add(vapConfigMap, "sae_groups", "19");
+         swl_mapCharFmt_addValInt32(vapConfigMap, "sae_pwe", 1);
+-        swl_mapCharFmt_addValInt32(vapConfigMap, "ieee80211w", 2);
+-        swl_mapChar_add(vapConfigMap, "wpa_key_mgmt", "SAE");
+-        swl_mapChar_add(vapConfigMap, "wpa_pairwise", "CCMP");
+         swl_mapCharFmt_addValInt32(vapConfigMap, "multi_ap", 0);
+         swl_mapChar_add(vapConfigMap, "tx_queue_data2_burst", "0");
+     }
+-- 
+2.43.0
+
