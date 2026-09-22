@@ -23,7 +23,7 @@ diff --git a/include/wld/wld_radio.h b/include/wld/wld_radio.h
 diff --git a/src/wld_radio.c b/src/wld_radio.c
 --- a/src/wld_radio.c
 +++ b/src/wld_radio.c
-@@ -3864,5 +3864,15 @@ bool wld_rad_is11beUsable(T_Radio* pRad) {
+@@ -3864,5 +3864,17 @@ bool wld_rad_is11beUsable(T_Radio* pRad) {
      return false;
  }
 
@@ -31,7 +31,9 @@ diff --git a/src/wld_radio.c b/src/wld_radio.c
 +    ASSERTS_NOT_NULL(pRad, false, ME, "NULL");
 +    if(wld_rad_hasConnectedEpWithRadStd(pRad, SWL_RADSTD_BN) ||
 +       (wld_rad_checkEnabledRadStd(pRad, SWL_RADSTD_BN) &&
-+        (!wld_rad_isMloCapable(pRad) || wld_rad_hasUsableApMld(pRad, 1)))) {
++        (!wld_rad_isMloCapable(pRad) ||
++         !wld_rad_is11beMldUnitRequired(pRad) ||
++         wld_rad_hasUsableApMld(pRad, 1)))) {
 +        return true;
 +    }
 +    return false;
@@ -45,7 +47,7 @@ diff --git a/src/nl80211/wld_hostapd_cfgFile.c b/src/nl80211/wld_hostapd_cfgFile
 +++ b/src/nl80211/wld_hostapd_cfgFile.c
 @@ -272,3 +272,4 @@ void wld_hostapd_cfgFile_setRadioConfig(T_Radio* pRad, swl_mapChar_t* radConfig
      bool enableRad11be = wld_rad_is11beUsable(pRad);
-+    bool enableRad11bn = wld_rad_is11bnUsable(pRad);
++    bool enableRad11bn = enableRad11be && wld_rad_checkEnabledRadStd(pRad, SWL_RADSTD_BN);
      /*
       * hostapd: Enabling HE is mandatory to enable EHT mode
 @@ -575,3 +576,6 @@ void wld_hostapd_cfgFile_setRadioConfig(T_Radio* pRad, swl_mapChar_t* radConfig
