@@ -1,0 +1,40 @@
+From b4d834f38ca2259d8a595bb82236d56b85310b80 Mon Sep 17 00:00:00 2001
+From: Kartheek E <karte@qti.qualcomm.com>
+Date: Tue, 22 Sep 2026 00:27:02 +0530
+Subject: [PATCH] pwhm: include IEEE 802.11bn in hostapd radio parameters
+
+Signed-off-by: Kartheek E <karte@qti.qualcomm.com>
+---
+ src/nl80211/wld_hostapd_cfgManager.c | 2 +-
+ src/nl80211/wld_rad_hostapd_api.c    | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/nl80211/wld_hostapd_cfgManager.c b/src/nl80211/wld_hostapd_cfgManager.c
+index 8a26eb7..8b7c5b0 100644
+--- a/src/nl80211/wld_hostapd_cfgManager.c
++++ b/src/nl80211/wld_hostapd_cfgManager.c
+@@ -211,7 +211,7 @@ bool wld_hostapd_createBssConfig(wld_hostapd_bssConfig_t** ppbssConfig, swl_mapC
+     const char* minimalRadioParamsForBssConfig[] = {
+         "hw_mode", "channel", "country_code",
+         "ieee80211d", "ieee80211h",
+-        "ieee80211n", "ieee80211ac", "ieee80211ax", "ieee80211be",
++        "ieee80211n", "ieee80211ac", "ieee80211ax", "ieee80211be", "ieee80211bn",
+         "ht_capab",
+         "vht_capab", "vht_oper_chwidth", "vht_oper_centr_freq_seg0_idx",
+         "he_oper_chwidth", "he_oper_centr_freq_seg0_idx",
+diff --git a/src/nl80211/wld_rad_hostapd_api.c b/src/nl80211/wld_rad_hostapd_api.c
+index d3a421a..1910679 100644
+--- a/src/nl80211/wld_rad_hostapd_api.c
++++ b/src/nl80211/wld_rad_hostapd_api.c
+@@ -391,7 +391,7 @@ wld_secDmn_action_rc_ne wld_rad_hostapd_setMiscParams(T_Radio* pRad) {
+         "he_spr_sr_control", "he_spr_non_srg_obss_pd_max_offset",
+         "he_spr_srg_obss_pd_min_offset", "he_spr_srg_obss_pd_max_offset",
+         "he_spr_srg_bss_colors", "mbssid", "hw_mode", "ieee80211n",
+-        "ieee80211ac", "ieee80211ax", "ieee80211be", "country_code", "he_6ghz_reg_pwr_type",
++        "ieee80211ac", "ieee80211ax", "ieee80211be", "ieee80211bn", "country_code", "he_6ghz_reg_pwr_type",
+     };
+     for(uint32_t i = 0; i < SWL_ARRAY_SIZE(miscRadParams); i++) {
+         wld_ap_hostapd_setParamValue(primaryVap, miscRadParams[i], swl_mapChar_get(&radParams, (char*) miscRadParams[i]), "");
+-- 
+2.43.0
+
