@@ -5,9 +5,6 @@
             object '{{Radio.Alias}}' {
                 /* 2.4GHz radio defaults matching reference hostapd config */
                 parameter OperatingFrequencyBand = "2.4GHz";
-                parameter RegulatoryDomain = "US";
-                parameter Channel = 1;
-                parameter OperatingChannelBandwidth = "20MHz";
                 parameter BeaconPeriod = 100;
                 parameter ExplicitBeamFormingEnabled = true;
                 parameter ImplicitBeamFormingEnabled = true;
