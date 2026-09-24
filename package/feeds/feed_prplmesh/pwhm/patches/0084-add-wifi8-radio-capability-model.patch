@@ -1,0 +1,247 @@
+From: Kartheek E <karte@qti.qualcomm.com>
+Subject: [PATCH] pwhm: expose Wi-Fi 8 radio capabilities
+
+Add read-only Wi-Fi 8 capability objects for AP and bSTA radio roles.
+Populate the model from the UHR capability attributes returned in the
+existing NL80211_CMD_GET_WIPHY response.
+
+Signed-off-by: Kartheek E <karte@qti.qualcomm.com>
+---
+ odl/wld_radio.odl                |  21 ++++++++++++++++
+ include/wld/wld.h                |   9 ++++++++
+ src/wld_radio.c                  |  21 +++++++++++++++++
+ src/Plugin/wifiGen_rad.c         |  33 +++++++++++++++++++++++++
+ include/wld/wld_nl80211_compat.h |   2 ++
+ include/wld/wld_nl80211_types.h  |   7 +++++
+ src/nl80211/wld_nl80211_parser.c |  49 +++++++++++++++++++++++++++-----------
+ 7 files changed, 127 insertions(+), 15 deletions(-)
+
+--- a/odl/wld_radio.odl
++++ b/odl/wld_radio.odl
+@@ -4033,6 +4033,26 @@
+ 				 */
+ 				%read-only bool TIDLinkMapNegotiation;
+ 			}
++
++			%read-only object WiFi8APRole{
++				%read-only bool NPCAConfigurationSupport;
++				%read-only bool ELRRxSupport;
++				%read-only bool ELRTxSupport;
++				%read-only bool DRUSupport;
++				%read-only object MAPC{
++					%read-only bool CoordinatedBFSupport;
++					%read-only bool CoordinatedSRSupport;
++					%read-only bool CoordinatedTDMASupport;
++					%read-only bool CoordinatedRTWTSupport;
++					%read-only bool CoordinatedCRSupport;
++				}
++			}
++			%read-only object WiFi8STARole{
++				%read-only bool NPCAConfigurationSupport;
++				%read-only bool ELRRxSupport;
++				%read-only bool ELRTxSupport;
++				%read-only bool DRUSupport;
++			}
+ 		}
+ 
+ 		/**
+
+--- a/include/wld/wld.h
++++ b/include/wld/wld.h
+@@ -1299,9 +1299,18 @@
+     bool tidLinkMapNegotiation;
+ } wld_radioWiFi7Cap_t;
+ 
++typedef struct wld_radioWiFi8Cap {
++    bool npcaConfigurationSupport; bool elrRxSupport; bool elrTxSupport; bool druSupport;
++    bool coordinatedBfSupport; bool coordinatedSrSupport; bool coordinatedTdmaSupport;
++    /* TODO: Populate RTWT/CR when driver/kernel capability bits are defined. */
++    bool coordinatedRtwtSupport; bool coordinatedCrSupport;
++} wld_radioWiFi8Cap_t;
++
+ typedef struct wld_radioCap {
+     wld_radioWiFi7Cap_t apCap7;
+     wld_radioWiFi7Cap_t staCap7;
++    wld_radioWiFi8Cap_t apCap8;
++    wld_radioWiFi8Cap_t staCap8;
+     wld_tidLinkMapCapability_e tidLinkMapCapability;  /**< TID-to-Link mapping hardware capability */
+ } wld_radioCap_t;
+ 
+
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -2031,6 +2031,27 @@
+     amxd_trans_set_value(cstring_t, trans, "TIDLinkMapCapability", tidLinkMapCapabilityStr[pR->cap.tidLinkMapCapability]);
+     s_writeWiFi7Cap(trans, amxd_object_findf(capObj, "WiFi7APRole"), &pR->cap.apCap7);
+     s_writeWiFi7Cap(trans, amxd_object_findf(capObj, "WiFi7STARole"), &pR->cap.staCap7);
++    amxd_object_t* ap8Obj = amxd_object_findf(capObj, "WiFi8APRole");
++    amxd_object_t* sta8Obj = amxd_object_findf(capObj, "WiFi8STARole");
++    amxd_trans_select_object(trans, ap8Obj);
++    amxd_trans_set_bool(trans, "NPCAConfigurationSupport", pR->cap.apCap8.npcaConfigurationSupport);
++    amxd_trans_set_bool(trans, "ELRRxSupport", pR->cap.apCap8.elrRxSupport);
++    amxd_trans_set_bool(trans, "ELRTxSupport", pR->cap.apCap8.elrTxSupport);
++    amxd_trans_set_bool(trans, "DRUSupport", pR->cap.apCap8.druSupport);
++    amxd_object_t* ap8MapcObj = amxd_object_findf(ap8Obj, "MAPC");
++    amxd_trans_select_object(trans, ap8MapcObj);
++    amxd_trans_set_bool(trans, "CoordinatedBFSupport", pR->cap.apCap8.coordinatedBfSupport);
++    amxd_trans_set_bool(trans, "CoordinatedSRSupport", pR->cap.apCap8.coordinatedSrSupport);
++    amxd_trans_set_bool(trans, "CoordinatedTDMASupport", pR->cap.apCap8.coordinatedTdmaSupport);
++    amxd_trans_set_bool(trans, "CoordinatedRTWTSupport", pR->cap.apCap8.coordinatedRtwtSupport);
++    amxd_trans_set_bool(trans, "CoordinatedCRSupport", pR->cap.apCap8.coordinatedCrSupport);
++    amxd_trans_select_pathf(trans, ".^");
++    amxd_trans_select_pathf(trans, ".^");
++    amxd_trans_select_object(trans, sta8Obj);
++    amxd_trans_set_bool(trans, "NPCAConfigurationSupport", pR->cap.staCap8.npcaConfigurationSupport);
++    amxd_trans_set_bool(trans, "ELRRxSupport", pR->cap.staCap8.elrRxSupport);
++    amxd_trans_set_bool(trans, "ELRTxSupport", pR->cap.staCap8.elrTxSupport);
++    amxd_trans_set_bool(trans, "DRUSupport", pR->cap.staCap8.druSupport);
+     amxd_trans_select_pathf(trans, ".^");
+ }
+ 
+
+--- a/src/Plugin/wifiGen_rad.c
++++ b/src/Plugin/wifiGen_rad.c
+@@ -677,6 +677,38 @@
+                     pRad->Name, pRad->stationMonitorOffChannelSupported,
+                     wiphyInfo.suppCmds.remainOnChannel);
+ 
++    const wld_nl80211_bandDef_t* pUhrBand = &wiphyInfo.bands[pRad->operatingFrequencyBand];
++    /* UHR masks mirror include/linux/ieee80211-uhr.h. */
++#define IEEE80211_UHR_MAC_CAP0_NPCA_SUPP 0x10
++#define IEEE80211_UHR_MAC_CAP4_CO_BF_SUPP 0x40
++#define IEEE80211_UHR_MAC_CAP4_CO_SR_SUPP 0x80
++#define IEEE80211_UHR_PHY_CAP0_ELR_TX_SUPP 0x40
++#define IEEE80211_UHR_PHY_CAP0_ELR_RX_SUPP 0x80
++#define IEEE80211_UHR_PHY_CAP2_CO_BF_JOINT_SND_SUPP 0x04
++#define IEEE80211_UHR_PHY_CAP2_CO_SR_MODE1_SUPP 0x20
++#define IEEE80211_UHR_PHY_CAP2_CO_SR_MODE2_SUPP 0x40
++#define IEEE80211_UHR_PHY_CAP2_DRU_DBW20_PBW20_SUPP 0x80
++#define ATH12K_MAPC_CAP_COTDMA_SUPPORT BIT(2)
++    const uint8_t* uhrApMac = pUhrBand->uhrMacCapabilities[WLD_WIPHY_IFTYPE_AP];
++    const uint8_t* uhrApPhy = pUhrBand->uhrPhyCapabilities[WLD_WIPHY_IFTYPE_AP];
++    const uint8_t* uhrStaMac = pUhrBand->uhrMacCapabilities[WLD_WIPHY_IFTYPE_STATION];
++    const uint8_t* uhrStaPhy = pUhrBand->uhrPhyCapabilities[WLD_WIPHY_IFTYPE_STATION];
++    bool apNpca = pUhrBand->uhrSupported[WLD_WIPHY_IFTYPE_AP] && ((uhrApMac[0] & IEEE80211_UHR_MAC_CAP0_NPCA_SUPP) != 0);
++    bool staNpca = pUhrBand->uhrSupported[WLD_WIPHY_IFTYPE_STATION] && ((uhrStaMac[0] & IEEE80211_UHR_MAC_CAP0_NPCA_SUPP) != 0);
++    bool apDru = pUhrBand->uhrSupported[WLD_WIPHY_IFTYPE_AP] && ((uhrApPhy[2] & IEEE80211_UHR_PHY_CAP2_DRU_DBW20_PBW20_SUPP) || uhrApPhy[3]);
++    bool staDru = pUhrBand->uhrSupported[WLD_WIPHY_IFTYPE_STATION] && ((uhrStaPhy[2] & IEEE80211_UHR_PHY_CAP2_DRU_DBW20_PBW20_SUPP) || uhrStaPhy[3]);
++    pRad->cap.apCap8.npcaConfigurationSupport = apNpca;
++    pRad->cap.staCap8.npcaConfigurationSupport = staNpca;
++    pRad->cap.apCap8.elrRxSupport = pUhrBand->uhrSupported[WLD_WIPHY_IFTYPE_AP] && ((uhrApPhy[0] & IEEE80211_UHR_PHY_CAP0_ELR_RX_SUPP) != 0);
++    pRad->cap.apCap8.elrTxSupport = pUhrBand->uhrSupported[WLD_WIPHY_IFTYPE_AP] && ((uhrApPhy[0] & IEEE80211_UHR_PHY_CAP0_ELR_TX_SUPP) != 0);
++    pRad->cap.staCap8.elrRxSupport = pUhrBand->uhrSupported[WLD_WIPHY_IFTYPE_STATION] && ((uhrStaPhy[0] & IEEE80211_UHR_PHY_CAP0_ELR_RX_SUPP) != 0);
++    pRad->cap.staCap8.elrTxSupport = pUhrBand->uhrSupported[WLD_WIPHY_IFTYPE_STATION] && ((uhrStaPhy[0] & IEEE80211_UHR_PHY_CAP0_ELR_TX_SUPP) != 0);
++    pRad->cap.apCap8.druSupport = apDru;
++    pRad->cap.staCap8.druSupport = staDru;
++    pRad->cap.apCap8.coordinatedBfSupport = pUhrBand->uhrSupported[WLD_WIPHY_IFTYPE_AP] && ((uhrApMac[4] & IEEE80211_UHR_MAC_CAP4_CO_BF_SUPP) != 0 || (uhrApPhy[2] & IEEE80211_UHR_PHY_CAP2_CO_BF_JOINT_SND_SUPP) != 0);
++    pRad->cap.apCap8.coordinatedSrSupport = pUhrBand->uhrSupported[WLD_WIPHY_IFTYPE_AP] && ((uhrApMac[4] & IEEE80211_UHR_MAC_CAP4_CO_SR_SUPP) != 0 || (uhrApPhy[2] & (IEEE80211_UHR_PHY_CAP2_CO_SR_MODE1_SUPP | IEEE80211_UHR_PHY_CAP2_CO_SR_MODE2_SUPP)) != 0);
++    pRad->cap.apCap8.coordinatedTdmaSupport = (wiphyInfo.mapcHwCapabilities & ATH12K_MAPC_CAP_COTDMA_SUPPORT) != 0;
++
+     if(wiphyInfo.suppMlo && (pOperBand->radStdsMask & M_SWL_RADSTD_BE)) {
+         wld_mldMgr_t* pMldMgr = pRad->vendor ? pRad->vendor->pMldMgr : NULL;
+         wld_mldCapa_t apMldCapa;
+
+--- a/include/wld/wld_nl80211_compat.h
++++ b/include/wld/wld_nl80211_compat.h
+@@ -292,6 +292,8 @@
+ #define NL80211_BAND_IFTYPE_ATTR_EHT_CAP_PPE 11
+ #define NL80211_BAND_IFTYPE_ATTR_UHR_CAP_MAC 12
+ #define NL80211_BAND_IFTYPE_ATTR_UHR_CAP_PHY 13
++#define NL80211_BAND_IFTYPE_ATTR_UHR_CAP_NPCA 14
++#define NL80211_ATTR_MAPC_HW_CAPS NL80211_ATTR(424)
+ #define NL80211_CHAN_WIDTH_320 13
+ #define NL80211_RATE_INFO_320_MHZ_WIDTH NL80211_RATE_ATTR(18)
+ #define NL80211_RATE_INFO_EHT_MCS NL80211_RATE_ATTR(19)
+
+--- a/include/wld/wld_nl80211_types.h
++++ b/include/wld/wld_nl80211_types.h
+@@ -200,7 +200,10 @@
+     swl_80211_hecap_macCapInfo_t heMacCapabilities;                         /* HE(High Efficiency) 802.11ax mac capabilities */
+     swl_80211_hecap_phyCapInfo_t hePhyCapabilities;                         /* HE(High Efficiency) 802.11ax phy capabilities */
+     swl_80211_hecap_MCSCap_t heMcsCaps[SWL_80211_HECAP_MCS_CAP_ARRAY_SIZE]; /* The Supported HE-MCS and NSS Set */
+-    swl_80211_ehtcap_phyCapInfo_t ehtPhyCapabilities;                       /* EHT(Extremely High Throughput) 802.11be capabilities*/
++    swl_80211_ehtcap_phyCapInfo_t ehtPhyCapabilities;
++    uint8_t uhrMacCapabilities[WLD_WIPHY_IFTYPE_MAX][6];
++    uint8_t uhrPhyCapabilities[WLD_WIPHY_IFTYPE_MAX][5];
++    bool uhrSupported[WLD_WIPHY_IFTYPE_MAX];                 /* UHR capability per interface type */
+     swl_mcs_t mcsStds[SWL_MCS_STANDARD_MAX];                                //support mcs standards (each indexed on its relative enum)
+     swl_mcs_legacyIndex_m supportedDataTransmitRates;                       //supported data transmit rates
+ } wld_nl80211_bandDef_t;
+@@ -256,6 +260,7 @@
+     wld_nl80211_wiphyExtCapas extCapas;
+     uint8_t maxMbssidAdsIfaces;                     //max number of advertised MBSSID interfaces supported by the driver. (MBSSID support when max >= 2)
+     uint8_t maxMbssidEmaPeriod;                     //maximum profile periodicity of Enhanced Multi-BSSID Advertisement (EMA support when max > 0)
++    uint32_t mapcHwCapabilities;
+ } wld_nl80211_wiphyInfo_t;
+ 
+ typedef struct {
+
+--- a/src/nl80211/wld_nl80211_parser.c
++++ b/src/nl80211/wld_nl80211_parser.c
+@@ -813,23 +813,40 @@
+     ASSERTS_NOT_NULL(tbBand[NL80211_BAND_ATTR_IFTYPE_DATA], SWL_RC_OK, ME, "no iftype data");
+     struct nlattr* nlIfType = NULL;
+     int rem = 0;
+-    struct nlattr* tbIfType[NL80211_BAND_IFTYPE_ATTR_UHR_CAP_PHY + 1] = {};
++    struct nlattr* tbIfType[NL80211_BAND_IFTYPE_ATTR_UHR_CAP_NPCA + 1] = {};
+     nla_for_each_nested(nlIfType, tbBand[NL80211_BAND_ATTR_IFTYPE_DATA], rem) {
+-        nla_parse(tbIfType, NL80211_BAND_IFTYPE_ATTR_UHR_CAP_PHY, nla_data(nlIfType), nla_len(nlIfType), NULL);
+-        if(!s_isSupportedNlIfType(tbIfType[NL80211_BAND_IFTYPE_ATTR_IFTYPES])) {
+-            continue;
+-        }
+-        struct nlattr* uhrCapPhyAttr = tbIfType[NL80211_BAND_IFTYPE_ATTR_UHR_CAP_PHY];
+-        if(uhrCapPhyAttr == NULL) {
+-            continue;
+-        }
+-        /* Only set BN if the UHR PHY capability element is non-zero,
+-         * i.e. the driver truly advertises 802.11bn (UHR) support. */
++        nla_parse(tbIfType, NL80211_BAND_IFTYPE_ATTR_UHR_CAP_NPCA, nla_data(nlIfType), nla_len(nlIfType), NULL);
++        if(!s_isSupportedNlIfType(tbIfType[NL80211_BAND_IFTYPE_ATTR_IFTYPES])) continue;
++        struct nlattr* mac = tbIfType[NL80211_BAND_IFTYPE_ATTR_UHR_CAP_MAC];
++        struct nlattr* phy = tbIfType[NL80211_BAND_IFTYPE_ATTR_UHR_CAP_PHY];
++        if(mac == NULL || phy == NULL) continue;
++        uint8_t uhrCapMac[6] = {0};
+         uint8_t uhrCapPhy[5] = {0};
+-        NLA_GET_DATA(uhrCapPhy, uhrCapPhyAttr, sizeof(uhrCapPhy));
+-        if(memcmp(uhrCapPhy, &((uint8_t[5]) {0}), sizeof(uhrCapPhy)) != 0) {
++        NLA_GET_DATA(uhrCapMac, mac, sizeof(uhrCapMac));
++        NLA_GET_DATA(uhrCapPhy, phy, sizeof(uhrCapPhy));
++        if((memcmp(uhrCapMac, &((uint8_t[6]) {0}), sizeof(uhrCapMac)) == 0) &&
++           (memcmp(uhrCapPhy, &((uint8_t[5]) {0}), sizeof(uhrCapPhy)) == 0)) continue;
++        bool apSupported = false;
++        bool stationSupported = false;
++        struct nlattr* ift = NULL;
++        int remIft = 0;
++        nla_for_each_nested(ift, tbIfType[NL80211_BAND_IFTYPE_ATTR_IFTYPES], remIft) {
++            if(nla_type(ift) == NL80211_IFTYPE_AP) apSupported = true;
++            else if(nla_type(ift) == NL80211_IFTYPE_STATION) stationSupported = true;
++        }
++        if(apSupported) {
++            memcpy(pBand->uhrMacCapabilities[WLD_WIPHY_IFTYPE_AP], uhrCapMac, sizeof(uhrCapMac));
++            memcpy(pBand->uhrPhyCapabilities[WLD_WIPHY_IFTYPE_AP], uhrCapPhy, sizeof(uhrCapPhy));
++            pBand->uhrSupported[WLD_WIPHY_IFTYPE_AP] = true;
++        }
++        if(stationSupported) {
++            memcpy(pBand->uhrMacCapabilities[WLD_WIPHY_IFTYPE_STATION], uhrCapMac, sizeof(uhrCapMac));
++            memcpy(pBand->uhrPhyCapabilities[WLD_WIPHY_IFTYPE_STATION], uhrCapPhy, sizeof(uhrCapPhy));
++            pBand->uhrSupported[WLD_WIPHY_IFTYPE_STATION] = true;
++        }
++        if(apSupported || stationSupported) {
+             pBand->radStdsMask |= M_SWL_RADSTD_BN;
+-            SAH_TRACEZ_INFO(ME, "UHR (802.11bn) capability detected: setting M_SWL_RADSTD_BN");
++            SAH_TRACEZ_INFO(ME, "UHR (802.11bn) capability detected");
+         }
+     }
+     return SWL_RC_DONE;
+@@ -1215,6 +1232,10 @@
+     s_parseSuppCmds(tb, pWiphy);
+     s_parseIfTypeExtCapa(tb, pWiphy);
+     s_parseMbssidAds(tb, pWiphy);
++    if(tb[NL80211_ATTR_MAPC_HW_CAPS]) {
++        pWiphy->mapcHwCapabilities = nla_get_u32(tb[NL80211_ATTR_MAPC_HW_CAPS]);
++        SAH_TRACEZ_INFO(ME, "MAPC HW capabilities: 0x%08x", pWiphy->mapcHwCapabilities);
++    }
+     return SWL_RC_OK;
+ }
+ 
+
