@@ -1,0 +1,90 @@
+From 11a7ee01ac3ad5734c4c2bc7f59eb381795aa86d Mon Sep 17 00:00:00 2001
+From: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+Date: Fri, 25 Sep 2026 09:44:12 +0530
+Subject: [PATCH] XGS-PON TR181 DataModel IncorrectValue Fix
+
+Change-Id: I87a56a69fec153c1dc18c25afba88d8e09b06c6c
+Signed-off-by: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+---
+
+diff --git a/src/ani_sfp.c b/src/ani_sfp.c
+index 9e44273..f2bb408 100644
+--- a/src/ani_sfp.c
++++ b/src/ani_sfp.c
+@@ -343,8 +343,9 @@ exit:
+  *     ANI. This function should only be called if that parameter is a non-empty
+  *     string.
+  *
+- * tr181-xpon sets/forces Status of the ANI to NotPresent as long as the SFP is
+- * not present or its PON mode does not match the PON mode of the ANI.
++ * tr181-xpon sets/forces Status of the ANI to NotPresent after it successfully
++ * reads the referenced SFP cage and detects that the SFP is not present or its
++ * PON mode does not match the PON mode of the ANI.
+  */
+ void ani_sfp_init(ani_priv_t* ani, const char* sfp_reference) {
+ 
+@@ -362,7 +363,7 @@ void ani_sfp_init(ani_priv_t* ani, const char* sfp_reference) {
+     }
+     SAH_TRACEZ_DEBUG(ME, "sfp_reference='%s'", sfp_reference);
+     ani->sfp_reference = strdup(sfp_reference);
+-    ani->force_status_to_not_present = true;
++    ani->force_status_to_not_present = false;
+     dm_ani_update_operational_status(ani);
+ 
+     ctx = amxb_be_who_has(SFPS_DM);
+diff --git a/src/dm_actions.c b/src/dm_actions.c
+index 5a13c53..e8ee387 100644
+--- a/src/dm_actions.c
++++ b/src/dm_actions.c
+@@ -87,6 +87,8 @@
+ static const char* const TEMPERATURE = "Temperature";
+ /** Lowest possible value for the Temperature parameter */
+ static const int32_t TEMPERATURE_THRESHOLD_LOW = -274;
++/** Kernel state line prefix for ANI last-change lookup */
++static const char* const ONU_STATE_PREFIX = "state:";
+ 
+ /**
+  * Do not ask vendor module for param value if this setting is true.
+@@ -410,30 +412,29 @@ amxd_status_t _ani_lastchange_on_read(UNUSED amxd_object_t* const object,
+          SAH_TRACEZ_WARNING(ME, "wrong reason, expected action_param_read(%d) got %d",
+                             action_param_read, reason);
+          rv = amxd_status_invalid_action;
++         goto exit;
+      }
+ 
+     fp = fopen("/proc/trex/gpon/onu", "r");
+     if(fp != NULL) {
+         while(fgets(line, sizeof(line), fp) != NULL) {
+-            const char* key = "state:";
+-            char* pos = strstr(line, key);
++            char* pos = strstr(line, ONU_STATE_PREFIX);
+             if(pos != NULL) {
+-                pos += strlen(key);
++                pos += strlen(ONU_STATE_PREFIX);
+                 while(*pos == ' ' || *pos == '\t') {
+                     pos++;
+                 }
+-                char token[64] = {0};
+-                size_t i = 0;
+-                while(*pos != '\0' && *pos != ' ' && *pos != '\t' && *pos != '\n' && i + 1 < sizeof(token)) {
+-                    token[i++] = *pos++;
++
++                while(*pos != '\0' && *pos != ' ' && *pos != '\t' && *pos != '\n') {
++                    pos++;
++                }
++                while(*pos == ' ' || *pos == '\t') {
++                    pos++;
+                 }
+-                token[i] = '\0';
+-                char* dot = strchr(token, '.');
+-                if(dot != NULL) {
+-                    *dot = '\0';
++
++                if(*pos != '\0' && *pos != '\n') {
++                    last_change_value = (uint32_t) strtoul(pos, NULL, 10);
+                 }
+-                last_change_value = (uint32_t) atoi(token);
+-                SAH_TRACEZ_DEBUG(ME, "ANI last_change from /proc = %u", last_change_value);
+                 break;
+              }
+         }
