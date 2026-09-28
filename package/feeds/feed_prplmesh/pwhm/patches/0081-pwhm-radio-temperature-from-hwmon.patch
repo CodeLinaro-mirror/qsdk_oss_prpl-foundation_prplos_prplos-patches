@@ -1,0 +1,83 @@
+From: Kartheek E <karte@qti.qualcomm.com>
+Date: Fri, 25 Sep 2026 00:00:00 +0530
+Subject: [PATCH] pwhm: fix radio temperature and 2.4 GHz EHT configuration
+
+Read the radio thermal sensor exposed below the radio hwmon path and
+publish it through WiFi.Radio.{i}.Stats.Temperature. 
+
+Signed-off-by: Kartheek E <karte@qti.qualcomm.com>
+---
+ include/wld/wld_statsmon.h |  1 +
+ src/wld_radio.c            |  2 ++
+ src/wld_statsmon.c         | 30 ++++++++++++++++++++++++++++++
+ 4 files changed, 34 insertions(+), 1 deletion(-)
+
+diff --git a/src/wld_statsmon.c b/src/wld_statsmon.c
+--- a/src/wld_statsmon.c
++++ b/src/wld_statsmon.c
+@@ -63,6 +63,8 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <errno.h>
++#include <dirent.h>
++#include <limits.h>
+ 
+ #include "wld_statsmon.h"
+ #include "wld_util.h"
+@@ -76,6 +78,34 @@
+ 
+ static time_t latestStateChangeTime = 0;
+ 
++static int s_filterHwmon(const struct dirent* pEntry) {
++    return (pEntry != NULL) && (strncmp(pEntry->d_name, "hwmon", 5) == 0);
++}
++
++static int s_getRadioTemperature(const T_Radio* pR) {
++    ASSERTS_NOT_NULL(pR, WLD_TEMP_INVALID_CELSIUS, ME, "NULL");
++    ASSERTS_STR(pR->wiphyName, WLD_TEMP_INVALID_CELSIUS, ME, "Empty wiphy name");
++
++    char hwmonPath[PATH_MAX];
++    snprintf(hwmonPath, sizeof(hwmonPath), "/sys/class/ieee80211/%s", pR->wiphyName);
++    struct dirent** entries = NULL;
++    int nrEntries = scandir(hwmonPath, &entries, s_filterHwmon, alphasort);
++    if(nrEntries <= pR->ref_index) return WLD_TEMP_INVALID_CELSIUS;
++    char tempPath[PATH_MAX];
++    snprintf(tempPath, sizeof(tempPath), "%s/%s/temp1_input", hwmonPath, entries[pR->ref_index]->d_name);
++    FILE* fp = fopen(tempPath, "r"); long millidegrees = 0;
++    int valid = (fp != NULL) && (fscanf(fp, "%ld", &millidegrees) == 1);
++    if(fp != NULL) fclose(fp);
++    for(int i = 0; i < nrEntries; i++) free(entries[i]);
++    free(entries);
++    return valid ? (int) (millidegrees / 1000) : WLD_TEMP_INVALID_CELSIUS;
++}
++
++void wld_statsmon_updateTemperature(T_Radio* pR, T_Stats* pStats) {
++    ASSERTS_NOT_NULL(pR, , ME, "NULL"); ASSERTS_NOT_NULL(pStats, , ME, "NULL");
++    pStats->TemperatureDegreesCelsius = s_getRadioTemperature(pR);
++}
++
+ static T_Stats* s_addRadioStats(T_Stats* pDst, const T_intf_txrxstats* pSrc) {
+     if(pDst && pSrc) {
+         pDst->BytesSent += pSrc->txBytes;
+diff --git a/include/wld/wld_statsmon.h
+--- a/include/wld/wld_statsmon.h
++++ b/include/wld/wld_statsmon.h
+@@ -96,6 +96,7 @@
+ T_Stats* wld_statsmon_updateVAPStats(T_AccessPoint* pAP);
+ T_Stats* wld_statsmon_updateEPStats(T_EndPoint* pEP);
+ T_Stats* wld_statsmon_updateRADStats(T_Radio* pR);
++void wld_statsmon_updateTemperature(T_Radio* pR, T_Stats* pStats);
+ 
+ T_Stats* wld_updateVAPStats(T_AccessPoint* pAP, T_intf_txrxstats* pST);
+ T_Stats* wld_updateEPStats(T_EndPoint* pEP, T_intf_txrxstats* pST);
+diff --git a/src/wld_radio.c
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -824,6 +824,8 @@
+         wld_updateRadioStats(pR, NULL);
+     }
+ 
++    wld_statsmon_updateTemperature(pR, &pR->stats);
++
+     ASSERT_NOT_NULL(stats, SWL_RC_INVALID_PARAM, ME, "stats NULL");
+     wld_util_stats2Obj((amxd_object_t*) stats, &pR->stats);

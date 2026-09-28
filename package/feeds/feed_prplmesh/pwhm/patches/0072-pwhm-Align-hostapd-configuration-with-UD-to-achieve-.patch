@@ -230,18 +230,16 @@ index 3f54d37..d4efd0d 100644
          bool enableShPreamble = (pRad->preambleType == PREAMBLE_TYPE_LONG) ? 0 : 1;
          swl_mapCharFmt_addValStr(radConfigMap, "preamble", "%u", enableShPreamble);
      }
-@@ -913,6 +1088,36 @@ void wld_hostapd_cfgFile_setRadioConfig(T_Radio* pRad, swl_mapChar_t* radConfigM
+@@ -913,6 +1088,34 @@ void wld_hostapd_cfgFile_setRadioConfig(T_Radio* pRad, swl_mapChar_t* radConfigM
                              bgCacEnable ? 1 : 0, bwReduceEnable ? 1 : 0);
          }
      }
 +    if(wld_rad_is_24ghz(pRad)) {
 +        swl_mapChar_add(radConfigMap, "chanlist", "1-11");
-+        swl_mapCharFmt_addValInt32(radConfigMap, "ieee80211ac", 1);
 +        swl_mapCharFmt_addValInt32(radConfigMap, "vht_oper_chwidth", 0);
 +        swl_mapCharFmt_addValInt32(radConfigMap, "vht_oper_centr_freq_seg0_idx", 3);
 +        swl_mapCharFmt_addValInt32(radConfigMap, "he_mu_beamformer", 1);
 +        swl_mapCharFmt_addValInt32(radConfigMap, "he_bss_color", 15);
-+        swl_mapCharFmt_addValInt32(radConfigMap, "ieee80211be", 1);
 +        swl_mapCharFmt_addValInt32(radConfigMap, "eht_su_beamformer", 1);
 +        swl_mapCharFmt_addValInt32(radConfigMap, "eht_mu_beamformer", 1);
 +        swl_mapCharFmt_addValInt32(radConfigMap, "eht_su_beamformee", 1);
