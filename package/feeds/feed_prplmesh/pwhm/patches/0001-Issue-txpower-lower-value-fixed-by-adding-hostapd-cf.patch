@@ -16,7 +16,7 @@ index ec33e73..c004518 100644
          }
 +        if(pRad->operatingFrequencyBand == SWL_FREQ_BAND_EXT_6GHZ) {
 +            SAH_TRACEZ_INFO(ME, "%s: Adding 6GHz HE Caps parameters", pRad->Name);
-+	    swl_mapCharFmt_addValInt32(radConfigMap, "he_6ghz_reg_pwr_type", 0);   // corresponds to 6GHZ tx power
++	    swl_mapCharFmt_addValInt32(radConfigMap, "he_6ghz_reg_pwr_type", pRad->PowerType);   // corresponds to 6GHZ tx power
 +        }
      }
      if(SWL_BIT_IS_SET(pRad->supportedStandards, SWL_RADSTD_BE)) {
