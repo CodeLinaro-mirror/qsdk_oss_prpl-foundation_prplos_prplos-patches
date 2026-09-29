@@ -48,7 +48,7 @@ index 3f54d37..d4efd0d 100644
      }
      if(enableRad11n) {
          if(wld_channel_hasChannelWidthCovered(tgtChspec, SWL_BW_40MHZ)) {
-@@ -526,6 +534,132 @@ void wld_hostapd_cfgFile_setRadioConfig(T_Radio* pRad, swl_mapChar_t* radConfigM
+@@ -526,6 +534,130 @@ void wld_hostapd_cfgFile_setRadioConfig(T_Radio* pRad, swl_mapChar_t* radConfigM
              }
          }
  
@@ -133,8 +133,6 @@ index 3f54d37..d4efd0d 100644
 +        }
 +
 +        if(wld_rad_is_6ghz(pRad)) {
-+            /* 6GHz regulatory power type: 0=SP (Standard Power) */
-+            swl_mapCharFmt_addValInt32(radConfigMap, "he_6ghz_reg_pwr_type", 0);
 +
 +            /* Spatial Reuse: SRG + Non-SRG OBSS PD SR enabled */
 +            swl_mapCharFmt_addValInt32(radConfigMap, "he_spr_sr_control", 3);
