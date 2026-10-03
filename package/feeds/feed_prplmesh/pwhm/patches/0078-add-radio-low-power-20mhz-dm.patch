@@ -1,0 +1,165 @@
+From 1526189d524d1418bece45514b831d20b77b4ccc Mon Sep 17 00:00:00 2001
+From: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
+Date: Sat, 3 Oct 2026 23:48:33 +0530
+Subject: [PATCH 1/1] pwhm: add erp Radio low-power 20mhz mode
+
+Add WiFi.Radio.{i}.SetLowPower20MHz DM support and map it to the
+  ath12k NL80211 AP power-save operation.
+
+Change-Id: Ifa2a8276b34a88f388783209b369ddda2107a82e
+Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
+
+diff --git a/include/wld/wld_nl80211_api.h b/include/wld/wld_nl80211_api.h
+--- a/include/wld/wld_nl80211_api.h
++++ b/include/wld/wld_nl80211_api.h
+@@ -455,5 +455,12 @@
+ swl_rc_ne wld_nl80211_setWiphyStaDfsEn(wld_nl80211_state_t* state, uint32_t ifIndex, bool enable);
+ 
++/**
++ * @brief Enable or disable 20 MHz low-power mode for an AP MLO link.
++ */
++swl_rc_ne wld_nl80211_setLowPower20MHz(wld_nl80211_state_t* state,
++                                        uint32_t ifIndex,
++                                        uint8_t linkId,
++                                        bool enable);
+ 
+ /*
+  * @brief configure automatic transmit power level
+diff --git a/src/nl80211/wld_nl80211_api.c b/src/nl80211/wld_nl80211_api.c
+--- a/src/nl80211/wld_nl80211_api.c
++++ b/src/nl80211/wld_nl80211_api.c
+@@ -813,2 +813,20 @@
+ 
++swl_rc_ne wld_nl80211_setLowPower20MHz(wld_nl80211_state_t* state,
++                                        uint32_t ifIndex,
++                                        uint8_t linkId,
++                                        bool enable) {
++    uint8_t value = enable ? 1 : 0;
++    NL_ATTRS(attribs,
++             ARR(NL_ATTR_VAL(NL80211_ATTR_MLO_LINK_ID, linkId),
++                 NL_ATTR_VAL(NL80211_ATTR_LOW_POWER_20MHZ, value)));
++    /* AP_POWER_SAVE can make ath12k stop/recreate VDEVs.  Do not block the
++     * WLD data-model thread while those asynchronous driver events arrive. */
++    swl_rc_ne rc = wld_nl80211_sendCmdAsyncWithAck(state,
++                                                   NL80211_CMD_AP_POWER_SAVE,
++                                                   0,
++                                                   ifIndex,
++                                                   &attribs);
++    NL_ATTRS_CLEAR(&attribs);
++    return rc;
++}
+
+ static swl_rc_ne s_setTxPower(wld_nl80211_state_t* state, uint32_t ifIndex, int8_t mloLinkId, enum nl80211_tx_power_setting type, int32_t dbm) {
+diff --git a/src/wld_radio.c b/src/wld_radio.c
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -68,0 +69,4 @@
++#include <stdint.h>
++#include <net/if.h>
++#include "wld_nl80211_api.h"
++#include "wld_mld.h"
+@@ -6663,3 +6663,4 @@
+                   SWLA_DM_PARAM_HDLR("PowerSaveEnable", s_setPowerSaveEnable_pwf),
+                   SWLA_DM_PARAM_HDLR("StrictPassiveScan", s_setStrictPassiveScan_pwf),
++                  SWLA_DM_PARAM_HDLR("SetLowPower20MHz", _wld_rad_setLowPower20MHz_pwf),
+                   SWLA_DM_PARAM_HDLR("CSwOpts", s_setCSwOpts_pwf),
+@@ -7556,0 +7556,44 @@
++void wld_rad_applyLowPower20MHz(T_Radio* pRad, bool enable) {
++    T_AccessPoint* pAP = NULL;
++    T_SSID* pTargetSsid = NULL;
++    int8_t linkId = MLO_LINK_ID_UNKNOWN;
++
++    if(pRad == NULL) {
++        return;
++    }
++    SAH_TRACEZ_INFO(ME, "%s: SetLowPower20MHz request enable=%d", pRad->Name, enable);
++    /* Match native iw: target the MLD AP (for example wlan2.1), while
++     * preserving the link ID belonging to this Radio.{i}. */
++    pAP = wld_rad_getFirstActiveAp(pRad);
++    pTargetSsid = (pAP != NULL) ? pAP->pSSID : NULL;
++    if(pTargetSsid != NULL) {
++        linkId = wld_ssid_getMLDLinkID(pTargetSsid);
++    }
++    if((pTargetSsid != NULL) && (pTargetSsid->pMldLink != NULL)) {
++        T_SSID* pPrimarySsid = wld_mld_getPrimaryLinkSsid(pTargetSsid->pMldLink);
++        if((pPrimarySsid != NULL) && wld_ssid_isLinkActive(pPrimarySsid) && (pPrimarySsid->AP_HOOK != NULL)) {
++            pTargetSsid = pPrimarySsid;
++            pAP = pPrimarySsid->AP_HOOK;
++        }
++    }
++    if((pAP != NULL) && (pTargetSsid != NULL) && (linkId >= 0)) {
++            const char* ifName = wld_ssid_getIfName(pTargetSsid);
++            uint32_t ifIndex = (ifName != NULL) ? if_nametoindex(ifName) : 0;
++            SAH_TRACEZ_INFO(ME, "SetLowPower20MHz: target ifname=%s ifIndex=%u linkId=%d",
++                             ifName != NULL ? ifName : "NULL", ifIndex, linkId);
++            if(ifIndex <= 0) {
++                SAH_TRACEZ_WARNING(ME, "%s: skip SetLowPower20MHz for %s (%s): no live VAP ifIndex",
++                                   pRad->Name, pAP->alias, ifName != NULL ? ifName : "unknown");
++                return;
++            }
++            swl_rc_ne rc = wld_nl80211_setLowPower20MHz(
++                wld_nl80211_getSharedState(), (uint32_t) ifIndex, (uint8_t) linkId, enable);
++            if(rc != SWL_RC_OK) {
++                SAH_TRACEZ_ERROR(ME, "%s: SetLowPower20MHz failed (vap=%s ifname=%s ifIndex=%u linkId=%u enable=%d rc=%d)",
++                                 pRad->Name, pAP->alias, ifName, ifIndex, linkId, enable, rc);
++            } else {
++                SAH_TRACEZ_INFO(ME, "%s: SetLowPower20MHz queued (vap=%s ifname=%s ifIndex=%u linkId=%d enable=%d)",
++                                pRad->Name, pAP->alias, ifName, ifIndex, linkId, enable);
++            }
++    }
++}
+diff --git a/include/wld/wld_radio.h b/include/wld/wld_radio.h
+--- a/include/wld/wld_radio.h
++++ b/include/wld/wld_radio.h
+@@ -341,1 +341,6 @@
+ void wld_rad_updateState(T_Radio* pRad, bool forceVapUpdate);
++void wld_rad_applyLowPower20MHz(T_Radio* pRad, bool enable);
++void _wld_rad_setLowPower20MHz_pwf(void* priv,
++                                    amxd_object_t* object,
++                                    amxd_param_t* param,
++                                    const amxc_var_t* const newValue);
+diff --git a/src/Plugin/wld_plugin.c b/src/Plugin/wld_plugin.c
+--- a/src/Plugin/wld_plugin.c
++++ b/src/Plugin/wld_plugin.c
+@@ -74,8 +74,30 @@
+ #include "wld/Features/wld_persist.h"
+ #include "wld/wld_eventing.h"
++#include "wld/wld_radio.h"
++#include <amxo/amxo_resolvers.h>
+ 
+ #define ME "wld"
+ 
++void _wld_rad_setLowPower20MHz_pwf(void* priv _UNUSED,
++                                  amxd_object_t* object,
++                                  amxd_param_t* param,
++                                  const amxc_var_t* const newValue) {
++    SAH_TRACEZ_INFO(ME, "SetLowPower20MHz: callback enter");
++    /* The write action is already invoked on the Radio instance. Do not
++     * call wld_rad_fromObj() here: it re-validates the complete object tree
++     * and can block while the DM transaction is held. */
++    T_Radio* pRad = object != NULL ? (T_Radio*) object->priv : NULL;
++    if(pRad == NULL && param != NULL) {
++        amxd_object_t* owner = amxd_param_get_owner(param);
++        pRad = owner != NULL ? (T_Radio*) owner->priv : NULL;
++    }
++    if(pRad == NULL || newValue == NULL) {
++        SAH_TRACEZ_WARNING(ME, "SetLowPower20MHz: invalid radio or value");
++        return;
++    }
++    wld_rad_applyLowPower20MHz(pRad, amxc_var_dyncast(bool, newValue));
++}
++
+ 
+ static void s_sendLifecycleEvent(wld_lifecycleEvent_e change) {
+
+diff --git a/odl/wld_radio.odl b/odl/wld_radio.odl
+--- a/odl/wld_radio.odl
++++ b/odl/wld_radio.odl
+@@ -4071,1 +4071,6 @@
+                }
++
++                /** Enable or disable 20 MHz low-power mode for an AP MLO link. */
++                %persistent bool SetLowPower20MHz {
++                        default false;
++                }
++
