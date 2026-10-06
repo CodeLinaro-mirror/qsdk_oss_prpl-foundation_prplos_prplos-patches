@@ -1,0 +1,60 @@
+From 63b975c1bab0901078f04208634d44f56fc5813a Mon Sep 17 00:00:00 2001
+From: Atchaya R <ratchaya@qti.qualcomm.com>
+Date: Fri, 11 Sep 2026 15:35:56 +0530
+Subject: [PATCH] pwhm: add support for 14.0 backport NL80211 command with
+ correct value for BG DFS stop command
+
+Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
+---
+ include/wld/wld_nl80211_compat.h  | 4 +++-
+ src/ChannelManagement/wld_bgdfs.c | 9 +++++----
+ 2 files changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/include/wld/wld_nl80211_compat.h b/include/wld/wld_nl80211_compat.h
+index 825a46f..39675c0 100644
+--- a/include/wld/wld_nl80211_compat.h
++++ b/include/wld/wld_nl80211_compat.h
+@@ -314,8 +314,10 @@
+ #define NL80211_ATTR_PUNCT_BITMAP NL80211_ATTR(322)
+ 
+ //to be up-streamed, not yet in kernel 6.17
++/* backport 14.0: NL80211_CMD_MAX=176, NL80211_CMD_STOP_BGRADAR_DETECT=160 (0xA0)
++ * older backport: NL80211_CMD_MAX~161, NL80211_CMD_STOP_BGRADAR_DETECT=158 */
+ #define NL80211_CMD_STOP_BGRADAR_DETECT \
+     (!NL80211_ATTR_IS_SPECIFIED(NL80211_ATTR_RADAR_BACKGROUND) ? NL80211_CMD_UNSPEC : \
+-     ((NL80211_CMD_MAX >= 161) ? NL80211_CMD(158) : ((NL80211_CMD_MAX >= 157) ? NL80211_CMD(157) : NL80211_CMD(155))))
++     ((NL80211_CMD_MAX >= 162) ? NL80211_CMD(160) : ((NL80211_CMD_MAX >= 161) ? NL80211_CMD(158) : ((NL80211_CMD_MAX >= 157) ? NL80211_CMD(157) : NL80211_CMD(155)))))
+ 
+ #endif /* INCLUDE_WLD_WLD_NL80211_COMPAT_H_ */
+diff --git a/src/ChannelManagement/wld_bgdfs.c b/src/ChannelManagement/wld_bgdfs.c
+index f32777f..6f61475 100644
+--- a/src/ChannelManagement/wld_bgdfs.c
++++ b/src/ChannelManagement/wld_bgdfs.c
+@@ -576,19 +576,20 @@ amxd_status_t _startBgDfsClear(amxd_object_t* object,
+ }
+ 
+ amxd_status_t _stopBgDfsClear(amxd_object_t* object,
+-                              amxd_function_t* func _UNUSED,
+-                              amxc_var_t* args _UNUSED,
+-                              amxc_var_t* retval _UNUSED) {
++                               amxd_function_t* func _UNUSED,
++                               amxc_var_t* args _UNUSED,
++                               amxc_var_t* retval) {
+     SAH_TRACEZ_IN(ME);
+ 
+     T_Radio* pR = wld_rad_fromObj(amxd_object_get_parent(amxd_object_get_parent(object)));
+     ASSERT_NOT_NULL(pR, amxd_status_ok, ME, "No mapped radio ctx");
+ 
+     amxd_status_t status = bgdfs_stopClear(pR);
++    amxc_var_set(bool, retval, (status == amxd_status_ok));
+ 
+     SAH_TRACEZ_OUT(ME);
+ 
+-    return status;
++    return amxd_status_ok;
+ }
+ 
+ /**
+-- 
+2.34.1
+
