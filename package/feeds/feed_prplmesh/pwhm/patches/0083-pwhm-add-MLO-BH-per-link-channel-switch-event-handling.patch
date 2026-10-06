@@ -1,0 +1,239 @@
+From: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+Date: Tue, 06 Oct 2026
+Subject: [PATCH] pwhm: add MLO BH per-link channel-switch event handling
+
+Add dedicated handlers for CTRL-EVENT-STARTED-LINK-CHANNEL-SWITCH and
+CTRL-EVENT-LINK-CHANNEL-SWITCH wpa_supplicant events. These events carry
+a link_id field identifying which MLO link the channel switch applies to,
+allowing the per-link chanspec to be forwarded to the correct neighbor
+endpoint's wpaCtrl interface.
+
+Previously both CTRL-EVENT-STARTED-LINK-CHANNEL-SWITCH and
+CTRL-EVENT-LINK-CHANNEL-SWITCH were dispatched to the same generic
+s_chanSwitchStartedEvtCb / s_chanSwitchEvtCb handlers which have no
+awareness of MLO link IDs. Channel updates for non-primary BH links were
+therefore routed to the wrong radio.
+
+Also make s_chanSwitchCb use ifName (was _UNUSED) so the EP lookup can
+identify the backhaul endpoint, and resume the bkh chanspec refresh
+timer on CSA completion.
+
+Signed-off-by: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+---
+--- a/include/wld/wld_wpaCtrl_events.h	2026-10-06 14:55:15.481886971 +0530
++++ b/include/wld/wld_wpaCtrl_events.h	2026-10-06 14:54:15.278809146 +0530
+@@ -176,6 +176,20 @@
+ typedef void (* wld_wpaCtrl_stationMultiApInfoCb_f)(void* userData, char* ifName, uint8_t profileId, uint16_t primVlanId);
+ 
+ /*
++ * @brief Handler for bstamlo link-channel-switch-started event.
++ * It shall redirect the received info, over the main endpoint wpaCtrl iface,
++ * to the appropriate neighbor bstamlo link (identified with linkId)
++ */
++typedef void (* wld_wpaCtrl_bStaMloLinkChanSwitchStartedCb_f)(void* userData, char* ifName, swl_chanspec_t* chanSpec, int8_t linkId);
++
++/*
++ * @brief Handler for bstamlo link-channel-switch done event.
++ * It shall redirect the received info, over the main endpoint wpaCtrl iface,
++ * to the appropriate neighbor bstamlo link (identified with linkId)
++ */
++typedef void (* wld_wpaCtrl_bStaMloLinkChanSwitchCb_f)(void* userData, char* ifName, swl_chanspec_t* chanSpec, int8_t linkId);
++
++/*
+  * handler to select MLD iface (primary link) name of a provided SSID (AP/STA link) interface
+  * pLinkIfName is allocated inside the handler and must be freed by the caller
+  */
+@@ -223,6 +237,8 @@
+     wld_wpaCtrl_apIfaceEventCb_f fApEnabledCb;
+     wld_wpaCtrl_apIfaceEventCb_f fApDisabledCb;
+     wld_wpaCtrl_stationMultiApInfoCb_f fStationMultiApInfoCb;
++    wld_wpaCtrl_bStaMloLinkChanSwitchStartedCb_f fBStaMloLinkChanSwitchStartedCb;
++    wld_wpaCtrl_bStaMloLinkChanSwitchCb_f fBStaMloLinkChanSwitchCb;
+ 
+     /*
+      * AP/EP sync handlers:
+--- a/src/nl80211/wld_wpaCtrl_events.c	2026-10-06 14:55:15.481886971 +0530
++++ b/src/nl80211/wld_wpaCtrl_events.c	2026-10-06 14:54:15.278809146 +0530
+@@ -572,6 +572,48 @@
+     CALL_MGR_I(pInterface, fChanSwitchCb, &chanSpec);
+ }
+ 
++static void s_bStaMloLinkChanSwitchStartedEvtCb(wld_wpaCtrlInterface_t* pInterface, char* event _UNUSED, char* params) {
++    /**
++     * Example:
++     * CTRL-EVENT-STARTED-LINK-CHANNEL-SWITCH freq=5220 link_id=1 ht_enabled=1 ch_offset=1 ch_width=80 MHz cf1=5210 cf2=0
++     *
++     * puncturing_bitmap is not yet defined in wpactlr msg but checked by anticipation
++     */
++    swl_chanspec_t chanSpec = SWL_CHANSPEC_EMPTY;
++    ASSERT_FALSE(s_freqParamToChanSpec(params, "freq", &chanSpec) < SWL_RC_OK, , ME, "fail to get freq");
++    s_chWidthDescToChanSpec(params, "ch_width", &chanSpec);
++    s_punctBitmapDescToChanSpec(params, "puncturing_bitmap", &chanSpec);
++    int32_t linkId = -1;
++    ASSERTS_TRUE(wld_wpaCtrl_getValueIntExt(params, "link_id", &linkId), , ME, "fail to get link_id");
++    ASSERT_TRUE(wld_mld_isLinkIdValid(linkId), , ME, "invalid link id value %d", linkId);
++
++    SAH_TRACEZ_INFO(ME, "%s: linkId=%d channel=%d width=%d band=%d", pInterface->name, linkId,
++                    chanSpec.channel, chanSpec.bandwidth, chanSpec.band);
++
++    CALL_INTF(pInterface, fBStaMloLinkChanSwitchStartedCb, &chanSpec, linkId);
++}
++
++static void s_bStaMloLinkChanSwitchEvtCb(wld_wpaCtrlInterface_t* pInterface, char* event _UNUSED, char* params) {
++    /**
++     * Example:
++     * CTRL-EVENT-LINK-CHANNEL-SWITCH freq=5220 link_id=1 ht_enabled=1 ch_offset=1 ch_width=80 MHz cf1=5210 cf2=0
++     *
++     * puncturing_bitmap is not yet defined in wpactlr msg but checked by anticipation
++     */
++    swl_chanspec_t chanSpec = SWL_CHANSPEC_EMPTY;
++    ASSERT_FALSE(s_freqParamToChanSpec(params, "freq", &chanSpec) < SWL_RC_OK, , ME, "fail to get freq");
++    s_chWidthDescToChanSpec(params, "ch_width", &chanSpec);
++    s_punctBitmapDescToChanSpec(params, "puncturing_bitmap", &chanSpec);
++    int32_t linkId = -1;
++    ASSERTS_TRUE(wld_wpaCtrl_getValueIntExt(params, "link_id", &linkId), , ME, "fail to get link_id");
++    ASSERT_TRUE(wld_mld_isLinkIdValid(linkId), , ME, "invalid link id value %d", linkId);
++
++    SAH_TRACEZ_INFO(ME, "%s: linkId=%d channel=%d width=%d band=%d", pInterface->name, linkId,
++                    chanSpec.channel, chanSpec.bandwidth, chanSpec.band);
++
++    CALL_INTF(pInterface, fBStaMloLinkChanSwitchCb, &chanSpec, linkId);
++}
++
+ static void s_apCsaFinishedEvtCb(wld_wpaCtrlInterface_t* pInterface, char* event _UNUSED, char* params) {
+     // Example: AP-CSA-FINISHED freq=2427 dfs=0
+     swl_chanspec_t chanSpec = SWL_CHANSPEC_EMPTY;
+@@ -1020,8 +1062,8 @@
+               {"CTRL-EVENT-CONNECTION-FAIL", &s_connFailEvent},
+               {"CTRL-EVENT-STARTED-CHANNEL-SWITCH", &s_chanSwitchStartedEvtCb},
+               {"CTRL-EVENT-CHANNEL-SWITCH", &s_chanSwitchEvtCb},
+-              {"CTRL-EVENT-STARTED-LINK-CHANNEL-SWITCH", &s_chanSwitchStartedEvtCb},
+-              {"CTRL-EVENT-LINK-CHANNEL-SWITCH", &s_chanSwitchEvtCb},
++              {"CTRL-EVENT-STARTED-LINK-CHANNEL-SWITCH", &s_bStaMloLinkChanSwitchStartedEvtCb},
++              {"CTRL-EVENT-LINK-CHANNEL-SWITCH", &s_bStaMloLinkChanSwitchEvtCb},
+               {"AP-CSA-FINISHED", &s_apCsaFinishedEvtCb},
+               {"AP-MGMT-FRAME-RECEIVED", &s_mgtFrameEvt},
+               {"ACS-STARTED", &s_acsStartedEvt},
+--- a/src/Plugin/wifiGen_eventHandlers.c	2026-10-06 14:55:15.529889425 +0530
++++ b/src/Plugin/wifiGen_eventHandlers.c	2026-10-06 14:54:15.282809351 +0530
+@@ -455,7 +455,7 @@
+     s_saveChanChanged(pRad, &chanSpec, reason);
+ }
+ 
+-static void s_chanSwitchCb(void* userData, char* ifName _UNUSED, swl_chanspec_t* chanSpec) {
++static void s_chanSwitchCb(void* userData, char* ifName, swl_chanspec_t* chanSpec) {
+     T_Radio* pRad = (T_Radio*) userData;
+     ASSERT_NOT_NULL(pRad, , ME, "NULL");
+     SAH_TRACEZ_WARNING(ME, "%s: channel switch event central_chan=%d bandwidth=%s band=%s ext=%d", pRad->Name,
+@@ -488,6 +488,10 @@
+     T_EndPoint* pEP = wld_vep_from_name(ifName);
+     if(pEP != NULL) {
+         reason = CHAN_REASON_EP_MOVE;
++        // resume auto refresh of bkh chanspec
++        if(pEP->refreshChspecTimer != NULL) {
++            amxp_timer_start(pEP->refreshChspecTimer, BKH_CHSPEC_REFRESH_DELAY_MS);
++        }
+     }
+ 
+     /*
+@@ -2656,6 +2660,38 @@
+     }
+ }
+ 
++static void s_stationLinkChanSwitchStartedCb(void* userData, char* ifName _UNUSED, swl_chanspec_t* chanSpec, int8_t linkId) {
++    T_EndPoint* pEP = (T_EndPoint*) userData;
++    ASSERTS_NOT_NULL(pEP, , ME, "NULL");
++    ASSERTS_NOT_NULL(chanSpec, , ME, "No chanspec");
++    T_SSID* pSSID = pEP->pSSID;
++    ASSERTS_NOT_NULL(pSSID, , ME, "No mapped ssid");
++    T_SSID* pLinkSsid = wld_mld_getLinkSsidByLinkId(pSSID->pMldLink, linkId);
++    if(pLinkSsid && pLinkSsid->ENDP_HOOK &&
++       wld_rad_matchRadioWithChanInfo(pLinkSsid->RADIO_PARENT, chanSpec->band, chanSpec->channel)) {
++        T_EndPoint* pLinkEP = pLinkSsid->ENDP_HOOK;
++        T_Radio* pLinkRadio = pLinkSsid->RADIO_PARENT;
++        SAH_TRACEZ_INFO(ME, "%s: forward linkChSwStarted event to link(%d) %s radio %s", ifName, linkId, pLinkEP->Name, pLinkRadio->Name);
++        CALL_MGR_I_EXT(pLinkEP->wpaCtrlInterface, fChanSwitchStartedCb, chanSpec);
++    }
++}
++
++static void s_stationLinkChanSwitchCb(void* userData, char* ifName _UNUSED, swl_chanspec_t* chanSpec, int8_t linkId) {
++    T_EndPoint* pEP = (T_EndPoint*) userData;
++    ASSERTS_NOT_NULL(pEP, , ME, "NULL");
++    ASSERTS_NOT_NULL(chanSpec, , ME, "No chanspec");
++    T_SSID* pSSID = pEP->pSSID;
++    ASSERTS_NOT_NULL(pSSID, , ME, "No mapped ssid");
++    T_SSID* pLinkSsid = wld_mld_getLinkSsidByLinkId(pSSID->pMldLink, linkId);
++    if(pLinkSsid && pLinkSsid->ENDP_HOOK &&
++       wld_rad_matchRadioWithChanInfo(pLinkSsid->RADIO_PARENT, chanSpec->band, chanSpec->channel)) {
++        T_EndPoint* pLinkEP = pLinkSsid->ENDP_HOOK;
++        T_Radio* pLinkRadio = pLinkSsid->RADIO_PARENT;
++        SAH_TRACEZ_INFO(ME, "%s: forward linkChSw event to link(%d) %s radio %s", ifName, linkId, pLinkEP->Name, pLinkRadio->Name);
++        CALL_MGR_I_EXT(pLinkEP->wpaCtrlInterface, fChanSwitchCb, chanSpec);
++    }
++}
++
+ swl_rc_ne wifiGen_setEpEvtHandlers(T_EndPoint* pEP) {
+     ASSERT_NOT_NULL(pEP, SWL_RC_INVALID_PARAM, ME, "NULL");
+     ASSERTS_NOT_NULL(pEP->wpaSupp, SWL_RC_ERROR, ME, "NULL");
+@@ -2682,6 +2718,8 @@
+     wpaCtrlEpEvtHandlers.fWpsOverlapMsg = s_stationWpsOverlap;
+     wpaCtrlEpEvtHandlers.fWpsFailMsg = s_stationWpsFail;
+     wpaCtrlEpEvtHandlers.fStationMultiApInfoCb = s_stationMultiApInfo;
++    wpaCtrlEpEvtHandlers.fBStaMloLinkChanSwitchStartedCb = s_stationLinkChanSwitchStartedCb;
++    wpaCtrlEpEvtHandlers.fBStaMloLinkChanSwitchCb = s_stationLinkChanSwitchCb;
+ 
+     wld_wpaCtrlInterface_setEvtHandlers(pEP->wpaCtrlInterface, pEP, &wpaCtrlEpEvtHandlers);
+ 
+--- a/include/wld/wld_mld.h	2026-06-03 16:27:28.000000000 +0530
++++ b/include/wld/wld_mld.h	2026-10-06 17:27:40.285844393 +0530
+@@ -76,6 +76,13 @@
+ #define TID_NUM (8)
+ #define TID_LINKS_NUM (16)
+ 
++/**
++ * @brief valid range of link id 0:15
++ * see https://usp-data-models.broadband-forum.org/tr-181-2-21-0-usp.html#D.Device:2.Device.WiFi.DataElements.Network.Device.APMLD.AffiliatedAP.LinkID
++ */
++#define MLD_LINK_ID_MIN 0
++#define MLD_LINK_ID_MAX 15
++
+ typedef struct {
+     bool emlmrEnable;
+     bool emlsrEnable;
+@@ -304,6 +311,13 @@
+  */
+ wld_mld_t* wld_mld_getMldByUnit(wld_ssidType_e mldType, int32_t mldUnit);
+ 
++/**
++ * @brief check whether provided linkId value in the right range according to 11be standard (0-15)
++ * @param linkId link id value to be checked
++ * @return bool true when linkId is valid (in range), false otherwise
++ */
++bool wld_mld_isLinkIdValid(int32_t linkId);
++
+ #define wld_for_eachNeighMldLink(pNeighLink, pRefLink) \
+     for(pNeighLink = wld_mld_firstNeighLink(pRefLink); pNeighLink; pNeighLink = wld_mld_nextNeighLink(pNeighLink))
+ 
+--- a/src/wld_mld.c	2026-10-06 17:28:18.443794906 +0530
++++ b/src/wld_mld.c	2026-10-06 17:28:06.723195786 +0530
+@@ -892,3 +892,6 @@
+     return SWL_RC_OK;
+ }
+ 
++bool wld_mld_isLinkIdValid(int32_t linkId) {
++    return ((linkId >= MLD_LINK_ID_MIN) && (linkId <= MLD_LINK_ID_MAX));
++}
+--- a/src/Plugin/wifiGen_fsm.c
++++ b/src/Plugin/wifiGen_fsm.c
+@@ -1829,11 +1829,6 @@
+     swl_rc_ne rc = wld_ep_nl80211_getInterfaceInfo(pEP, &epIfInfo);
+     if(swl_rc_isOk(rc)) {
+         const wld_nl80211_chanSpec_t* pNlChspec = &epIfInfo.chanSpec;
+-        if(pNlChspec->noHT) {
+-            SAH_TRACEZ_WARNING(ME, "%s: re-establish ep connection to recover full chanwidth", pEP->Name);
+-            wld_wpaCtrl_sendCmdCheckResponse(pEP->wpaCtrlInterface, "REATTACH", "OK");
+-            return;
+-        }
+
+         /*
+          * manage case where endpoint connects with reduced bw, although larger is supported:
