@@ -237,7 +237,7 @@ index 3f54d37..d4efd0d 100644
 +        swl_mapCharFmt_addValInt32(radConfigMap, "vht_oper_chwidth", 0);
 +        swl_mapCharFmt_addValInt32(radConfigMap, "vht_oper_centr_freq_seg0_idx", 3);
 +        swl_mapCharFmt_addValInt32(radConfigMap, "he_mu_beamformer", 1);
-+        swl_mapCharFmt_addValInt32(radConfigMap, "he_bss_color", 15);
++
 +        swl_mapCharFmt_addValInt32(radConfigMap, "eht_su_beamformer", 1);
 +        swl_mapCharFmt_addValInt32(radConfigMap, "eht_mu_beamformer", 1);
 +        swl_mapCharFmt_addValInt32(radConfigMap, "eht_su_beamformee", 1);
@@ -247,7 +247,7 @@ index 3f54d37..d4efd0d 100644
 +    }
 +    if(wld_rad_is_5ghz(pRad)) {
 +        swl_mapChar_add(radConfigMap, "ht_coex", "0");
-+        swl_mapCharFmt_addValInt32(radConfigMap, "he_bss_color", 46);
++
 +        swl_mapCharFmt_addValInt32(radConfigMap, "eht_mu_beamformer", 1);
 +        swl_mapCharFmt_addValInt32(radConfigMap, "he_spr_sr_control", 3);
 +        swl_mapCharFmt_addValInt32(radConfigMap, "preamble", 1);
@@ -255,7 +255,7 @@ index 3f54d37..d4efd0d 100644
 +    if(wld_rad_is_6ghz(pRad)) {
 +        swl_mapChar_add(radConfigMap, "chanlist", "1-233");
 +        swl_mapCharFmt_addValInt32(radConfigMap, "ieee80211h", 1);
-+        swl_mapCharFmt_addValInt32(radConfigMap, "he_bss_color", 19);
++
 +        swl_mapCharFmt_addValInt32(radConfigMap, "eht_mu_beamformer", 1);
 +        swl_mapCharFmt_addValInt32(radConfigMap, "he_spr_sr_control", 3);
 +        swl_mapCharFmt_addValInt32(radConfigMap, "preamble", 1);
