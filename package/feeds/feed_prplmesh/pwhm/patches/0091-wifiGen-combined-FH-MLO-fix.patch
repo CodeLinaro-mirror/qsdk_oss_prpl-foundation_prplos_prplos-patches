@@ -1,0 +1,204 @@
+From: Abhi Teja Cholleti <acholleti@qti.qualcomm.com>
+Subject: [PATCH] wifiGen: fix MLO FH VAP lifecycle across bSTA connect/disconnect cycles
+
+MLO FH VAP lifecycle across bSTA connect/disconnect cycles.
+
+0081 - wifiGen_fsm: fix disable FH on all MLO radios in s_syncOnEpStartConnFail
+0082 - wifiGen_fsm: skip FH chanspec restore while bSTA connected/disconnected
+0084 - wifiGen_fsm: sync FH tgt chanspec to bSTA chanspec on connect
+0085 - wifiGen_rad: skip CSA when EP CONNECTED or CONNECTING on running channel
+0086 - wifiGen_fsm: immediately disable hostapd iface in s_disableFronthaul
+0087 - wifiGen_fsm: disable MLO neighbour FH VAPs on connection start
+0089 - wifiGen_fsm: restore FH VAP on first-ever connection after boot
+0090 - wifiGen_fsm: flush stale MLD link state in s_doEnableHostapd
+0092 - wifiGen_eventHandlers: skip CSA when EP CONNECTED or CONNECTING
+0093 - wifiGen_fsm: restore FH VAP when radio is in Dormant state on boot
+
+Signed-off-by: Abhi Teja Cholleti <acholleti@qti.qualcomm.com>
+---
+--- a/src/Plugin/wifiGen_fsm.c	2026-10-09 16:00:50.517000200 +0530
++++ b/src/Plugin/wifiGen_fsm.c	2026-10-09 17:41:58.112841151 +0530
+@@ -1156,6 +1156,8 @@
+     if(s_checkHapdActive(pRad)) {
+         // disable BSSs to allow wpa_supplicant to do scan
+         SAH_TRACEZ_INFO(ME, "%s: disable hostapd ifaces to let wpa_supplicant take the control", pRad->Name);
++        wld_rad_hostapd_disable(pRad);
++        wld_rad_resetApMldLinks(pRad);
+         setBitLongArray(pRad->fsmRad.FSM_BitActionArray, FSM_BW, GEN_FSM_DISABLE_HOSTAPD);
+         wld_rad_doCommitIfUnblocked(pRad);
+     }
+@@ -1166,7 +1168,7 @@
+         wld_epConnectionStatus_e connState = EPCS_DISABLED;
+         wld_wpaSupp_ep_getConnState(wld_rad_getEnabledEndpoint(pRad), &connState);
+         if((connState == EPCS_IDLE) || (connState == EPCS_DISABLED) ||
+-           (connState == EPCS_CONNECTED) || (connState == EPCS_DISCONNECTED) || (connState == EPCS_PASSIVE)) {
++           (connState == EPCS_PASSIVE)) {
+             SAH_TRACEZ_INFO(ME, "%s: restore fronthaul chanspec conf", pRad->Name);
+             pRad->pFA->mfn_wrad_setChanspec(pRad, true);
+         }
+@@ -1355,6 +1357,16 @@
+         SAH_TRACEZ_WARNING(ME, "%s: hostapd group is restarting: skip immediate enabling", pRad->Name);
+         return true;
+     }
++    if(wld_rad_hasMloSupport(pRad) && s_checkHapdDown(pRad)) {
++        SAH_TRACEZ_WARNING(ME, "%s: MLO radio FH down before ENABLE: flushing stale MLD link state",
++                           pRad->Name);
++        wld_wpaCtrlMngr_t* pMgr = wld_secDmn_getWpaCtrlMgr(pRad->hostapd);
++        wld_wpaCtrlInterface_t* pIface = wld_wpaCtrlMngr_getDefaultInterface(pMgr);
++        if(pIface) {
++            wld_wpaCtrl_sendCmdCheckResponseExt(pIface, "DISABLE", "OK", 5000);
++        }
++        wld_rad_resetApMldLinks(pRad);
++    }
+     wld_rad_hostapd_enable(pRad);
+     pRad->fsmRad.timeout_msec = 500;
+     return true;
+@@ -1911,6 +1923,56 @@
+         s_updateAllEpMld(pEP, &epIfInfo);
+         wld_bStaMld_update();
+     }
++    /*
++     * Align FH target chanspec to the bSTA's actual running chanspec before
++     * re-enabling the FH VAP.  Without this, wifiGen_rad_setChanspec and
++     * s_chanSwitchStartedCb may read the stale pre-connection target chanspec
++     * (e.g. 5_36/80) and issue a CHAN_SWITCH while the bSTA vdev already holds
++     * ch 64 causing DUAL_HOME_CHANNEL_CONFLICT and bSTA disconnect (reason=34).
++     */
++    {
++        swl_chanspec_t curChspec = wld_chanmgt_getCurChspec(pRad);
++        swl_chanspec_t tgtChspec = wld_chanmgt_getTgtChspec(pRad);
++        if((s_checkHapdDown(pRad) || (pRad->status == RST_DORMANT)) &&
++           ((curChspec.channel == 0) || swl_typeChanspec_equals(curChspec, tgtChspec))) {
++            SAH_TRACEZ_WARNING(ME, "%s: FH down/dormant and chanspec matches or unconfigured: triggering FH restore",
++                               pRad->Name);
++            pRad->pFA->mfn_wrad_setChanspec(pRad, true);
++        } else if((curChspec.channel != 0) &&
++                  !swl_typeChanspec_equals(curChspec, tgtChspec)) {
++            SAH_TRACEZ_WARNING(ME, "%s: bSTA connected on %s; align FH tgt chanspec from %s to avoid CSA conflict",
++                               pRad->Name,
++                               swl_typeChanspecExt_toBuf32(curChspec).buf,
++                               swl_typeChanspecExt_toBuf32(tgtChspec).buf);
++            wld_chanmgt_setTargetChanspec(pRad, curChspec, true, CHAN_REASON_EP_MOVE, "ep connected chspec sync");
++        }
++    }
++    wld_for_eachNeighMldLink_safe(pNgLink, pSSID->pMldLink) {
++        T_SSID* pNgSSID = wld_mld_getLinkSsid(pNgLink);
++        if(pEP->pSSID == pNgSSID) {
++            continue;
++        }
++        T_Radio* pNgRad = pNgSSID->RADIO_PARENT;
++        if(pNgRad) {
++            swl_chanspec_t ngCur = wld_chanmgt_getCurChspec(pNgRad);
++            swl_chanspec_t ngTgt = wld_chanmgt_getTgtChspec(pNgRad);
++            if((s_checkHapdDown(pNgRad) || (pNgRad->status == RST_DORMANT)) &&
++               ((ngCur.channel == 0) || swl_typeChanspec_equals(ngCur, ngTgt))) {
++                SAH_TRACEZ_WARNING(ME, "%s: MLO neighbour %s FH down/dormant and chanspec matches: triggering FH restore",
++                                   pRad->Name, pNgRad->Name);
++                pNgRad->pFA->mfn_wrad_setChanspec(pNgRad, true);
++                continue;
++            }
++            if((ngCur.channel != 0) &&
++               !swl_typeChanspec_equals(ngCur, ngTgt)) {
++                SAH_TRACEZ_WARNING(ME, "%s: MLO neighbour %s: align FH tgt chanspec from %s to %s",
++                                   pRad->Name, pNgRad->Name,
++                                   swl_typeChanspecExt_toBuf32(ngTgt).buf,
++                                   swl_typeChanspecExt_toBuf32(ngCur).buf);
++                wld_chanmgt_setTargetChanspec(pNgRad, ngCur, true, CHAN_REASON_EP_MOVE, "ep connected chspec sync");
++            }
++        }
++    }
+     s_delayRestoreFronthaul(pRad);
+     s_startRefreshEpChspec(pEP);
+ 
+@@ -1972,6 +2034,34 @@
+     SAH_TRACEZ_INFO(ME, "%s: endpoint is connecting to (%s) %s over chspec(%s)",
+                     pEP->Name, ssid, swl_typeMacBin_toBuf32Ref(bssid).buf, swl_typeChanspecExt_toBuf32Ref(chanSpec).buf);
+     ASSERTS_TRUE(wifiGen_hapd_isAlive(pRad), , ME, "%s: hapd not running", pRad->Name);
++    /*
++     * Proactively disable FH VAPs before the bSTA MLD association starts.
++     * mac80211 tries to add each MLD link during the association exchange;
++     * if the FH VAP on the corresponding radio is still running it holds the
++     * same MAC address as the MLD link (DUP MAC, valid_links=0x0).
++     * s_syncOnEpStartConnFail fires only after the failure -- too late.
++     *
++     * Disable both the primary radio's own FH (its VAP MAC collides with the
++     * corresponding bSTA MLD link) and every MLO neighbour FH for the same
++     * reason.
++     */
++    s_disableFronthaul(pRad);
++    T_SSID* pSSID_conn = pEP->pSSID;
++    if(pSSID_conn && pSSID_conn->pMldLink) {
++        wld_for_eachNeighMldLink_safe(pNgLink_conn, pSSID_conn->pMldLink) {
++            T_SSID* pNgSSID_conn = wld_mld_getLinkSsid(pNgLink_conn);
++            if(!pNgSSID_conn || (pNgSSID_conn == pSSID_conn)) {
++                continue;
++            }
++            T_Radio* pNgRad_conn = pNgSSID_conn->RADIO_PARENT;
++            if(!pNgRad_conn || (pNgRad_conn == pRad)) {
++                continue;
++            }
++            SAH_TRACEZ_WARNING(ME, "%s: pre-disabling MLO neighbour FH %s before bSTA MLD link add",
++                               pEP->Name, pNgRad_conn->Name);
++            s_disableFronthaul(pNgRad_conn);
++        }
++    }
+ 
+     swl_chanspec_t currChanSpec = SWL_CHANSPEC_EMPTY;
+     pRad->pFA->mfn_wrad_getChanspec(pRad, &currChanSpec);
+@@ -2081,13 +2171,10 @@
+                 if(!pNgRad || (pNgRad == pRad)) {
+                     continue;
+                 }
++                s_disableFronthaul(pNgRad);
+             }
+         }
+-        if(!pNgRad || (pNgRad == pRad)) {
+-            s_disableFronthaul(pRad);
+-        } else {
+-            s_disableFronthaul(pNgRad);
+-        }
++        s_disableFronthaul(pRad);
+     }
+ }
+ 
+--- a/src/Plugin/wifiGen_eventHandlers.c	2026-10-09 17:33:52.775772464 +0530
++++ b/src/Plugin/wifiGen_eventHandlers.c	2026-10-10 17:08:51.372091681 +0530
+@@ -733,6 +733,18 @@
+      * to the FH VAPs on THIS radio so both the BH STA and FH AP switch together.
+      */
+     if(wld_secDmn_isEnabled(pRad->hostapd)) {
++        /*
++         * If the EP is CONNECTED the bSTA vdev already owns the channel context.
++         * Issuing a CSA to a different channel causes DUAL_HOME_CHANNEL_CONFLICT.
++         * Skip the CHAN_SWITCH and let the EP stay on its current channel.
++         */
++        wld_epConnectionStatus_e epConnState = EPCS_DISABLED;
++        wld_wpaSupp_ep_getConnState(wld_rad_getEnabledEndpoint(pRad), &epConnState);
++        if((epConnState == EPCS_CONNECTED) || (epConnState == EPCS_CONNECTING)) {
++            SAH_TRACEZ_WARNING(ME, "%s: BH EP CONNECTED/CONNECTING on same radio, skipping CSA to ch=%d to avoid DUAL_HOME conflict",
++                               pRad->Name, chanSpec->channel);
++            return;
++        }
+         SAH_TRACEZ_WARNING(ME, "%s: BH EP + FH VAP on same radio (ch=%d bw=%s punct=0x%x): issuing CHAN_SWITCH",
+                            pRad->Name, chanSpec->channel,
+                            swl_bandwidth_str[chanSpec->bandwidth], chanSpec->punctBitmap);
+--- a/src/Plugin/wifiGen_rad.c	2026-09-09 18:25:10.581117132 +0530
++++ b/src/Plugin/wifiGen_rad.c	2026-10-10 17:16:36.903785148 +0530
+@@ -1072,6 +1072,17 @@
+             if(swl_rc_isOk(wld_rad_nl80211_getChannel(pRad, &runningChSpec))) {
+                 isTgtChspecRunning = (swl_typeChanspec_equals(runningChSpec, pRad->targetChanspec.chanspec));
+             }
++            if(!isTgtChspecRunning && (runningChSpec.channel != 0)) {
++                wld_epConnectionStatus_e connState = EPCS_DISABLED;
++                wld_wpaSupp_ep_getConnState(wld_rad_getEnabledEndpoint(pRad), &connState);
++                if((connState == EPCS_CONNECTED) || (connState == EPCS_CONNECTING)) {
++                    SAH_TRACEZ_WARNING(ME, "%s: EP CONNECTED/CONNECTING on %s, tgt %s stale: skip CSA to avoid conflict",
++                                       pRad->Name,
++                                       swl_typeChanspecExt_toBuf32(runningChSpec).buf,
++                                       swl_typeChanspecExt_toBuf32(pRad->targetChanspec.chanspec).buf);
++                    return SWL_RC_DONE;
++                }
++            }
+             if((pRad->pFA->mfn_misc_has_support(pRad, NULL, "CSA", 0)) &&
+                ((wld_channel_is_band_usable(pRad->targetChanspec.chanspec)) ||
+                 (pRad->pFA->mfn_misc_has_support(pRad, NULL, "DFS_OFFLOAD", 0)))) {
