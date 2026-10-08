@@ -1,0 +1,151 @@
+From fb7ce2c87ad5ce8b99fde79b57e27ee4afcb1717 Mon Sep 17 00:00:00 2001
+From: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
+Date: Tue, 6 Oct 2026 20:15:00 +0530
+Subject: [PATCH 1/1] tr181-usb: add USB ERP mode control
+
+Add the Device.USB.Port.{i}.ERP_mode_Enable parameter. Changing the
+parameter invokes netstandby.sh with the corresponding enter or exit
+argument after checking that the script is available and executable.
+Also create USB port instances from root-hub maxchild information when
+no USB device is connected.
+
+Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
+---
+--- a/odl/tr181-usb_port.odl
++++ b/odl/tr181-usb_port.odl
+@@ -161,6 +161,13 @@
+             }
+ 
+             /**
++             * Enables or disables USB ERP mode.
++             *
++             * @version 1.0
++             */
++            bool ERP_mode_Enable = false;
++
++            /**
+             * [ASYNC] Sets the power state of the Port asynchronously.
+             *
+             * The value MUST be a member of the list reported by the PowerCapability parameter.
+--- a/odl/tr181-usb_definition.odl
++++ b/odl/tr181-usb_definition.odl
+@@ -71,4 +71,6 @@
+     // Port events
+     on event "dm:instance-added" call usb_port_added
+         filter 'path == "USB.Port."';
++    on event "dm:object-changed" call erp_mode_enable_changed
++        filter 'path matches "USB\\.Port\\.[0-9]+\\.$"';
+ }
+--- a/include_priv/usb-dm.h
++++ b/include_priv/usb-dm.h
+@@ -103,3 +103,15 @@
+                                   void* const priv);
+ 
++/**
++ * @brief Called when USB.Port.{i}.ERP_mode_Enable changes.
++ *
++ * @param sig_name Name of the signal.
++ * @param data Pointer to the AMXC variable containing the data.
++ * @param priv Pointer to private data.
++ * @return Status of the operation.
++ */
++amxd_status_t _erp_mode_enable_changed(const char* const sig_name,
++                                       const amxc_var_t* const data,
++                                       void* const priv);
++
+ /**
+  * @brief Called when print events are enabled in the config.
+--- a/src/usb_dm.c
++++ b/src/usb_dm.c
+@@ -13,6 +13,9 @@
+ #include "usb-dm.h"
+ #include "usb-pwr-utils.h"
+ 
++#include <sys/wait.h>
++#include <unistd.h>
++
+ #define STR_EMPTY(x) (((x) == NULL) || ((x)[0] == '\0'))
+ 
+ #define ME "usb"
+@@ -244,5 +247,37 @@
+     return status;
+ }
+ 
++amxd_status_t _erp_mode_enable_changed(UNUSED const char* const sig_name,
++                                       const amxc_var_t* const data,
++                                       UNUSED void* const priv) {
++    amxd_object_t* port = NULL;
++    bool enable = false;
++    int result = -1;
++
++    when_null_trace(data, exit, ERROR, "Failed to get event data");
++    SAH_TRACEZ_NOTICE(ME, "ERP mode change callback received");
++    port = amxd_dm_signal_get_object(get_dm(), data);
++    when_null_trace(port, exit, ERROR, "USB.Port object is NULL");
++
++    enable = amxd_object_get_value(bool, port, "ERP_mode_Enable", NULL);
++    if(access("/etc/pm/power.d/netstandby.sh", X_OK) != 0) {
++        SAH_TRACEZ_ERROR(ME, "ERP mode script is unavailable or not executable: /etc/pm/power.d/netstandby.sh");
++        goto exit;
++    }
++    SAH_TRACEZ_NOTICE(ME, "ERP mode script is available: /etc/pm/power.d/netstandby.sh");
++
++    result = system(enable ? "/etc/pm/power.d/netstandby.sh enter" :
++                     "/etc/pm/power.d/netstandby.sh exit");
++    if(result == -1 || !WIFEXITED(result) || WEXITSTATUS(result) != 0) {
++        SAH_TRACEZ_ERROR(ME, "Failed to change ERP mode to %s", enable ? "enter" : "exit");
++        goto exit;
++    }
++
++    return amxd_status_ok;
++
++exit:
++    return amxd_status_unknown_error;
++}
++
+ /**
+  * @brief Handles host reset changes.
+--- a/src/usb_port.c
++++ b/src/usb_port.c
+@@ -651,1 +651,34 @@
+-/**
++static void autodiscover_root_hub_ports(const char* bus_name) {
++    char bus_dir[PATH_MAX];
++    char maxchild_path[PATH_MAX];
++    char standard[USB_PORT_STANDARD_BUF_LEN];
++    char rate[USB_PORT_RATE_BUF_LEN];
++    char port_id[PATH_MAX];
++    unsigned int maxchild = 0;
++    FILE* maxchild_file = NULL;
++
++    if((bus_name == NULL) ||
++       (strncmp(bus_name, USB_BUS_DIR_PREFIX, USB_BUS_DIR_PREFIX_LEN) != 0)) {
++        return;
++    }
++    snprintf(bus_dir, sizeof(bus_dir), "%s/%s", USB_SYSFS_DEVICES_PATH, bus_name);
++    if(!path_is_dir(bus_dir) ||
++       !safe_join(maxchild_path, sizeof(maxchild_path), bus_dir, "maxchild", '/')) {
++        return;
++    }
++    maxchild_file = fopen(maxchild_path, "r");
++    if((maxchild_file == NULL) || (fscanf(maxchild_file, "%u", &maxchild) != 1)) {
++        if(maxchild_file != NULL) {
++            fclose(maxchild_file);
++        }
++        return;
++    }
++    fclose(maxchild_file);
++
++    fill_port_capabilities(bus_dir, standard, sizeof(standard), rate, sizeof(rate));
++    for(unsigned int port = 1; port <= maxchild; port++) {
++        snprintf(port_id, sizeof(port_id), "%s-port%u", bus_name, port);
++        host_port_autocreate(port_id, USB_PORT_TYPE_HOST, standard, rate);
++    }
++}
++/**
+@@ -679,3 +712,3 @@
+         }
+         if(strncmp(dev_name, USB_BUS_DIR_PREFIX, USB_BUS_DIR_PREFIX_LEN) == 0) {
+-            continue; // skip controller aggregate entries
++            autodiscover_root_hub_ports(dev_name);
+             continue;
