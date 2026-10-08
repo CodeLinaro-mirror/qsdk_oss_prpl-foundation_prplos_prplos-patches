@@ -1,0 +1,230 @@
+From c0fc65e02c7c3a0460d7677181670fb148ba8e03 Mon Sep 17 00:00:00 2001
+From: Atchaya R <ratchaya@qti.qualcomm.com>
+Date: Wed, 7 Oct 2026 12:50:07 +0530
+Subject: [PATCH] pwhm: add support for chan_coex_disable feature
+
+Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
+---
+ include/wld/wld.h                 |  1 +
+ include/wld/wld_rad_nl80211.h     | 16 ++++++++
+ odl/wld_radio.odl                 |  8 ++++
+ src/nl80211/wld_hostapd_cfgFile.c | 11 ++++++
+ src/nl80211/wld_rad_nl80211.c     | 62 +++++++++++++++++++++++++++++++
+ src/wld_radio.c                   | 36 +++++++++++++++++-
+ 6 files changed, 132 insertions(+), 2 deletions(-)
+
+diff --git a/include/wld/wld.h b/include/wld/wld.h
+index f7f8e3d..da74e29 100644
+--- a/include/wld/wld.h
++++ b/include/wld/wld.h
+@@ -1753,6 +1753,7 @@ struct WLD_RADIO {
+    bool radarUpdatingDisabledSubChannels;                       /* True while radar path is updating DisabledSubChannels DM */
+    bool pendingUserPuncturingReapply;                           /* True when a re-apply CSA for user puncturing is pending (deferred until current CSA completes) */
+    bool cbsEventUpdating;                                       /* True when CBS event callback is updating CBS.Enable DM — skip wpa_ctrl command */
++   uint8_t chanCoexDisable;                                     /* QCA_WLAN_VENDOR_RADIO_PARAM_CHAN_COEX_DISABLE bitmask (0=all enabled) */
+ };
+ 
+ typedef struct {
+diff --git a/include/wld/wld_rad_nl80211.h b/include/wld/wld_rad_nl80211.h
+index 9aea976..6c6afb9 100644
+--- a/include/wld/wld_rad_nl80211.h
++++ b/include/wld/wld_rad_nl80211.h
+@@ -676,4 +676,20 @@ swl_rc_ne wld_rad_nl80211_setBlockDfsList(T_Radio* pRad, uint32_t block);
+ 
+ swl_rc_ne wld_rad_nl80211_displayBandChans(T_Radio* pRad);
+ swl_rc_ne wld_rad_nl80211_displaySuperChanList(T_Radio* pRad);
++
++/*
++ * @brief Disable specific 5GHz sub-bands for channel coexistence via NL80211 vendor command.
++ *
++ * Sends vendor SET command (subcmd=505) with dparam1=QCA_WLAN_VENDOR_RADIO_PARAM_CHAN_COEX_DISABLE (99).
++ * bitmask: bit0 = disable UNII-1 (ch 36-48), bit1 = disable UNII-2A (ch 52-64).
++ * 0 = all sub-bands enabled (driver default).
++ *
++ * @param pRad pointer to radio context
++ * @param bitmask sub-band disable bitmask (0 = all enabled)
++ *
++ * @return SWL_RC_OK in case of success
++ *         <= SWL_RC_ERROR otherwise
++ */
++swl_rc_ne wld_rad_nl80211_setChanCoexDisable(T_Radio* pRad, uint8_t bitmask);
++
+ #endif /* INCLUDE_WLD_WLD_RAD_NL80211_H_ */
+diff --git a/odl/wld_radio.odl b/odl/wld_radio.odl
+index 015cc44..58ca4e2 100644
+--- a/odl/wld_radio.odl
++++ b/odl/wld_radio.odl
+@@ -581,6 +581,14 @@ define probelist_t{
+ 		    default -1;
+ 		}
+ 
++		/**
++		 * Channel coexistence disable bitmask (QCA_WLAN_VENDOR_RADIO_PARAM_CHAN_COEX_DISABLE = 99).
++		 * Bit 0: disable UNII-1 (channels 36-48)
++		 * Bit 1: disable UNII-2A (channels 52-64)
++		 * 0 = all sub-bands enabled (driver default).
++		 */
++		%persistent uint8 ChanCoexDisable = 0;
++
+ 		/**
+ 		 * Timestamp of the last time status changed.
+ 		 */
+diff --git a/src/nl80211/wld_hostapd_cfgFile.c b/src/nl80211/wld_hostapd_cfgFile.c
+index 74d70f4..d10ec8b 100644
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -776,6 +776,17 @@ void wld_hostapd_cfgFile_setRadioConfig(T_Radio* pRad, swl_mapChar_t* radConfigM
+         }
+     }
+ 
++    /*
++     * chan_coex_disable: bitmask controlling which channel coexistence
++     * mechanisms are disabled in the driver.
++     * Corresponds to WiFi.Radio.{i}.ChanCoexDisable
++     */
++    if(pRad->chanCoexDisable != 0) {
++        SAH_TRACEZ_INFO(ME, "%s: Adding chan_coex_disable=0x%x to hostapd config",
++                        pRad->Name, pRad->chanCoexDisable);
++        swl_mapCharFmt_addValInt32(radConfigMap, "chan_coex_disable", pRad->chanCoexDisable);
++    }
++
+     int32_t rtsThreshold = -1;
+     if(pRad->rtsThreshold < IEEE80211_MAX_RTS_THRESHOLD) {
+         rtsThreshold = pRad->rtsThreshold;
+diff --git a/src/nl80211/wld_rad_nl80211.c b/src/nl80211/wld_rad_nl80211.c
+index f733a8d..8a8b4eb 100644
+--- a/src/nl80211/wld_rad_nl80211.c
++++ b/src/nl80211/wld_rad_nl80211.c
+@@ -855,6 +855,7 @@ swl_rc_ne wld_rad_nl80211_sendVendorSubCmdAttr(T_Radio* pRadio, uint32_t oui, in
+ #define QCA_DPARAM1_BGCAC_TIMEOUT       89u  /* QCA_WLAN_VENDOR_RADIO_PARAM_BGCAC_TIMEOUT = 89 */
+ #define QCA_DPARAM1_BLOCK_DFS_LIST      90u  /* QCA_WLAN_VENDOR_RADIO_PARAM_BLOCK_DFS_LIST = 90 */
+ #define QCA_DPARAM1_CAC_STATE           92u  /* QCA_WLAN_VENDOR_RADIO_PARAM_GET_CAC_STATE = 92 */
++#define QCA_DPARAM1_CHAN_COEX_DISABLE   99u  /* QCA_WLAN_VENDOR_RADIO_PARAM_CHAN_COEX_DISABLE = 99 */
+ #define QCA_DPARAM1_DISPLAY_BAND_CHANS      82u  /* QCA_WLAN_VENDOR_RADIO_PARAM_DISPLAY_BAND_CHANS */
+ #define QCA_DPARAM1_DISPLAY_SUPER_CHAN_LIST 83u  /* QCA_WLAN_VENDOR_RADIO_PARAM_DISPLAY_SUPER_CHANNEL_LIST */
+ 
+@@ -1426,6 +1427,67 @@ swl_rc_ne wld_rad_nl80211_setBlockDfsList(T_Radio* pRad, uint32_t block) {
+     return rc;
+ }
+ 
++/* -------------------------------------------------------------------------
++ * ChanCoexDisable (WRITE) — NL80211 vendor command
++ *
++ * SET: QCA_NL80211_VENDOR_SUBCMD_SET_WIPHY_CONFIGURATION (505)
++ *      → QCA_NL80211_VENDOR_SUBCMD_WIFI_PARAMS (dparam0=200)
++ *      → QCA_WLAN_VENDOR_RADIO_PARAM_CHAN_COEX_DISABLE (dparam1=99)
++ *      → bitmask: bit0=disable UNII-1 (ch36-48), bit1=disable UNII-2A (ch52-64)
++ *      0 = all sub-bands enabled (driver default)
++ * -------------------------------------------------------------------------
++ */
++swl_rc_ne wld_rad_nl80211_setChanCoexDisable(T_Radio* pRad, uint8_t bitmask) {
++    swl_rc_ne rc = SWL_RC_INVALID_PARAM;
++    ASSERT_NOT_NULL(pRad, rc, ME, "NULL radio");
++
++    uint32_t radioIdx = wld_rad_nl80211_getRadioIdx(pRad);
++    SAH_TRACEZ_INFO(ME, "%s: setChanCoexDisable bitmask=0x%x radioIdx=%u",
++                    pRad->Name, bitmask, radioIdx);
++
++    if(pRad->index <= 0 && pRad->wDevId == 0) {
++        SAH_TRACEZ_WARNING(ME, "%s: radio not available", pRad->Name);
++        return SWL_RC_ERROR;
++    }
++
++    uint8_t radioIdxU8 = (uint8_t)radioIdx;
++    uint32_t dparam0Val = QCA_DPARAM0_WIFI_PARAMS;
++    uint32_t dparam1Val = QCA_DPARAM1_CHAN_COEX_DISABLE;
++    uint32_t value0Val  = (uint32_t)bitmask;
++
++    NL_ATTR_NESTED(vendorAttr, NL80211_ATTR_VENDOR_DATA);
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_RADIO_IDX, radioIdxU8));
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_DPARAM0, dparam0Val));
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_DPARAM1, dparam1Val));
++    NL_ATTRS_ADD(&vendorAttr.data.attribs, NL_ATTR_VAL(QCA_ATTR_VALUE0, value0Val));
++
++    uint32_t wiphy = pRad->wiphy;
++    uint32_t vendorId = QCA_VENDOR_ID;
++    uint32_t vendorSubcmd = QCA_VENDOR_SUBCMD_SET;
++
++    NL_ATTRS(attribs,
++             ARR(
++                 NL_ATTR_VAL(NL80211_ATTR_VENDOR_ID, vendorId),
++                 NL_ATTR_VAL(NL80211_ATTR_VENDOR_SUBCMD, vendorSubcmd),
++                 NL_ATTR_VAL(NL80211_ATTR_WIPHY, wiphy)
++                 )
++             );
++    swl_unLiList_add(&attribs, &vendorAttr);
++
++    rc = wld_nl80211_sendCmdSyncWithAck(wld_nl80211_getSharedState(),
++                                        NL80211_CMD_VENDOR,
++                                        0,
++                                        0,
++                                        &attribs);
++    NL_ATTRS_CLEAR(&attribs);
++    NL_ATTRS_CLEAR(&vendorAttr.data.attribs);
++
++    if(rc != SWL_RC_OK) {
++        SAH_TRACEZ_ERROR(ME, "%s: setChanCoexDisable failed rc=%d", pRad->Name, rc);
++    }
++    return rc;
++}
++
+ static swl_rc_ne s_displayVendorCmdCb(swl_rc_ne rc, struct nlmsghdr* nlh _UNUSED, void* priv) {
+     swl_rc_ne* pRc = (swl_rc_ne*)priv;
+     *pRc = rc;
+diff --git a/src/wld_radio.c b/src/wld_radio.c
+index 73df21f..a741283 100644
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -6633,6 +6633,37 @@ static void s_setPowerSaveEnable_pwf(void* priv _UNUSED, amxd_object_t* object,
+     SAH_TRACEZ_OUT(ME);
+ }
+ 
++/**
++ * @brief Write handler for Radio.{i}.ChanCoexDisable
++ *
++ * Stores the bitmask in pRad->chanCoexDisable and applies it to the driver
++ * via nl80211 vendor command (QCA_DPARAM1_CHAN_COEX_DISABLE = 99).
++ * Guarded by wld_rad_isActive so startup fires are safe before driver is up.
++ */
++static void s_setChanCoexDisable_pwf(void* priv _UNUSED, amxd_object_t* object,
++                                     amxd_param_t* param _UNUSED,
++                                     const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_Radio* pRad = wld_rad_fromObj(object);
++    ASSERTI_NOT_NULL(pRad, , ME, "INVALID");
++
++    uint8_t bitmask = amxc_var_dyncast(uint8_t, newValue);
++    SAH_TRACEZ_INFO(ME, "%s: set ChanCoexDisable 0x%x", pRad->Name, bitmask);
++    pRad->chanCoexDisable = bitmask;
++
++    /* Always rewrite hostapd.conf so the new value persists across restarts */
++    wld_hostapd_cfgFile_createExt(pRad);
++
++    /* chan_coex_disable controls 5GHz UNII sub-bands (UNII-1/UNII-2A) only */
++    ASSERTI_TRUE(wld_rad_is_5ghz(pRad), , ME,
++                 "%s: ChanCoexDisable only applicable on 5GHz radio", pRad->Name);
++    ASSERTI_TRUE(wld_rad_isActive(pRad), , ME, "%s: ChanCoexDisable: radio not active", pRad->Name);
++    wld_rad_nl80211_setChanCoexDisable(pRad, bitmask);
++
++    SAH_TRACEZ_OUT(ME);
++}
++
+ SWLA_DM_HDLRS(sRadioDmHdlrs,
+               ARR(SWLA_DM_PARAM_HDLR("RegulatoryDomain", s_setCountryCode_pwf),
+                   SWLA_DM_PARAM_HDLR("IEEE80211hEnabled", s_set80211hEnable_pwf),
+@@ -6698,8 +6729,9 @@ SWLA_DM_HDLRS(sRadioDmHdlrs,
+                   SWLA_DM_PARAM_HDLR("AntennaGain5G", s_setAntennaGain5G_pwf),
+                   SWLA_DM_PARAM_HDLR("PowerSaveEnable", s_setPowerSaveEnable_pwf),
+                   SWLA_DM_PARAM_HDLR("StrictPassiveScan", s_setStrictPassiveScan_pwf),
+-                  SWLA_DM_PARAM_HDLR("CSwOpts", s_setCSwOpts_pwf),
+-                  ),
++                   SWLA_DM_PARAM_HDLR("CSwOpts", s_setCSwOpts_pwf),
++                   SWLA_DM_PARAM_HDLR("ChanCoexDisable", s_setChanCoexDisable_pwf),
++                   ),
+               .instAddedCb = s_addInstance_oaf);
+ 
+ SWLA_DM_GRP_HDLRS(sRadioDmGrpHdlrs,
+-- 
+2.34.1
+
