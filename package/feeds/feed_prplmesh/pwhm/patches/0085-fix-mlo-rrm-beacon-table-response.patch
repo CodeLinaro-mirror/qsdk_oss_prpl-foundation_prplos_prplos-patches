@@ -1,0 +1,50 @@
+From: Kartheek E <karte@qti.qualcomm.com>
+Date: Wed, 7 Oct 2026 
+Subject: [PATCH] pwhm: fix MLO Beacon Table response collection
+
+Accept Beacon Measurement responses received on another link of the same
+MLO AP and keep optional LINKID metadata out of the report payload decoder.
+This allows Mode 2 Beacon Table reports to be associated with the pending
+request while preserving strict hexadecimal report validation.
+
+Signed-off-by: Kartheek E <karte@qti.qualcomm.com>
+---
+--- pwhm-v7.27.5.orig/src/ApMgt/wld_ap_rrm.c
++++ pwhm-v7.27.5/src/ApMgt/wld_ap_rrm.c
+@@ -76,6 +76,15 @@
+ 
+ #define ME "ap11k"
+ 
++static bool s_sameMld(T_AccessPoint* first, T_AccessPoint* second) {
++    return (first != NULL) && (second != NULL) &&
++           (first->pSSID != NULL) && (second->pSSID != NULL) &&
++           (first->pSSID->pMldLink != NULL) &&
++           (second->pSSID->pMldLink != NULL) &&
++           (first->pSSID->pMldLink->pMld != NULL) &&
++           (first->pSSID->pMldLink->pMld == second->pSSID->pMldLink->pMld);
++}
++
+ typedef struct {
+     amxc_llist_it_t it;
+     swl_macChar_t mac;
+@@ -113,7 +122,7 @@
+ 
+     amxc_llist_for_each(it, &rrm_wait_list) {
+         rrm_wait_t* wait = amxc_llist_it_get_data(it, rrm_wait_t, it);
+-        if((wait->ap == ap) && swl_mac_charMatches(mac, &wait->mac)) {
++        if((wait->ap == ap || s_sameMld(wait->ap, ap)) && swl_mac_charMatches(mac, &wait->mac)) {
+             if(result) {
+                 const char* new_bssid = GET_CHAR(result, "BSSID");
+                 bool is_duplicate = false;
+--- pwhm-v7.27.5.orig/src/nl80211/wld_wpaCtrl_events.c
++++ pwhm-v7.27.5/src/nl80211/wld_wpaCtrl_events.c
+@@ -982,7 +982,8 @@
+     wld_wpaCtrl_rrmBeaconRsp_t rrmBeaconResponse;
+     memset(&rrmBeaconResponse, 0, sizeof(wld_wpaCtrl_rrmBeaconRsp_t));
+     if(*(++data) != '\0') {
+-        size_t dataLen = swl_str_len(data);
++        // Hex payload may be followed by MLO metadata, e.g. "LINKID=<id>".
++        size_t dataLen = strcspn(data, " ");
+         size_t binLen = (dataLen / 2) + (dataLen % 2);
+         swl_bit8_t binData[binLen];
+         bool success = swl_hex_toBytes(binData, binLen, data, dataLen);
