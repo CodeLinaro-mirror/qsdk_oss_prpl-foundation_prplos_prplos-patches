@@ -1,0 +1,141 @@
+From: Kartheek E <karte@qti.qualcomm.com>
+Date: Tue, 29 Sep 2026 12:00:00 +0530
+Subject: [PATCH] pwhm: update hostapd 6 GHz power mode after DM change
+
+Persist the numeric 6 GHz regulatory power mode and reapply it after
+hostapd completes MLO startup.
+
+Signed-off-by: Kartheek E <karte@qti.qualcomm.com>
+---
+ include/wld/wld_rad_hostapd_api.h  |  1 +
+ src/Plugin/wifiGen_eventHandlers.c |  3 +++
+ src/Plugin/wifiGen_rad.c           | 10 ++++------
+ src/nl80211/wld_rad_hostapd_api.c  | 28 ++++++++++++++++++++++++++++
+ src/wld_radio.c                    |  8 +++++++-
+ 5 files changed, 36 insertions(+), 7 deletions(-)
+
+---
+
+diff --git a/src/Plugin/wifiGen_rad.c b/src/Plugin/wifiGen_rad.c
+--- a/src/Plugin/wifiGen_rad.c
++++ b/src/Plugin/wifiGen_rad.c
+@@ -698,9 +698,7 @@
+              * NSTR is assumed supported with EMLMR or when STR is specifically supported
+              */
+             pRad->cap.apCap7.nstrSupported =
+-                (wiphyInfo.extCapas.nstrSupport[WLD_WIPHY_IFTYPE_AP] ||
+-                 pRad->cap.apCap7.strSupported ||
+-                 pRad->cap.apCap7.emlmrSupported);
++                wiphyInfo.extCapas.nstrSupport[WLD_WIPHY_IFTYPE_AP];
+ 
+             /*
+              * When APMLO is supported, all BSSs can be set as SLOs
+@@ -736,9 +734,7 @@
+              * NSTR is assumed supported with EMLMR or when STR is specifically supported
+              */
+             pRad->cap.staCap7.nstrSupported =
+-                (wiphyInfo.extCapas.nstrSupport[WLD_WIPHY_IFTYPE_STATION] ||
+-                 pRad->cap.staCap7.strSupported ||
+-                 pRad->cap.staCap7.emlmrSupported);
++                wiphyInfo.extCapas.nstrSupport[WLD_WIPHY_IFTYPE_STATION];
+ 
+             /*
+              * When bSTAMLO is supported, all EPs that can enabled simulteously
+diff --git a/src/nl80211/wld_rad_hostapd_api.c b/src/nl80211/wld_rad_hostapd_api.c
+--- a/src/nl80211/wld_rad_hostapd_api.c
++++ b/src/nl80211/wld_rad_hostapd_api.c
+@@ -212,6 +212,11 @@
+     swl_strlst_catFormat(cmd, sizeof(cmd), " ", "center_freq1=%d", center_freq);
+     if(bw > 20) {
+         swl_strlst_catFormat(cmd, sizeof(cmd), " ", "sec_channel_offset=%d", sec_channel_offset);
++    }
++    if(wld_rad_is_6ghz(pR) &&
++       pR->PowerType <= SWL_RADPWR_LOW_POWER_AP) {
++        swl_strlst_catFormat(cmd, sizeof(cmd), " ",
++                             "power_mode=%d", (int) pR->PowerType);
+     }
+ 
+     // standard_mode
+diff --git a/src/wld_radio.c b/src/wld_radio.c
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -757,13 +757,17 @@
+     swl_radpwr_e radPWR = swl_conv_charToEnum(OCPWR, swl_radpwr_str, SWL_RADPWR_MAX, SWL_RADPWR_MAX);
+     pRad->PowerType = radPWR;
+     if(wld_rad_is_6ghz(pRad)) {
++        bool accepted = false;
+         char pwrCmd[64];
+         snprintf(pwrCmd, sizeof(pwrCmd), "SET_6GHZ_PWR_MODE %d", (int) pRad->PowerType);
+         amxc_llist_for_each(it6g, &pRad->llAP) {
+             T_AccessPoint* pAP6g = amxc_llist_it_get_data(it6g, T_AccessPoint, it);
+             if(wld_wpaCtrlInterface_isReady(pAP6g->wpaCtrlInterface)) {
+-                wld_ap_hostapd_sendCommand(pAP6g, pwrCmd, "PowerType");
++                accepted |= wld_ap_hostapd_sendCommand(pAP6g, pwrCmd, "PowerType");
+             }
+         }
++        if(accepted) {
++            wld_hostapd_cfgFile_createExt(pRad);
++        }
+     } else {
+         wld_rad_doSync(pRad);
+     }
+diff --git a/src/nl80211/wld_rad_hostapd_api.c b/src/nl80211/wld_rad_hostapd_api.c
+--- a/src/nl80211/wld_rad_hostapd_api.c
++++ b/src/nl80211/wld_rad_hostapd_api.c
+@@ -383,4 +383,17 @@ wld_secDmn_action_rc_ne wld_rad_hostapd_setMiscParams(T_Radio* pRad) {
+     T_AccessPoint* primaryVap = wld_rad_hostapd_getCfgMainVap(pRad);
+     ASSERT_NOT_NULL(primaryVap, SECDMN_ACTION_ERROR, ME, "NULL");
+ 
++    /* Restore the persisted DM value before generating or applying radio config. */
++    if(wld_rad_is_6ghz(pRad) && pRad->pBus != NULL) {
++        char* powerType = amxd_object_get_cstring_t(pRad->pBus, "PowerType", NULL);
++        if(powerType != NULL) {
++            pRad->PowerType =
++                swl_conv_charToEnum(powerType,
++                                    swl_radpwr_str,
++                                    SWL_RADPWR_MAX,
++                                    SWL_RADPWR_INDOOR_AP);
++            free(powerType);
++        }
++    }
++
+     swl_mapChar_t radParams;
+diff --git a/src/Plugin/wifiGen_eventHandlers.c b/src/Plugin/wifiGen_eventHandlers.c
+--- a/src/Plugin/wifiGen_eventHandlers.c
++++ b/src/Plugin/wifiGen_eventHandlers.c
+@@ -677,2 +677,5 @@ static void s_mngrReadyCb(void* userData, char* ifName, bool isReady) {
+         }
+         CALL_SECDMN_MGR_EXT(pRad->hostapd, fSyncOnRadioUp, ifName, isRadReady);
++        if(wld_rad_is_6ghz(pRad)) {
++            wld_rad_hostapd_set6GHzPowerMode(pRad);
++        }
+         wld_rad_updateState(pRad, isRadReady);
+
+diff --git a/include/wld/wld_rad_hostapd_api.h b/include/wld/wld_rad_hostapd_api.h
+--- a/include/wld/wld_rad_hostapd_api.h
++++ b/include/wld/wld_rad_hostapd_api.h
+@@ -69,3 +69,4 @@
+ wld_secDmn_action_rc_ne wld_rad_hostapd_setChannel(T_Radio* pR);
+ wld_secDmn_action_rc_ne wld_rad_hostapd_setMiscParams(T_Radio* pR);
++void wld_rad_hostapd_set6GHzPowerMode(T_Radio* pR);
+
+diff --git a/src/nl80211/wld_rad_hostapd_api.c b/src/nl80211/wld_rad_hostapd_api.c
+--- a/src/nl80211/wld_rad_hostapd_api.c
++++ b/src/nl80211/wld_rad_hostapd_api.c
+@@ -377,3 +377,16 @@
+     return SECDMN_ACTION_OK_NEED_TOGGLE;
+ }
+ 
++void wld_rad_hostapd_set6GHzPowerMode(T_Radio* pRad) {
++    char pwrCmd[64];
++    if(!wld_rad_is_6ghz(pRad)) {
++        return;
++    }
++    snprintf(pwrCmd, sizeof(pwrCmd), "SET_6GHZ_PWR_MODE %d", (int) pRad->PowerType);
++    amxc_llist_for_each(it, &pRad->llAP) {
++        T_AccessPoint* pAP = amxc_llist_it_get_data(it, T_AccessPoint, it);
++        if(wld_wpaCtrlInterface_isReady(pAP->wpaCtrlInterface)) {
++            wld_ap_hostapd_sendCommand(pAP, pwrCmd, "PowerType");
++        }
++    }
++}
