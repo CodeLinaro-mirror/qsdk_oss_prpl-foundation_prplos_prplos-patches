@@ -219,8 +219,8 @@ index 3f54d37..d4efd0d 100644
 +    if(wld_rad_is_6ghz(pRad)) {
 +        /* DFS and QCA vendor-specific radio params */
 +        swl_mapCharFmt_addValInt32(radConfigMap, "disable_iface_during_cac", 0);
-+        /* Suppress spurious AWGN interference events on 6GHz */
-+        swl_mapCharFmt_addValInt32(radConfigMap, "discard_6g_awgn_event", 1);
++
++
 +        swl_mapCharFmt_addValInt32(radConfigMap, "athnewind", 0);
 +    }
 +
