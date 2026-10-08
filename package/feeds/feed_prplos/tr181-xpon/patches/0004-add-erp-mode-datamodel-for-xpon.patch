@@ -1,0 +1,88 @@
+From fd46f2351223a2f45277d551cc043be2d35fb5ea Mon Sep 17 00:00:00 2001
+From: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
+Date: Tue, 6 Oct 2026 17:38:04 +0530
+Subject: [PATCH] tr181-xpon: Add ERP mode data model control for xpon
+
+Add Device.XPON.ERPMode.Enable support for Marina.
+Map Enable=1 to ERP sleep and Enable=0 to ERP awake.
+
+Change-Id: I98d9556a456d1ee43050ccc0522f7a13eb7c7743
+Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
+---
+ include_priv/dm_events.h          |  4 ++++
+ odl/tr181-xpon_definition.odl     | 12 ++++++++++++
+ src/dm_events.c                   | 19 +++++++++++++++++++
+ 3 files changed, 35 insertions(+)
+
+--- a/odl/tr181-xpon_definition.odl
++++ b/odl/tr181-xpon_definition.odl
+@@ -104,6 +104,14 @@
+         %protected %read-only string FsmState;
+ 
++        /**
++         * Controls the Marina ERP PON power state.
++         * Enable=true enters ERP sleep; Enable=false restores the PON.
++         */
++        object ERPMode {
++            bool Enable = false;
++        }
++
+         /**
+             This object models one xPON interface or ONU as specified by the ITU
+             based PON standards.
+ 
+@@ -247,6 +255,10 @@
+ %populate {
+     on event "app:start" call xpon_mngr_app_start;
+ 
++    on event "dm:object-changed" call erp_mode_changed
++        filter 'path matches "XPON\.ERPMode\.$" &&
++                contains("parameters.Enable")';
++
+     on event "dm:object-changed" call onu_enable_changed
+         filter 'path matches "XPON\\.ONU\\.[0-9]+\\.$" &&
+                 contains("parameters.Enable")';
+--- a/include_priv/dm_events.h
++++ b/include_priv/dm_events.h
+@@ -82,4 +82,8 @@
+ void _xpon_mngr_app_start(const char* const sig_name,
+                           const amxc_var_t* const data,
+                           void* const priv);
++
++void _erp_mode_changed(const char* const event_name,
++                       const amxc_var_t* const event_data,
++                       void* const priv);
+ 
+ void _onu_enable_changed(const char* const event_name,
+--- a/src/dm_events.c
++++ b/src/dm_events.c
+@@ -64,5 +64,6 @@
+ #include "dm_events.h"
+ 
+ /* System headers */
++#include <stdlib.h>                     /* system() */
+ 
+ /* Other libraries' headers */
+@@ -171,3 +171,21 @@
+ }
+ 
++/**
++ * Handle a change to XPON.ERPMode.Enable.
++ *
++ * ERP changes only the PON ERP state and do not change XPON.ONU.Enable.
++ */
++void _erp_mode_changed(UNUSED const char* const event_name,
++                       const amxc_var_t* const event_data,
++                       UNUSED void* const priv) {
++    const bool enable = GETP_BOOL(event_data, "parameters.Enable.to");
++    const char* const command = enable ?
++        "/etc/omci/pon_subsystem.sh erp_sleep" :
++        "/etc/omci/pon_subsystem.sh erp_awake";
++    const int rc = system(command);
++
++    SAH_TRACEZ_INFO(ME, "ERPMode.Enable=%d command='%s' rc=%d",
++                    enable, command, rc);
++}
++
+ /**
+  * The Enable param of an XPON.ONU instance changed value.
