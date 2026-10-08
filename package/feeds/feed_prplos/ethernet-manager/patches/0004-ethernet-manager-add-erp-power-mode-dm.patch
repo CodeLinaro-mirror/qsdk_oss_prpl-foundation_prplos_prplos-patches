@@ -1,0 +1,40 @@
+From 3f6aefcad88421fae8fd48b9476a84775641bad9 Mon Sep 17 00:00:00 2001
+From: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
+Date: Wed, 23 Sep 2026 17:38:49 +0530
+Subject: [PATCH] ethernet-manager: add erppowermode support on interface disable
+
+Execute the ssdk_sh port erppowermode command whenever an
+Ethernet interface is disabled. The associated switch port is
+moved to low_power mode to improve power efficiency while the
+interface remains disabled.
+
+Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
+
+diff --git a/src/dm_ethernet_events.c b/src/dm_ethernet_events.c
+--- a/src/dm_ethernet_events.c
++++ b/src/dm_ethernet_events.c
+@@ -304,0 +305,12 @@
++    char command[64];
++    int result;
++
++    if(enable) {
++        snprintf(command, sizeof(command),
++                 "ssdk_sh port erppowermode set %u 0",
++                 amxd_object_get_index(obj));
++        result = system(command);
++        if(result != 0) {
++            SAH_TRACEZ_ERROR(ME, "ERP command failed with result: %d", result);
++        }
++    }
+@@ -307,0 +320,9 @@
++    if(!enable) {
++        snprintf(command, sizeof(command),
++                 "ssdk_sh port erppowermode set %u 1",
++                 amxd_object_get_index(obj));
++        result = system(command);
++        if(result != 0) {
++            SAH_TRACEZ_ERROR(ME, "ERP command failed with result: %d", result);
++        }
++    }
+-- 
+2.39.0
