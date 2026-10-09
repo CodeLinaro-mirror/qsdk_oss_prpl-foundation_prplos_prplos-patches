@@ -1,0 +1,64 @@
+From 8002022d30c326e7d60660bf2fd945af19ddee91 Mon Sep 17 00:00:00 2001
+From: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+Date: Fri, 9 Oct 2026 16:15:21 +0530
+Subject: [PATCH] Fix error flooding when trying to get nl info of disabled
+ vaps
+
+Change-Id: Id2fe979c4d61c808020cb0557c97b283aadd077a
+Signed-off-by: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+---
+
+diff --git a/src/nl80211/wld_ssid_nl80211.c b/src/nl80211/wld_ssid_nl80211.c
+index 96d3b85..d8049c9 100644
+--- a/src/nl80211/wld_ssid_nl80211.c
++++ b/src/nl80211/wld_ssid_nl80211.c
+@@ -71,6 +71,16 @@
+ 
+ #define ME "nlSSID"
+ 
++/**
++ * @brief ensure ssid type matching against nl80211 iface type
++ */
++static bool s_matchSsidIfType(T_SSID* pSSID, wld_nl80211_ifaceInfo_t* pIfaceInfo) {
++    ASSERTS_NOT_NULL(pSSID, false, ME, "NULL");
++    ASSERTS_NOT_NULL(pIfaceInfo, false, ME, "NULL");
++    return ((pIfaceInfo->isSta && (wld_ssid_getType(pSSID) == WLD_SSID_TYPE_EP)) ||
++            (pIfaceInfo->isAp && (wld_ssid_getType(pSSID) == WLD_SSID_TYPE_AP)));
++}
++
+ swl_rc_ne wld_ssid_nl80211_getInterfaceInfoExt(T_SSID* pSSID, wld_nl80211_ifaceInfo_t* pIfaceInfo, int32_t* pLinkId) {
+     wld_nl80211_ifaceInfo_t ifaceInfo;
+     memset(&ifaceInfo, 0, sizeof(ifaceInfo));
+@@ -88,13 +98,15 @@ swl_rc_ne wld_ssid_nl80211_getInterfaceInfoExt(T_SSID* pSSID, wld_nl80211_ifaceI
+     swl_rc_ne rc = SWL_RC_NOT_AVAILABLE;
+     if(((wld_ssid_isMLDReady(pSSID) && wld_ssid_hasValidMLDRole(pSSID)) || wld_ssid_hasValidMLDLinkID(pSSID)) &&
+        ((ifIndex = wld_ssid_nl80211_getPrimaryLinkIfIndex(pSSID)) > 0) &&
+-       (wld_nl80211_getInterfaceInfo(wld_nl80211_getSharedState(), ifIndex, &ifaceInfo) >= SWL_RC_OK)) {
++       (wld_nl80211_getInterfaceInfo(wld_nl80211_getSharedState(), ifIndex, &ifaceInfo) >= SWL_RC_OK) &&
++       s_matchSsidIfType(pSSID, &ifaceInfo)) {
+         /** Fetch link in primary nl80211 iface info, with linkId and relative radio's freq band */
+         rc = wld_nl80211_fetchIfaceLinkInfo(&ifaceInfo, pRad->operatingFrequencyBand, pLinkMac, wld_ssid_getMLDLinkID(pSSID), &linkId);
+     }
+     if(rc == SWL_RC_NOT_AVAILABLE) {
+         /** Search link across all nl80211 ifaces, with linkMac and relative radio's freq band */
+-        if((rc = wld_nl80211_findIfaceByLinkMac(wld_nl80211_getSharedState(), pLinkMac, &ifaceInfo, &linkId)) >= SWL_RC_OK) {
++        if((wld_nl80211_findIfaceByLinkMac(wld_nl80211_getSharedState(), pLinkMac, &ifaceInfo, &linkId) >= SWL_RC_OK) &&
++           s_matchSsidIfType(pSSID, &ifaceInfo)) {
+             rc = wld_nl80211_fetchIfaceLinkInfo(&ifaceInfo, pRad->operatingFrequencyBand, pLinkMac, linkId, &linkId);
+         }
+     }
+@@ -102,14 +114,6 @@ swl_rc_ne wld_ssid_nl80211_getInterfaceInfoExt(T_SSID* pSSID, wld_nl80211_ifaceI
+                  pSSID->Name, wld_ssid_getMLDLinkID(pSSID),
+                  swl_freqBandExt_str[pRad->operatingFrequencyBand], swl_typeMacBin_toBuf32Ref(pLinkMac).buf);
+ 
+-    /** ensure ssid type matching */
+-    if((ifaceInfo.isSta && (wld_ssid_getType(pSSID) != WLD_SSID_TYPE_EP)) ||
+-       (ifaceInfo.isAp && (wld_ssid_getType(pSSID) != WLD_SSID_TYPE_AP))) {
+-        SAH_TRACEZ_ERROR(ME, "SSID[%s] mismatching type of iface (ifName:%s)(ifId:%u)",
+-                         pSSID->Name, ifaceInfo.name, ifaceInfo.ifIndex);
+-        return SWL_RC_ERROR;
+-    }
+-
+     if(linkId >= 0) {
+         const wld_nl80211_ifaceMloLinkInfo_t* pLinkInfo = wld_nl80211_fetchIfaceMloLinkById(&ifaceInfo, linkId);
+         ASSERT_NOT_NULL(pLinkInfo, SWL_RC_ERROR, ME, "SSID[%s]: no linkId(%d) in iface (ifName:%s)(ifId:%u) nLinks(%u)",
