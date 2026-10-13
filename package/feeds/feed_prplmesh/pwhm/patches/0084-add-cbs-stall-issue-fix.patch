@@ -1,0 +1,43 @@
+From 3c582ae652f99e2f097a4da811e1d33969c7e963 Mon Sep 17 00:00:00 2001
+From: Atchaya R <ratchaya@qti.qualcomm.com>
+Date: Mon, 12 Oct 2026 18:52:22 +0530
+Subject: [PATCH] pwhm: add support for triggering cbs post abortion in middle
+ of a cbs scan
+
+Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
+---
+ src/Plugin/wifiGen_eventHandlers.c | 16 ++++++++++++----
+ 1 file changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/src/Plugin/wifiGen_eventHandlers.c b/src/Plugin/wifiGen_eventHandlers.c
+index 09e32da..a125eb3 100644
+--- a/src/Plugin/wifiGen_eventHandlers.c
++++ b/src/Plugin/wifiGen_eventHandlers.c
+@@ -1198,12 +1198,20 @@ static void s_cbsAbortedCb(void* userData, char* ifName, char* params) {
+     SAH_TRACEZ_WARNING(ME, "%s: notify wpaCtrlEvents CBS-ABORTED eventData=%s", pRad->Name, msgData);
+     amxd_object_trigger_signal(pRad->pBus, "wpaCtrlEvents", &eventData);
+     amxc_var_clean(&eventData);
+-    /* Reset CBS.Enable to 0 in the DM — scan was aborted */
++    /* Reset CBS.Enable to 0 in the DM — scan was aborted
++     * Only touch the flag/commit when Enable is actually non-zero: if it is
++     * already 0 (e.g. a duplicate/late ABORTED event), committing 0 again is
++     * a no-op that never fires s_setCbsEnable_pwf, so cbsEventUpdating would
++     * never get cleared and would wrongly swallow the next genuine
++     * CBS.Enable write (see s_cbsCompletedCb for the same pattern). */
+     amxd_object_t* cbsObj = amxd_object_findf(pRad->pBus, "CBS");
+     if(cbsObj != NULL) {
+-        /* Set flag so s_setCbsEnable_pwf skips the wpa_ctrl command */
+-        pRad->cbsEventUpdating = true;
+-        swl_typeUInt32_commitObjectParam(cbsObj, "Enable", 0);
++	    uint32_t curEnable = amxd_object_get_uint32_t(cbsObj, "Enable", NULL);
++	    if(curEnable != 0) {
++	       /* Set flag so s_setCbsEnable_pwf skips the wpa_ctrl command */
++	       pRad->cbsEventUpdating = true;
++	       swl_typeUInt32_commitObjectParam(cbsObj, "Enable", 0);
++	    }
+     }
+ }
+ 
+-- 
+2.34.1
+
