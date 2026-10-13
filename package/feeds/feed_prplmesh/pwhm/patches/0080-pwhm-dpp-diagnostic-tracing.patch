@@ -1,0 +1,842 @@
+From: Sandeep Tomer <stomer@qti.qualcomm.com>
+Date: 22 Sep 2026 18:44:00 +0530
+Subject: [PATCH] pwhm: correct DPP command results, relay lifecycle and AP
+ security
+
+Retain the diagnostic changes in 0080 and apply this delta after the existing
+patch series (including 0076). Keep the build directory generated from patches.
+
+- Correct swl_rc_ne/Boolean conversion for the bSTAList SET operation.
+- Expose actual listener readiness and per-connection relay generations.
+- Bound framing and close a stream after incomplete sends; redact DPP payloads.
+- Separate CCE advertisement from operational DPP state and explicit AKM mode.
+- Validate/synchronize complete per-BSS credentials and reset partial events.
+- Do not emit the deprecated `dpp=1` WPA supplicant network option.
+
+No channel-switch, STA-DFS, radio FSM or non-DPP platform changes.
+Endpoint/1905 credential persistence across reboot needs a separate design.
+
+Signed-off-by: Sandeep Tomer <stomer@qti.qualcomm.com>
+---
+ 10 files changed
+--- a/include/wld/wld_dpp.h
++++ b/include/wld/wld_dpp.h
+@@ -10,6 +10,9 @@
+ 
+ void _wld_dpp_relay_setConf_ocf(const char* const sig_name, const amxc_var_t* const data, void* const priv);
+ 
++amxd_status_t _DPPRelay_StartRelay(amxd_object_t* object, amxd_function_t* func,
++                                   amxc_var_t* args, amxc_var_t* retval);
++
+ amxd_status_t _DPPRelay_SendDppFrame(amxd_object_t* object,
+                                       amxd_function_t* func,
+                                       amxc_var_t* args,
+--- a/odl/wld_accesspoint.odl
++++ b/odl/wld_accesspoint.odl
+@@ -1173,10 +1173,18 @@
+ 		 *  [DPP] for this access point.*/
+ 		%persistent object DPP{
+ 			on event "*" call wld_ap_setDppConf_ocf;
++			on action validate call wld_ap_validateDpp_ovf;
+ 			/** Enables or disables DPP functionality for this access point. */
+ 			%persistent bool Enable{
+ 				default false;
+ 			}
++			/** CCE advertisement only; disabling this preserves relay and credentials. */
++			%persistent bool ConfiguratorConnectivity { default true; }
++			/** Explicit AKM ownership. Auto preserves legacy credential-driven behavior. */
++			%persistent string AKMMode {
++				on action validate call check_enum ["Auto", "Disabled", "DPPOnly", "Mixed"];
++				default "Auto";
++			}
+ 			/** DPP role for this AP.
+ 			 * "Configurator": writes dpp=1 + dpp_configurator_connectivity=1
+ 			 * "Relay"       : writes dpp_controller only. BootstrapType and
+--- a/odl/wld_dpp.odl
++++ b/odl/wld_dpp.odl
+@@ -34,10 +34,19 @@
+ 			/**
+ 			 * True while a client (hostapd) is connected to the relay.
+ 			 */
+-			bool ClientConnected {
++			%read-only bool ClientConnected {
+ 				default false;
+ 			}
+ 
++			/** Actual bind/listen/event-loop registration status, not desired state. */
++			%read-only bool ListenerReady { default false; }
++			%read-only string LastError;
++			/** Changes on each accepted connection; zero means no connection yet. */
++			%read-only uint64 ClientGeneration { default 0; }
++
++			/** Idempotent synchronous start; returns only after listener is ready. */
++			bool StartRelay();
++
+ 			/**
+ 			 * Notifies a raw DPP frame reception, or a relay client
+ 			 * connect/disconnect transition.
+@@ -53,7 +62,8 @@
+ 			 * @param tcpType the raw TCP frame type byte
+ 			 * @param frame hex-encoded DPP frame bytes
+ 			 */
+-			void SendDppFrame(%in %mandatory uint8 tcpType, %in %mandatory string frame);
++			void SendDppFrame(%in %mandatory uint8 tcpType, %in %mandatory string frame,
++			                  %in uint64 connectionId);
+ 		}
+ 	}
+ }
+--- a/src/nl80211/wld_wpaSupp_cfgFile.c
++++ b/src/nl80211/wld_wpaSupp_cfgFile.c
+@@ -356,10 +356,6 @@ static swl_rc_ne s_setWpaSuppNetworkConfig(T_EndPoint* pEP, swl_mapChar_t* netw
+ 
+     swl_mapCharFmt_addValInt32(network, "ieee80211w", mfp);
+ 
+-    if(pEP->DPP_Enable) {
+-        swl_mapChar_add(network, "dpp", "1");
+-    }
+-
+     if(pEP->multiAPEnable) {
+         swl_mapChar_add(network, "multi_ap_backhaul_sta", "1");
+     }
+--- a/src/Plugin/wifiGen_eventHandlers.c
++++ b/src/Plugin/wifiGen_eventHandlers.c
+@@ -152,7 +152,11 @@
+         amxc_var_add_key(cstring_t, &eventData, "ifName", ifName);
+         amxc_var_add_key(cstring_t, &eventData, "eventData", msgData);
+ 
+-    SAH_TRACEZ_ERROR(ME, "%s: notify wpaCtrlEvents eventData=%s", ifName, msgData);
++        if(strncmp(eventName, "DPP-", 4) == 0) {
++            SAH_TRACEZ_INFO(ME, "%s: notify wpaCtrlEvents %s (payload redacted)", ifName, eventName);
++        } else {
++            SAH_TRACEZ_ERROR(ME, "%s: notify wpaCtrlEvents eventData=%s", ifName, msgData);
++        }
+ 
+         amxd_object_trigger_signal(object, "wpaCtrlEvents", &eventData);
+         amxc_var_clean(&eventData);
+@@ -196,6 +200,7 @@
+ static void s_storePendingDppCredential(char** field, const char* value, bool firstTokenOnly) {
+     ASSERTS_NOT_NULL(field, , ME, "NULL");
+     ASSERTS_NOT_NULL(value, , ME, "NULL");
++    W_SWL_FREE(*field);
+     if(swl_str_isEmpty(value)) {
+         return;
+     }
+@@ -220,7 +225,6 @@
+     ASSERTS_NOT_NULL(copy, , ME, "NULL");
+     memcpy(copy, value, len);
+ 
+-    W_SWL_FREE(*field);
+     *field = copy;
+ }
+ 
+@@ -253,15 +257,30 @@
+ 
+     bool updated = false;
+     if(swl_str_matches(eventName, "DPP-CONNECTOR")) {
++        /* hostapd emits Connector, C-sign, NetAccessKey in this order for
++         * each config object. Never combine fragments of two objects. */
++        s_clearPendingDppCredentials(pAP);
+         s_storePendingDppCredential(&pAP->dppPendingConnector, s_getDppEventPayload(msgData, eventName), false);
+         updated = true;
+     } else if(swl_str_matches(eventName, "DPP-C-SIGN-KEY")) {
++        if(!pAP->dppPendingConnector || pAP->dppPendingCSign) {
++            s_clearPendingDppCredentials(pAP);
++            return;
++        }
+         s_storePendingDppCredential(&pAP->dppPendingCSign, s_getDppEventPayload(msgData, eventName), false);
+         updated = true;
+     } else if(swl_str_matches(eventName, "DPP-NET-ACCESS-KEY")) {
++        if(!pAP->dppPendingConnector || !pAP->dppPendingCSign) {
++            s_clearPendingDppCredentials(pAP);
++            return;
++        }
+         s_storePendingDppCredential(&pAP->dppPendingNetAccessKey, s_getDppEventPayload(msgData, eventName), true);
+         updated = true;
+     } else if(swl_str_matches(eventName, "DPP-AUTH-SUCCESS") ||
++              swl_str_matches(eventName, "DPP-CONF-RECEIVED") ||
++              swl_str_matches(eventName, "DPP-AUTH-INIT-FAILED") ||
++              swl_str_matches(eventName, "DPP-NOT-COMPATIBLE") ||
++              swl_str_matches(eventName, "CTRL-EVENT-TERMINATING") ||
+               swl_str_matches(eventName, "DPP-FAIL") ||
+               swl_str_matches(eventName, "DPP-CONF-FAILED")) {
+         s_clearPendingDppCredentials(pAP);
+@@ -270,6 +289,9 @@
+ 
+     if(updated) {
+         s_persistCompleteDppCredentials(pAP);
++        if(swl_str_matches(eventName, "DPP-NET-ACCESS-KEY")) {
++            s_clearPendingDppCredentials(pAP);
++        }
+     }
+ }
+ 
+@@ -283,11 +305,22 @@
+     T_EndPoint* pEP = (T_EndPoint*) userData;
+     if(debugIsVapPointer(pAP)) {
+         object = pAP->pBus;
++        if(strncmp(eventName, "DPP-", 4) == 0 &&
++           !swl_str_matches(ifName, wld_wpaCtrlInterface_getName(pAP->wpaCtrlInterface))) {
++            s_clearPendingDppCredentials(pAP);
++            return;
++        }
+         if(pAP->DPP_Enable) {
+             s_handleDppCredentialEvent(pAP, eventName, msgData);
++        } else {
++            s_clearPendingDppCredentials(pAP);
+         }
+     } else if(debugIsEpPointer(pEP)) {
+         object = pEP->pBus;
++        if(strncmp(eventName, "DPP-", 4) == 0 &&
++           !swl_str_matches(ifName, wld_wpaCtrlInterface_getName(pEP->wpaCtrlInterface))) {
++            return;
++        }
+     }
+ 
+     ASSERTS_NOT_NULL(object, , ME, "NULL");
+@@ -347,6 +380,12 @@
+ static swl_rc_ne s_wpaCtrlIfacePreEvt(void* userData _UNUSED, char* ifName, char* msgData, size_t len _UNUSED, char** newIfName, char** newMsgData, size_t* newLen) {
+     ASSERT_NOT_NULL(msgData, SWL_RC_INVALID_PARAM, ME, "NULL");
+ 
++    /* DPP has no rewrite in this table. Do not expose key-bearing events in the
++     * generic parser-miss diagnostic; normal DPP dispatch follows this hook. */
++    if(strstr(msgData, "DPP-") != NULL) {
++        return SWL_RC_OK;
++    }
++
+     swl_rc_ne ret = SWL_RC_OK;
+     char* eventName = NULL;
+     char* pParams = NULL;
+@@ -1768,6 +1807,7 @@
+     ASSERTS_STR(ifName, , ME, "NULL");
+     T_AccessPoint* pAP = (T_AccessPoint*) userData;
+     ASSERT_TRUE(debugIsVapPointer(pAP), , ME, "INVALID");
++    s_clearPendingDppCredentials(pAP);
+     wld_vap_updateState(pAP);
+     ASSERTS_NOT_EQUALS(pAP->status, APSTI_ENABLED, , ME, "%s: ap still enabled", pAP->alias);
+     SAH_TRACEZ_INFO(ME, "%s: AP iface disabled", ifName);
+@@ -2283,6 +2323,7 @@
+ 
+ swl_rc_ne wifiGen_setVapEvtHandlers(T_AccessPoint* pAP) {
+     ASSERT_NOT_NULL(pAP, SWL_RC_INVALID_PARAM, ME, "NULL");
++    s_clearPendingDppCredentials(pAP);
+ 
+     wld_wpaCtrl_evtHandlers_cb wpaCtrlVapEvtHandlers;
+     memset(&wpaCtrlVapEvtHandlers, 0, sizeof(wpaCtrlVapEvtHandlers));
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -2269,56 +2269,76 @@
+  *
+  * @return void
+  */
+-void wld_hostapd_cfgFile_setVapConfig(T_AccessPoint* pAP, swl_mapChar_t* vapConfigMap, swl_mapChar_t* multiAPConfig) {
+-    ASSERTS_NOT_NULL(pAP, , ME, "NULL");
+-    ASSERTS_NOT_NULL(vapConfigMap, , ME, "NULL");
+-
+-    ASSERTS_TRUE(s_setVapCommonConfig(pAP, vapConfigMap), , ME, "%s: skipped", pAP->alias);
+-    s_setVapWpsConfig(pAP, vapConfigMap);
+-    s_setVapMultiApConf(pAP, vapConfigMap, multiAPConfig);
+-
++static void s_setVapDppConfig(T_AccessPoint* pAP, swl_mapChar_t* vapConfigMap) {
++    amxd_object_t* dppObj = pAP->pBus ? amxd_object_findf(pAP->pBus, "DPP") : NULL;
++    if(dppObj == NULL) {
++        return;
++    }
+     if(pAP->DPP_Enable && pAP->DPP_IsRelay) {
+         swl_mapChar_add(vapConfigMap, "dpp_controller",
+                          "ipaddr=127.0.0.1 pkhash="
+                          "0000000000000000000000000000000000000000000000000000000000000000");
+     }
+-    if(pAP->DPP_Enable) {
++    if(pAP->DPP_Enable && amxd_object_get_bool(dppObj, "ConfiguratorConnectivity", NULL)) {
+         swl_mapChar_add(vapConfigMap, "dpp_configurator_connectivity", "1");
+     }
+-
+-    /* DPP credentials are per-BSS and must be replayed after hostapd restart. */
+-    if(pAP->DPP_Enable && pAP->pBus) {
+-        amxd_object_t* dppObj = amxd_object_findf(pAP->pBus, "DPP");
+-        if(dppObj) {
+-            char* connector = amxd_object_get_cstring_t(dppObj, "Connector", NULL);
+-            char* csign = amxd_object_get_cstring_t(dppObj, "CSign", NULL);
+-            char* netAccessKey = amxd_object_get_cstring_t(dppObj, "NetAccessKey", NULL);
+-            bool hasConnector = (connector && connector[0]);
+-            bool hasCSign = (csign && csign[0]);
+-            bool hasNetAccessKey = (netAccessKey && netAccessKey[0]);
+-            if(hasConnector && hasCSign && hasNetAccessKey) {
+-                swl_mapChar_add(vapConfigMap, "dpp_connector", connector);
+-                swl_mapChar_add(vapConfigMap, "dpp_csign", csign);
+-                swl_mapChar_add(vapConfigMap, "dpp_netaccesskey", netAccessKey);
+-
+-                /* A BSS holding a DPP Connector must also advertise the DPP AKM in its
+-                 * RSN IE, or a peer using that Connector can never associate. */
+-                char* curKeyMgmt = swl_mapChar_get(vapConfigMap, "wpa_key_mgmt");
+-                if(!swl_str_isEmpty(curKeyMgmt)) {
+-                    char keyMgmtBuf[128] = {0};
+-                    swl_str_copy(keyMgmtBuf, sizeof(keyMgmtBuf), curKeyMgmt);
+-                    swl_mapCharFmt_addValStr(vapConfigMap, "wpa_key_mgmt", "%s DPP", keyMgmtBuf);
+-                }
+-            } else if(hasConnector || hasCSign || hasNetAccessKey) {
+-                SAH_TRACEZ_WARNING(ME,
+-                                   "%s: incomplete persistent DPP credential set, skipping replay",
+-                                   pAP->alias);
++    char* mode = amxd_object_get_cstring_t(dppObj, "AKMMode", NULL);
++    bool dppOnly = swl_str_matches(mode, "DPPOnly");
++    bool mixed = swl_str_matches(mode, "Mixed");
++    bool disabled = swl_str_matches(mode, "Disabled");
++    char* connector = amxd_object_get_cstring_t(dppObj, "Connector", NULL);
++    char* csign = amxd_object_get_cstring_t(dppObj, "CSign", NULL);
++    char* netAccessKey = amxd_object_get_cstring_t(dppObj, "NetAccessKey", NULL);
++    bool complete = !swl_str_isEmpty(connector) && !swl_str_isEmpty(csign) &&
++                    !swl_str_isEmpty(netAccessKey);
++    const char* curKeyMgmt = swl_mapChar_get(vapConfigMap, "wpa_key_mgmt");
++    bool baseSecure = !swl_str_isEmpty(curKeyMgmt);
++    /* Auto retains the existing credential-driven behavior, including RSN for a
++     * DPP-only BSS (there must never be an implicit open-security fallback). */
++    if(!disabled && pAP->DPP_Enable && complete) {
++        if(dppOnly || (!mixed && !baseSecure)) {
++            swl_mapChar_addOrSet(vapConfigMap, "wpa", "2");
++            swl_mapChar_addOrSet(vapConfigMap, "wpa_key_mgmt", "DPP");
++            swl_mapChar_addOrSet(vapConfigMap, "rsn_pairwise", "CCMP");
++            swl_mapChar_addOrSet(vapConfigMap, "ieee80211w", "2");
++            swl_mapChar_addOrSet(vapConfigMap, "wps_state", "0");
++        } else if(baseSecure) {
++            char keyMgmtBuf[128] = {0};
++            swl_str_copy(keyMgmtBuf, sizeof(keyMgmtBuf), curKeyMgmt);
++            if(strstr(keyMgmtBuf, "DPP") == NULL) {
++                swl_mapCharFmt_addValStr(vapConfigMap, "wpa_key_mgmt", "%s DPP", keyMgmtBuf);
+             }
+-            free(connector);
+-            free(csign);
+-            free(netAccessKey);
++        } else {
++            swl_mapChar_addOrSet(vapConfigMap, "start_disabled", "1");
++            SAH_TRACEZ_ERROR(ME, "%s: Mixed DPP requires a secure base AKM", pAP->alias);
+         }
++        swl_mapChar_add(vapConfigMap, "dpp_connector", connector);
++        swl_mapChar_add(vapConfigMap, "dpp_csign", csign);
++        swl_mapChar_add(vapConfigMap, "dpp_netaccesskey", netAccessKey);
++    } else if(dppOnly || mixed) {
++        /* Invalid restored state must not start an open BSS. Normal writes are
++         * rejected by the DPP object validator before reaching this guard. */
++        swl_mapChar_addOrSet(vapConfigMap, "start_disabled", "1");
++        if(dppOnly) {
++            swl_mapChar_addOrSet(vapConfigMap, "wpa", "2");
++            swl_mapChar_addOrSet(vapConfigMap, "wpa_key_mgmt", "DPP");
++            swl_mapChar_addOrSet(vapConfigMap, "rsn_pairwise", "CCMP");
++        }
++        SAH_TRACEZ_ERROR(ME, "%s: refusing incomplete/disabled DPP-AKM BSS", pAP->alias);
+     }
++    free(mode);
++    free(connector);
++    free(csign);
++    free(netAccessKey);
++}
++
++void wld_hostapd_cfgFile_setVapConfig(T_AccessPoint* pAP, swl_mapChar_t* vapConfigMap, swl_mapChar_t* multiAPConfig) {
++    ASSERTS_NOT_NULL(pAP, , ME, "NULL");
++    ASSERTS_NOT_NULL(vapConfigMap, , ME, "NULL");
++
++    ASSERTS_TRUE(s_setVapCommonConfig(pAP, vapConfigMap), , ME, "%s: skipped", pAP->alias);
++    s_setVapWpsConfig(pAP, vapConfigMap);
++    s_setVapMultiApConf(pAP, vapConfigMap, multiAPConfig);
+ 
+     /* DCS: write dcs_enable bitmask to hostapd config when non-zero.
+      * Bit 0 = CW, Bit 1 = WLAN, Bit 2 = AWGN, Bit 4 = OBSS */
+@@ -2336,6 +2356,7 @@
+     bool rnrCfgStd = isIEEE80211k && (wld_ap_getDiscoveryMethod(pAP) == M_AP_DM_RNR);
+ 
+     pAP->pFA->mfn_wvap_updateConfigMap(pAP, vapConfigMap);
++    s_setVapDppConfig(pAP, vapConfigMap);
+ 
+     // if rnr conf has been changed by vdr, then prevent further overwriting by removing standard rnr conf setting
+     if(wld_secDmn_getCfgParamSupp(pAP->pRadio->hostapd, "rnr") != SWL_TRL_FALSE) {
+--- a/src/nl80211/wld_wpaCtrl_events.c
++++ b/src/nl80211/wld_wpaCtrl_events.c
+@@ -1235,7 +1235,8 @@
+     ASSERTS_NOT_NULL(pInterface, , ME, "NULL");
+     ASSERTS_STR(msgData, , ME, "empty");
+     ASSERTS_TRUE(len > 0, , ME, "null length");
+-    SAH_TRACEZ_NOTICE(ME, "%s: receive event len: %zu (%s)", wld_wpaCtrlInterface_getName(pInterface), len, msgData);
++    SAH_TRACEZ_NOTICE(ME, "%s: receive event len: %zu (%s)", wld_wpaCtrlInterface_getName(pInterface), len,
++                       strstr(msgData, "DPP-") ? "DPP payload redacted" : msgData);
+ 
+     // 1) prepare custom msg for processing: target interface, msg content
+     char* newIfName = NULL;
+@@ -1254,7 +1255,8 @@
+         if((newMsgData != NULL) && (newLen > 0)) {
+             msgData = newMsgData;
+             len = newLen;
+-            SAH_TRACEZ_NOTICE(ME, "%s: modified event len: %zu (%s)", pInterface->name, len, msgData);
++            SAH_TRACEZ_NOTICE(ME, "%s: modified event len: %zu (%s)", pInterface->name, len,
++                               strstr(msgData, "DPP-") ? "DPP payload redacted" : msgData);
+         }
+     }
+     W_SWL_FREE(newIfName);
+--- a/src/wld_accesspoint.c
++++ b/src/wld_accesspoint.c
+@@ -1861,10 +1861,69 @@
+     SAH_TRACEZ_OUT(ME);
+ }
+ 
++/* Credential-only changes also need a hostapd sync, even when Enable/Role stay equal. */
++static void s_setDppConfig_pwf(void* priv _UNUSED, amxd_object_t* object,
++                               amxd_param_t* param _UNUSED, const amxc_var_t* const newValue _UNUSED) {
++    T_AccessPoint* pAP = wld_ap_fromObj(amxd_object_get_parent(object));
++    if(pAP != NULL) {
++        wld_ap_doSync(pAP);
++    }
++}
++
++amxd_status_t _wld_ap_validateDpp_ovf(amxd_object_t* object,
++                                      amxd_param_t* param _UNUSED,
++                                      amxd_action_t reason _UNUSED,
++                                      const amxc_var_t* const args _UNUSED,
++                                      amxc_var_t* const retval _UNUSED,
++                                      void* priv _UNUSED) {
++    if(amxd_object_get_type(amxd_object_get_parent(object)) != amxd_object_instance) {
++        return amxd_status_ok;
++    }
++    amxc_var_t params;
++    amxc_var_init(&params);
++    amxc_var_set_type(&params, AMXC_VAR_ID_HTABLE);
++    swla_object_paramsToMap(&params, object);
++    const char* mode = GET_CHAR(&params, "AKMMode");
++    const char* connector = GET_CHAR(&params, "Connector");
++    const char* csign = GET_CHAR(&params, "CSign");
++    const char* nak = GET_CHAR(&params, "NetAccessKey");
++    bool hasConnector = !swl_str_isEmpty(connector);
++    bool hasCsign = !swl_str_isEmpty(csign);
++    bool hasNak = !swl_str_isEmpty(nak);
++    bool complete = hasConnector && hasCsign && hasNak;
++    bool explicitAkm = swl_str_matches(mode, "DPPOnly") || swl_str_matches(mode, "Mixed");
++    bool valid = (!hasConnector && !hasCsign && !hasNak) || complete;
++    if(complete) {
++        valid = (strlen(connector) <= 8192) && (strpbrk(connector, "\r\n\t ") == NULL) &&
++                (strlen(csign) <= 8192) && (strlen(csign) % 2 == 0) &&
++                (strspn(csign, "0123456789abcdefABCDEF") == strlen(csign)) &&
++                (strlen(nak) <= 8192) && (strlen(nak) % 2 == 0) &&
++                (strspn(nak, "0123456789abcdefABCDEF") == strlen(nak));
++    }
++    if(explicitAkm) {
++        amxd_object_t* security = amxd_object_findf(amxd_object_get_parent(object), "Security");
++        char* baseMode = security ? amxd_object_get_cstring_t(security, "ModeEnabled", NULL) : NULL;
++        bool open = swl_str_matches(baseMode, "None");
++        valid = valid && complete && (baseMode != NULL) &&
++                (swl_str_matches(mode, "DPPOnly") ? open : !open);
++        free(baseMode);
++    }
++    amxc_var_clean(&params);
++    if(!valid) {
++        SAH_TRACEZ_ERROR(ME, "Reject incomplete/invalid DPP credentials or inconsistent AKM mode");
++    }
++    return valid ? amxd_status_ok : amxd_status_invalid_value;
++}
++
+ SWLA_DM_HDLRS(sApDppDmHdlrs,
+               ARR(SWLA_DM_PARAM_HDLR("Enable", s_setDppEnable_pwf),
+                   SWLA_DM_PARAM_HDLR("Role", s_setDppRole_pwf),
+-                  SWLA_DM_PARAM_HDLR("BootstrapType", s_setDppBootstrapType_pwf)
++                  SWLA_DM_PARAM_HDLR("BootstrapType", s_setDppBootstrapType_pwf),
++                  SWLA_DM_PARAM_HDLR("ConfiguratorConnectivity", s_setDppConfig_pwf),
++                  SWLA_DM_PARAM_HDLR("AKMMode", s_setDppConfig_pwf),
++                  SWLA_DM_PARAM_HDLR("Connector", s_setDppConfig_pwf),
++                  SWLA_DM_PARAM_HDLR("CSign", s_setDppConfig_pwf),
++                  SWLA_DM_PARAM_HDLR("NetAccessKey", s_setDppConfig_pwf)
+                   )
+               );
+ 
+--- a/src/wld_dpp.c
++++ b/src/wld_dpp.c
+@@ -46,6 +46,7 @@
+     amxd_object_t* dppObj;
+     uint8_t rxBuf[DPP_RX_BUF_SIZE];
+     size_t rxLen;
++    uint64_t clientGeneration;
+ } wld_dpp_ctx_t;
+ 
+ static wld_dpp_ctx_t s_dppCtx = {
+@@ -62,10 +63,26 @@
+     amxc_var_init(&notifMap);
+     amxc_var_set_type(&notifMap, AMXC_VAR_ID_HTABLE);
+     amxc_var_add_key(cstring_t, &notifMap, "state", connected ? "connected" : "disconnected");
++    amxc_var_add_key(uint64_t, &notifMap, "connectionId", s_dppCtx.clientGeneration);
++    amxd_object_set_bool(s_dppCtx.dppObj, "ClientConnected", connected);
++    amxd_object_set_uint64_t(s_dppCtx.dppObj, "ClientGeneration", s_dppCtx.clientGeneration);
+     amxd_object_trigger_signal(s_dppCtx.dppObj, "DppFrameReceived", &notifMap);
+     amxc_var_clean(&notifMap);
++}
+ 
+-    amxd_object_set_bool(s_dppCtx.dppObj, "ClientConnected", connected);
++static void s_notifyListenerState(bool ready, const char* error) {
++    if(s_dppCtx.dppObj == NULL) {
++        return;
++    }
++    amxd_object_set_bool(s_dppCtx.dppObj, "ListenerReady", ready);
++    amxd_object_set_cstring_t(s_dppCtx.dppObj, "LastError", error);
++    amxc_var_t notifMap;
++    amxc_var_init(&notifMap);
++    amxc_var_set_type(&notifMap, AMXC_VAR_ID_HTABLE);
++    amxc_var_add_key(cstring_t, &notifMap, "state", ready ? "listening" : "stopped");
++    amxc_var_add_key(bool, &notifMap, "listenerReady", ready);
++    amxd_object_trigger_signal(s_dppCtx.dppObj, "DppFrameReceived", &notifMap);
++    amxc_var_clean(&notifMap);
+ }
+ 
+ static const char* s_dppActionTypeToStr(uint8_t type) {
+@@ -98,17 +115,16 @@
+     bool ok = swl_hex_fromBytesSep(frameHex, sizeof(frameHex), frame, frameLen, false, 0, NULL);
+     ASSERT_TRUE(ok, , ME, "fail to hex-encode DPP frame (len:%zu)", frameLen);
+ 
+-    if(frameLen >= DPP_HDR_LEN) {
++    if((tcpType == 9) && (frameLen >= DPP_HDR_LEN)) {
+         uint8_t dppActionType = frame[DPP_HDR_LEN - 1];
+-        SAH_TRACEZ_INFO(ME, "rx DPP frame tcpType(%u) dppActionType(%u:%s) len(%zu) raw(%s)",
+-                        tcpType, dppActionType, s_dppActionTypeToStr(dppActionType), frameLen, frameHex);
++        SAH_TRACEZ_INFO(ME, "rx DPP frame tcpType(%u) dppActionType(%u:%s) len(%zu)",
++                        tcpType, dppActionType, s_dppActionTypeToStr(dppActionType), frameLen);
+         if((dppActionType == DPP_PA_PRESENCE_ANNOUNCEMENT) || (dppActionType == DPP_PA_RECONFIG_ANNOUNCEMENT)) {
+             SAH_TRACEZ_INFO(ME, "rx DPP %s from hostapd (Enrollee-proxy) fd(%d)",
+                             s_dppActionTypeToStr(dppActionType), s_dppCtx.clientFd);
+         }
+     } else {
+-        SAH_TRACEZ_WARNING(ME, "rx DPP frame too short to decode action type tcpType(%u) len(%zu) raw(%s)",
+-                            tcpType, frameLen, frameHex);
++        SAH_TRACEZ_INFO(ME, "rx relay frame tcpType(%u) len(%zu)", tcpType, frameLen);
+     }
+ 
+     amxc_var_t notifMap;
+@@ -116,6 +132,7 @@
+     amxc_var_set_type(&notifMap, AMXC_VAR_ID_HTABLE);
+     amxc_var_add_key(cstring_t, &notifMap, "frame", frameHex);
+     amxc_var_add_key(uint8_t, &notifMap, "tcpType", tcpType);
++    amxc_var_add_key(uint64_t, &notifMap, "connectionId", s_dppCtx.clientGeneration);
+     SAH_TRACEZ_INFO(ME, "sending DppFrameReceived signal via ambiorix to 1905/EasyMesh process (tcpType:%u, frameLen:%zu)",
+                     tcpType, frameLen);
+     amxd_object_trigger_signal(s_dppCtx.dppObj, "DppFrameReceived", &notifMap);
+@@ -138,16 +155,15 @@
+  * record to the front of the buffer. payloadLen covers the type byte plus
+  * the frame (1 + frameLen), matching hostapd's dpp_tcp.c wire format.
+  */
+-static void s_reassembleFrames(void) {
++static bool s_reassembleFrames(void) {
+     size_t offset = 0;
+     while((s_dppCtx.rxLen - offset) >= DPP_FRAME_HDR_LEN) {
+         const uint8_t* hdr = &s_dppCtx.rxBuf[offset];
+         uint32_t payloadLen = ((uint32_t) hdr[0] << 24) | ((uint32_t) hdr[1] << 16) |
+             ((uint32_t) hdr[2] << 8) | (uint32_t) hdr[3];
+-        if(payloadLen < 1) {
+-            SAH_TRACEZ_ERROR(ME, "invalid DPP frame payloadLen(%u), discarding buffer", payloadLen);
+-            s_dppCtx.rxLen = 0;
+-            return;
++        if((payloadLen < 1) || (payloadLen > DPP_RX_BUF_SIZE - 4)) {
++            SAH_TRACEZ_ERROR(ME, "invalid DPP frame payloadLen(%u), closing stream", payloadLen);
++            return false;
+         }
+         if((s_dppCtx.rxLen - offset - 4) < payloadLen) {
+             break;
+@@ -161,6 +177,7 @@
+         memmove(s_dppCtx.rxBuf, &s_dppCtx.rxBuf[offset], s_dppCtx.rxLen - offset);
+     }
+     s_dppCtx.rxLen -= offset;
++    return true;
+ }
+ 
+ static void s_dppClientRead(int fd, void* priv _UNUSED) {
+@@ -176,11 +193,12 @@
+         }
+         ssize_t n = recv(fd, &s_dppCtx.rxBuf[s_dppCtx.rxLen], sizeof(s_dppCtx.rxBuf) - s_dppCtx.rxLen, MSG_DONTWAIT);
+         if(n > 0) {
+-            char rawHex[((size_t) n * 2) + 1];
+-            if(swl_hex_fromBytesSep(rawHex, sizeof(rawHex), &s_dppCtx.rxBuf[s_dppCtx.rxLen], (size_t) n, false, 0, NULL)) {
+-                SAH_TRACEZ_INFO(ME, "recv fd(%d) %zd raw byte(s): %s", fd, n, rawHex);
+-            }
+             s_dppCtx.rxLen += (size_t) n;
++            /* Drain records as they arrive, including data immediately preceding EOF. */
++            if(!s_reassembleFrames()) {
++                disconnected = true;
++                break;
++            }
+             continue;
+         } else if(n == 0) {
+             SAH_TRACEZ_INFO(ME, "DPP relay client fd(%d) closed connection (EOF)", fd);
+@@ -197,8 +215,6 @@
+         }
+     }
+ 
+-    s_reassembleFrames();
+-
+     if(disconnected) {
+         s_closeClient();
+     }
+@@ -210,7 +226,7 @@
+     SAH_TRACEZ_IN(ME);
+     ASSERTS_EQUALS(fd, s_dppCtx.listenFd, , ME, "fd mismatch");
+ 
+-    int newFd = accept4(fd, NULL, NULL, SOCK_NONBLOCK);
++    int newFd = accept4(fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+     ASSERTI_FALSE(newFd < 0, , ME, "accept4 err(%d:%s)", errno, strerror(errno));
+ 
+     /* Single-Enrollee policy, mirrors nl80211's dpp_relay_socket::handle_accept():
+@@ -233,6 +249,9 @@
+ 
+     s_dppCtx.clientFd = newFd;
+     s_dppCtx.rxLen = 0;
++    if(++s_dppCtx.clientGeneration == 0) {
++        ++s_dppCtx.clientGeneration;
++    }
+     SAH_TRACEZ_INFO(ME, "accepted new DPP relay client fd(%d)", newFd);
+     s_notifyClientState(true);
+ 
+@@ -240,10 +259,17 @@
+ }
+ 
+ static swl_rc_ne s_startRelay(amxd_object_t* dppObj) {
+-    ASSERTI_TRUE(s_dppCtx.listenFd < 0, SWL_RC_OK, ME, "relay already started");
++    s_dppCtx.dppObj = dppObj;
++    if(s_dppCtx.listenFd >= 0) {
++        s_notifyListenerState(true, "");
++        return SWL_RC_OK;
++    }
+ 
+-    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+-    ASSERT_FALSE(fd < 0, SWL_RC_ERROR, ME, "socket() failed err(%d:%s)", errno, strerror(errno));
++    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
++    if(fd < 0) {
++        s_notifyListenerState(false, strerror(errno));
++        return SWL_RC_ERROR;
++    }
+ 
+     int reuse = 1;
+     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+@@ -258,12 +284,13 @@
+        (listen(fd, 5) < 0) ||
+        (amxo_connection_add(get_wld_plugin_parser(), fd, s_dppAccept, "dppListen", AMXO_CUSTOM, NULL) != 0)) {
+         SAH_TRACEZ_ERROR(ME, "fail to start DPP relay listener err(%d:%s)", errno, strerror(errno));
++        s_notifyListenerState(false, "DPP listener bind/listen/registration failed");
+         close(fd);
+         return SWL_RC_ERROR;
+     }
+ 
+     s_dppCtx.listenFd = fd;
+-    s_dppCtx.dppObj = dppObj;
++    s_notifyListenerState(true, "");
+     SAH_TRACEZ_INFO(ME, "DPP relay listening on 127.0.0.1:%d", DPP_TCP_PORT);
+     return SWL_RC_OK;
+ }
+@@ -278,6 +305,7 @@
+         s_dppCtx.listenFd = -1;
+         SAH_TRACEZ_INFO(ME, "DPP relay stopped");
+     }
++    s_notifyListenerState(false, "");
+ }
+ 
+ void wld_dpp_stopRelay(void) {
+@@ -290,7 +318,10 @@
+     bool flag = amxc_var_dyncast(bool, newValue);
+     SAH_TRACEZ_INFO(ME, "set DPP RelayEnable %d", flag);
+     if(flag) {
+-        s_startRelay(object);
++        swl_rc_ne rc = s_startRelay(object);
++        if(!swl_rc_isOk(rc)) {
++            SAH_TRACEZ_ERROR(ME, "DPP relay requested but listener is not ready rc=%d", rc);
++        }
+     } else {
+         s_stopRelay();
+     }
+@@ -307,6 +338,18 @@
+     swla_dm_procObjEvtOfLocalDm(&sDppDmHdlrs, sig_name, data, priv);
+ }
+ 
++amxd_status_t _DPPRelay_StartRelay(amxd_object_t* object,
++                                   amxd_function_t* func _UNUSED,
++                                   amxc_var_t* args _UNUSED,
++                                   amxc_var_t* retval) {
++    bool ok = swl_rc_isOk(s_startRelay(object));
++    amxc_var_set(bool, retval, ok);
++    if(ok) {
++        amxd_object_set_bool(object, "RelayEnable", true);
++    }
++    return ok ? amxd_status_ok : amxd_status_unknown_error;
++}
++
+ amxd_status_t _DPPRelay_SendDppFrame(amxd_object_t* object _UNUSED,
+                                       amxd_function_t* func _UNUSED,
+                                       amxc_var_t* args,
+@@ -314,19 +357,25 @@
+     SAH_TRACEZ_IN(ME);
+ 
+     ASSERT_TRUE(s_dppCtx.clientFd >= 0, amxd_status_invalid_action, ME, "no DPP client connected");
++    uint64_t connectionId = amxc_var_dyncast(uint64_t, GET_ARG(args, "connectionId"));
++    ASSERT_TRUE((connectionId == 0) || (connectionId == s_dppCtx.clientGeneration),
++                amxd_status_invalid_action, ME, "stale DPP relay connection");
+ 
+     uint8_t tcpType = amxc_var_dyncast(uint8_t, GET_ARG(args, "tcpType"));
+     const char* frameHex = GET_CHAR(args, "frame");
+     ASSERT_STR(frameHex, amxd_status_invalid_arg, ME, "empty frame");
+ 
+-    size_t frameLen = swl_str_len(frameHex) / 2;
++    size_t hexLen = swl_str_len(frameHex);
++    ASSERT_TRUE((hexLen % 2 == 0) && (hexLen <= 2 * (DPP_RX_BUF_SIZE - DPP_FRAME_HDR_LEN)),
++                amxd_status_invalid_arg, ME, "invalid or oversized DPP frame length");
++    size_t frameLen = hexLen / 2;
+     SAH_TRACEZ_INFO(ME, "sending DPP frame to fd(%d) tcpType(%u) frameLen(%zu)",
+                     s_dppCtx.clientFd, tcpType, frameLen);
+     swl_bit8_t frameBin[frameLen];
+     bool ok = swl_hex_toBytes(frameBin, sizeof(frameBin), frameHex, swl_str_len(frameHex));
+     ASSERT_TRUE(ok, amxd_status_invalid_arg, ME, "fail to hex-decode DPP frame");
+ 
+-    if(frameLen >= DPP_HDR_LEN) {
++    if((tcpType == 9) && (frameLen >= DPP_HDR_LEN)) {
+         uint8_t dppActionType = frameBin[DPP_HDR_LEN - 1];
+         SAH_TRACEZ_INFO(ME, "tx DPP frame dppActionType(%u:%s) to fd(%d) (from 1905/EasyMesh process via ambiorix)",
+                         dppActionType, s_dppActionTypeToStr(dppActionType), s_dppCtx.clientFd);
+@@ -347,10 +396,10 @@
+     size_t sent = 0;
+     int eagainRetries = 0;
+     while(sent < sizeof(sendBuf)) {
+-        ssize_t n = send(s_dppCtx.clientFd, sendBuf + sent, sizeof(sendBuf) - sent, 0);
++        ssize_t n = send(s_dppCtx.clientFd, sendBuf + sent, sizeof(sendBuf) - sent,
++                         MSG_NOSIGNAL | MSG_DONTWAIT);
+         if(n > 0) {
+             SAH_TRACEZ_INFO(ME, "sent %zd/%zu bytes to fd(%d)", n, sizeof(sendBuf), s_dppCtx.clientFd);
+-            eagainRetries = 0;
+             sent += (size_t) n;
+         } else if((n < 0) && (errno == EINTR)) {
+             SAH_TRACEZ_INFO(ME, "send fd(%d) interrupted (EINTR), retrying", s_dppCtx.clientFd);
+@@ -359,12 +408,16 @@
+             eagainRetries++;
+             SAH_TRACEZ_INFO(ME, "send fd(%d) would block (EAGAIN), retry %d/%d",
+                             s_dppCtx.clientFd, eagainRetries, DPP_SEND_EAGAIN_MAX_RETRIES);
+-            ASSERT_TRUE(eagainRetries <= DPP_SEND_EAGAIN_MAX_RETRIES, amxd_status_unknown_error,
+-                        ME, "send fd(%d) still not writable after %d retries, dropping frame",
+-                        s_dppCtx.clientFd, eagainRetries);
++            if(eagainRetries > DPP_SEND_EAGAIN_MAX_RETRIES) {
++                SAH_TRACEZ_ERROR(ME, "DPP send timeout after %zu/%zu bytes; closing stream", sent, sizeof(sendBuf));
++                s_closeClient();
++                return amxd_status_unknown_error;
++            }
+             usleep(DPP_SEND_EAGAIN_RETRY_DELAY_US);
+         } else {
+             SAH_TRACEZ_ERROR(ME, "send err(%d:%s)", errno, strerror(errno));
++            /* A partial record must never be followed by a new record on this stream. */
++            s_closeClient();
+             return amxd_status_unknown_error;
+         }
+     }
+--- a/src/wld_endpoint.c
++++ b/src/wld_endpoint.c
+@@ -3068,6 +3068,9 @@
+     const char* netrole = GET_CHAR(args, "netrole");
+     uint32_t iterations = GET_UINT32(args, "iterations");
+     char cmd[256] = {0};
++    SAH_TRACEZ_INFO(ME, "%s: DPP chirp request id=%u netrole=%s iterations=%u ctrlReady=%d",
++                    pEP->alias, id, netrole ? netrole : "<null>", iterations,
++                    wld_wpaCtrlInterface_isReady(pEP->wpaCtrlInterface));
+     
+     int len = snprintf(cmd, sizeof(cmd), "DPP_CHIRP own=%u", id);
+     if(iterations > 0) {
+@@ -3077,6 +3080,7 @@
+         snprintf(cmd + len, sizeof(cmd) - len, " netrole=%s", netrole);
+     }
+     bool bRet = wld_wpaCtrl_sendCmdCheckResponse(pEP->wpaCtrlInterface, cmd, "OK");
++    SAH_TRACEZ_INFO(ME, "%s: DPP chirp command='%s' result=%d", pEP->alias, cmd, bRet);
+     if (!bRet) {
+         SAH_TRACEZ_ERROR(ME, "DPP_CHIRP failed");
+         amxc_var_set(bool, retMap, false);
+@@ -3093,11 +3097,23 @@
+     return (pEP != NULL) && wld_wpaCtrlInterface_isReady(pEP->wpaCtrlInterface);
+ }
+ 
++static void s_dppLogEpState(T_EndPoint* pEP, const char* operation) {
++    if(pEP == NULL) {
++        SAH_TRACEZ_ERROR(ME, "DPP %s: endpoint is NULL", operation);
++        return;
++    }
++    SAH_TRACEZ_INFO(ME, "%s: DPP %s ctrlReady=%d enable=%d connStatus=%d iface=%s",
++                    pEP->alias, operation,
++                    wld_wpaCtrlInterface_isReady(pEP->wpaCtrlInterface),
++                    pEP->enable, pEP->status, pEP->Name);
++}
++
+ amxd_status_t _dpp_bootstrap_gen_info(amxd_object_t* obj,
+                                        amxd_function_t* func _UNUSED,
+                                        amxc_var_t* args,
+                                        amxc_var_t* retMap) {
+     T_EndPoint* pEP = wld_ep_fromObj(amxd_object_get_parent(obj));
++    s_dppLogEpState(pEP, "bootstrap-gen start");
+     ASSERTS_TRUE(s_dppCtrlReady(pEP), amxd_status_not_supported, ME,
+                  "DPP wpa_ctrl is not ready");
+ 
+@@ -3123,11 +3139,12 @@
+     swl_rc_ne ret = wld_wpaCtrl_sendCmdFmtGetResponse(pEP->wpaCtrlInterface, idReply,
+                                                       sizeof(idReply), "%s", cmd);
+     if((ret != SWL_RC_OK) || swl_str_isEmpty(idReply) || swl_str_matches(idReply, "FAIL")) {
+-        SAH_TRACEZ_ERROR(ME, "DPP_BOOTSTRAP_GEN failed");
++        SAH_TRACEZ_ERROR(ME, "%s: DPP_BOOTSTRAP_GEN failed rc=%d reply='%s'", pEP->alias, ret, idReply);
+         return amxd_status_unknown_error;
+     }
+ 
+     uint32_t id = atoi(idReply);
++    SAH_TRACEZ_INFO(ME, "%s: DPP_BOOTSTRAP_GEN success id=%u reply='%s'", pEP->alias, id, idReply);
+     if(id == 0) {
+         SAH_TRACEZ_ERROR(ME, "DPP_BOOTSTRAP_GEN returned invalid id: %s", idReply);
+         return amxd_status_unknown_error;
+@@ -3138,10 +3155,12 @@
+     ret = wld_wpaCtrl_sendCmdFmtGetResponse(pEP->wpaCtrlInterface, uriReply,
+                                             sizeof(uriReply), "%s", cmd);
+     if((ret != SWL_RC_OK) || swl_str_isEmpty(uriReply) || swl_str_matches(uriReply, "FAIL")) {
+-        SAH_TRACEZ_ERROR(ME, "DPP_BOOTSTRAP_GET_URI failed");
++        SAH_TRACEZ_ERROR(ME, "%s: DPP_BOOTSTRAP_GET_URI failed id=%u rc=%d reply='%s'", pEP->alias, id, ret, uriReply);
+         return amxd_status_unknown_error;
+     }
+ 
++    SAH_TRACEZ_INFO(ME, "%s: DPP_BOOTSTRAP_GET_URI success id=%u uriLen=%zu", pEP->alias, id, strlen(uriReply));
++
+     char result[1200] = {0};
+     snprintf(result, sizeof(result), "id=%u\nuri=%s", id, uriReply);
+     amxc_var_set(cstring_t, retMap, result);
+@@ -3158,17 +3177,40 @@
+ 
+     const char* name = GET_CHAR(args, "name");
+     const char* value = GET_CHAR(args, "value");
+-    ASSERTS_TRUE(swl_str_matches(name, "bSTAList"), amxd_status_invalid_arg, ME,
+-                 "unsupported DPP extra request name");
+-    ASSERT_NOT_NULL(value, amxd_status_invalid_arg, ME, "missing DPP extra request value");
++    char* convertedValue = NULL;
++    amxc_var_t* valueVar = GET_ARG(args, "value");
++
++    /* Accept convertible string variants received through USP/AMXB. */
++    if((value == NULL) && (valueVar != NULL)) {
++        convertedValue = amxc_var_dyncast(cstring_t, valueVar);
++        value = convertedValue;
++    }
++    s_dppLogEpState(pEP, "extra-conf start");
++    SAH_TRACEZ_INFO(ME, "%s: DPP extra-conf name=%s valueLen=%zu", pEP->alias,
++                    name ? name : "<null>", value ? strlen(value) : 0);
++    if(!swl_str_matches(name, "bSTAList") || (value == NULL) ||
++       (value[0] == '\0') || (strpbrk(value, "\r\n") != NULL) ||
++       (strlen(value) + strlen("SET dpp_extra_conf_req_value ") >= 512)) {
++        SAH_TRACEZ_ERROR(ME, "%s: invalid DPP extra request name/value or command length type=%d",
++                         pEP->alias, valueVar ? amxc_var_type_of(valueVar) : AMXC_VAR_ID_NULL);
++        free(convertedValue);
++        return amxd_status_invalid_arg;
++    }
+ 
+     bool ok = wld_wpaCtrl_sendCmdCheckResponse(pEP->wpaCtrlInterface,
+                                                "SET dpp_extra_conf_req_name bSTAList", "OK");
++    SAH_TRACEZ_INFO(ME, "%s: SET dpp_extra_conf_req_name result=%d", pEP->alias, ok);
+     if(ok) {
+-        ok = wld_wpaCtrl_sendCmdFmtCheckResponse(pEP->wpaCtrlInterface, "OK",
+-                                                  "SET dpp_extra_conf_req_value %s", value);
++        swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pEP->wpaCtrlInterface, "OK",
++                                                           "SET dpp_extra_conf_req_value %s", value);
++        /* Unlike the non-format helper above, this returns an enum: OK is zero. */
++        ok = swl_rc_isOk(rc);
++        SAH_TRACEZ_INFO(ME, "%s: SET dpp_extra_conf_req_value rc=%d success=%d valueLen=%zu",
++                        pEP->alias, rc, ok, strlen(value));
+     }
++    SAH_TRACEZ_INFO(ME, "%s: DPP extra-conf complete result=%d", pEP->alias, ok);
+     amxc_var_set(bool, retMap, ok);
++    free(convertedValue);
+     return ok ? amxd_status_ok : amxd_status_unknown_error;
+ }
+ 
