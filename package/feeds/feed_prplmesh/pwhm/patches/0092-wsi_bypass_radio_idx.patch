@@ -1,0 +1,301 @@
+From: Kartheek E <karte@qti.qualcomm.com>
+Date: Wed, 14 Oct 2026 14:45:21 +0530
+Subject: [PATCH] pwhm: use live radio index for WSI bypass
+
+Use the driver-reported NL80211_ATTR_WIPHY_RADIOS information to resolve the
+radio index serving a radio's operating frequency. This avoids relying on a
+fixed frequency-band-to-index mapping that can differ with hardware probe
+order, while retaining the legacy mapping as a fallback.
+
+Signed-off-by: Kartheek E <karte@qti.qualcomm.com>
+---
+ include/wld/wld_nl80211_types.h   | 16 ++++++++++++++++
+ include/wld/wld_nl80211_utils.h   | 22 ++++++++++++++++++++++
+ src/nl80211/wld_nl80211_parser.c  | 87 ++++++++++++++++++++++++++++++++++++++++
+ src/nl80211/wld_nl80211_utils.c   | 29 +++++++++++++++++++++
+ src/nl80211/wld_rad_nl80211.c     | 53 +++++++++++++++++++++++++++++++++++++++--
+ 5 files changed, 207 insertions(+), 13 deletions(-)
+
+--- a/include/wld/wld_nl80211_types.h
++++ b/include/wld/wld_nl80211_types.h
+@@ -230,6 +230,20 @@
+     uint8_t tidLinkMapCapability;                          // TID-to-Link mapping hardware capability from NL80211
+ } wld_nl80211_wiphyExtCapas;
+ 
++#define WLD_NL80211_WIPHY_MAX_RADIOS MAXNROF_RADIO       //max number of individual (combo) radios a single wiphy can expose over NL80211_ATTR_WIPHY_RADIOS
++#define WLD_NL80211_WIPHY_MAX_RADIO_FREQ_RANGES 4        //max number of disjoint frequency ranges reported per radio (NL80211_WIPHY_RADIO_ATTR_FREQ_RANGE may repeat)
++
++typedef struct {
++    uint32_t startMHz;                               //frequency range start (MHz), from NL80211_WIPHY_RADIO_FREQ_ATTR_START
++    uint32_t endMHz;                                 //frequency range end (MHz), from NL80211_WIPHY_RADIO_FREQ_ATTR_END
++} wld_nl80211_freqRange_t;
++
++typedef struct {
++    uint32_t radioIdx;                               //HW radio index as reported by the driver (NL80211_WIPHY_RADIO_ATTR_INDEX)
++    uint32_t nFreqRanges;
++    wld_nl80211_freqRange_t freqRanges[WLD_NL80211_WIPHY_MAX_RADIO_FREQ_RANGES]; //frequency ranges (MHz) actually served by this radio index on this board
++} wld_nl80211_wiphyRadioInfo_t;
++
+ #define WLD_NL80211_CIPHERS_MAX 14                  //(Cf: IEEE80211 Table 9-180—Cipher suite selectors: defined suite types 0..14)
+ typedef struct {
+     uint32_t genId;                                 //info generation id (unique for all wiphy info received chunks)
+@@ -256,6 +270,8 @@
+     wld_nl80211_wiphyExtCapas extCapas;
+     uint8_t maxMbssidAdsIfaces;                     //max number of advertised MBSSID interfaces supported by the driver. (MBSSID support when max >= 2)
+     uint8_t maxMbssidEmaPeriod;                     //maximum profile periodicity of Enhanced Multi-BSSID Advertisement (EMA support when max > 0)
++    uint32_t nRadios;                               //number of individual radios reported in NL80211_ATTR_WIPHY_RADIOS. 0 when driver doesn't report per-radio split (single implicit radio per wiphy)
++    wld_nl80211_wiphyRadioInfo_t radios[WLD_NL80211_WIPHY_MAX_RADIOS]; //per-radio HW index + actual supported frequency ranges, as reported live by the driver (reflects real HW/PCI probe order on this board)
+ } wld_nl80211_wiphyInfo_t;
+ 
+ typedef struct {
+--- a/include/wld/wld_nl80211_utils.h
++++ b/include/wld/wld_nl80211_utils.h
+@@ -70,6 +70,7 @@
+ #define INCLUDE_WLD_WLD_NL80211_UTILS_H_
+ 
+ #include "wld_nl80211_compat.h"
++#include "wld_nl80211_types.h"
+ #include "swl/swl_common.h"
+ #include "swl/swl_common_chanspec.h"
+ 
+@@ -175,4 +176,25 @@
+  */
+ swl_freqBand_e wld_nl80211_freqBandNlToSwl(uint32_t nl80211Fb);
+ 
++/*
++ * @brief find the HW radio index (as reported live by the driver via
++ * NL80211_ATTR_WIPHY_RADIOS) that actually serves a given frequency, within a
++ * (combo) wiphy.
++ *
++ * Use this instead of deriving a radio index from the operating frequency
++ * band: on combo/MLO wiphys the array position of a radio is set by the
++ * driver at HW probe time (which can depend on PCI/device probe order), and
++ * is not guaranteed to follow a fixed 2.4/5/6GHz convention across boards.
++ *
++ * @param pWiphy wiphy info, previously filled by wld_nl80211_getWiphyInfo()
++ * @param freqMHz frequency (MHz) to match against each radio's reported range(s)
++ * @param pRadioIdx output: matching HW radio index
++ *
++ * @return SWL_RC_OK when a match is found
++ *         SWL_RC_NOT_AVAILABLE when the driver did not report per-radio info
++ *         (single implicit radio wiphy): pRadioIdx is set to 0
++ *         <= SWL_RC_ERROR on invalid params or no matching radio found
++ */
++swl_rc_ne wld_nl80211_getWiphyRadioIdxByFreq(wld_nl80211_wiphyInfo_t* pWiphy, uint32_t freqMHz, uint32_t* pRadioIdx);
++
+ #endif /* INCLUDE_WLD_WLD_NL80211_UTILS_H_ */
+--- a/src/nl80211/wld_nl80211_parser.c
++++ b/src/nl80211/wld_nl80211_parser.c
+@@ -1184,6 +1184,92 @@
+     return SWL_RC_OK;
+ }
+ 
++/*
++ * @brief parse one NL80211_WIPHY_RADIO_ATTR_FREQ_RANGE nested attribute (start/end in kHz)
++ * into a wld_nl80211_freqRange_t (MHz)
++ */
++static swl_rc_ne s_parseWiphyRadioFreqRange(struct nlattr* pFreqRangeAttr, wld_nl80211_freqRange_t* pFreqRange) {
++    ASSERTS_NOT_NULL(pFreqRangeAttr, SWL_RC_INVALID_PARAM, ME, "NULL");
++    ASSERTS_NOT_NULL(pFreqRange, SWL_RC_INVALID_PARAM, ME, "NULL");
++
++    struct nlattr* pTb[NL80211_WIPHY_RADIO_FREQ_ATTR_MAX + 1] = {};
++    static struct nla_policy freqRangePolicy[NL80211_WIPHY_RADIO_FREQ_ATTR_MAX + 1] = {
++        [NL80211_WIPHY_RADIO_FREQ_ATTR_START] = { .type = NLA_U32 },
++        [NL80211_WIPHY_RADIO_FREQ_ATTR_END] = { .type = NLA_U32 },
++    };
++    if(nla_parse_nested(pTb, NL80211_WIPHY_RADIO_FREQ_ATTR_MAX, pFreqRangeAttr, freqRangePolicy) != SWL_RC_OK) {
++        SAH_TRACEZ_ERROR(ME, "Failed to parse nested wiphy radio freq range attributes!");
++        return SWL_RC_ERROR;
++    }
++    uint32_t startKHz = 0;
++    uint32_t endKHz = 0;
++    NLA_GET_VAL(startKHz, nla_get_u32, pTb[NL80211_WIPHY_RADIO_FREQ_ATTR_START]);
++    NLA_GET_VAL(endKHz, nla_get_u32, pTb[NL80211_WIPHY_RADIO_FREQ_ATTR_END]);
++    pFreqRange->startMHz = startKHz / 1000;
++    pFreqRange->endMHz = endKHz / 1000;
++    return SWL_RC_OK;
++}
++
++/*
++ * @brief parse one radio entry of NL80211_ATTR_WIPHY_RADIOS: its HW index and
++ * (possibly repeated) supported frequency ranges
++ */
++static swl_rc_ne s_parseWiphyRadio(struct nlattr* pRadioAttr, wld_nl80211_wiphyRadioInfo_t* pRadio) {
++    ASSERTS_NOT_NULL(pRadioAttr, SWL_RC_INVALID_PARAM, ME, "NULL");
++    ASSERTS_NOT_NULL(pRadio, SWL_RC_INVALID_PARAM, ME, "NULL");
++
++    struct nlattr* pAttr;
++    int rem;
++    nla_for_each_nested(pAttr, pRadioAttr, rem) {
++        if(nla_type(pAttr) == NL80211_WIPHY_RADIO_ATTR_INDEX) {
++            pRadio->radioIdx = nla_get_u32(pAttr);
++        } else if((nla_type(pAttr) == NL80211_WIPHY_RADIO_ATTR_FREQ_RANGE) &&
++                  (pRadio->nFreqRanges < WLD_NL80211_WIPHY_MAX_RADIO_FREQ_RANGES)) {
++            if(s_parseWiphyRadioFreqRange(pAttr, &pRadio->freqRanges[pRadio->nFreqRanges]) == SWL_RC_OK) {
++                pRadio->nFreqRanges++;
++            }
++        }
++    }
++    return SWL_RC_OK;
++}
++
++/*
++ * @brief parse NL80211_ATTR_WIPHY_RADIOS: the live, driver-reported split of a
++ * (combo) wiphy into individual HW radios and the frequency ranges each one
++ * actually serves on this board (reflects real HW/PCI probe order, unlike any
++ * static band->index assumption).
++ */
++static swl_rc_ne s_parseWiphyRadios(struct nlattr* tb[], wld_nl80211_wiphyInfo_t* pWiphy) {
++    ASSERTS_NOT_NULL(tb, SWL_RC_INVALID_PARAM, ME, "NULL");
++    ASSERTS_NOT_NULL(pWiphy, SWL_RC_INVALID_PARAM, ME, "NULL");
++    /*
++     * NL80211_CMD_GET_WIPHY (with NL80211_ATTR_SPLIT_WIPHY_DUMP) splits a
++     * single wiphy's attributes across several netlink messages, each parsed
++     * via a separate call to this function on the same pWiphy. NL80211_ATTR_WIPHY_RADIOS
++     * is only present in one such chunk, so nRadios must only be touched when
++     * that chunk is actually seen - resetting it unconditionally would wipe
++     * out the already-parsed radios on every subsequent chunk that lacks it.
++     */
++    ASSERTS_NOT_NULL(tb[NL80211_ATTR_WIPHY_RADIOS], SWL_RC_OK, ME, "No per-radio info reported (single implicit radio wiphy)");
++    pWiphy->nRadios = 0;
++
++    struct nlattr* pRadioAttr;
++    int rem;
++    nla_for_each_nested(pRadioAttr, tb[NL80211_ATTR_WIPHY_RADIOS], rem) {
++        if(pWiphy->nRadios >= WLD_NL80211_WIPHY_MAX_RADIOS) {
++            SAH_TRACEZ_WARNING(ME, "%s: more wiphy radios reported than supported (max %u), truncating",
++                               pWiphy->name, WLD_NL80211_WIPHY_MAX_RADIOS);
++            break;
++        }
++        wld_nl80211_wiphyRadioInfo_t* pRadio = &pWiphy->radios[pWiphy->nRadios];
++        memset(pRadio, 0, sizeof(*pRadio));
++        if(s_parseWiphyRadio(pRadioAttr, pRadio) == SWL_RC_OK) {
++            pWiphy->nRadios++;
++        }
++    }
++    return SWL_RC_OK;
++}
++
+ swl_rc_ne wld_nl80211_parseWiphyInfo(struct nlattr* tb[], wld_nl80211_wiphyInfo_t* pWiphy) {
+     ASSERT_NOT_NULL(pWiphy, SWL_RC_INVALID_PARAM, ME, "NULL");
+     ASSERT_NOT_NULL(tb, SWL_RC_INVALID_PARAM, ME, "NULL");
+@@ -1215,6 +1301,7 @@
+     s_parseSuppCmds(tb, pWiphy);
+     s_parseIfTypeExtCapa(tb, pWiphy);
+     s_parseMbssidAds(tb, pWiphy);
++    s_parseWiphyRadios(tb, pWiphy);
+     return SWL_RC_OK;
+ }
+ 
+--- a/src/nl80211/wld_nl80211_utils.c
++++ b/src/nl80211/wld_nl80211_utils.c
+@@ -179,3 +179,32 @@
+     return (swl_freqBand_e) (*pSwlFb);
+ }
+ 
++/*
++ * @brief find the HW radio index (as reported live by the driver via
++ * NL80211_ATTR_WIPHY_RADIOS) that actually serves a given frequency, within a
++ * (combo) wiphy. See header for details.
++ */
++swl_rc_ne wld_nl80211_getWiphyRadioIdxByFreq(wld_nl80211_wiphyInfo_t* pWiphy, uint32_t freqMHz, uint32_t* pRadioIdx) {
++    ASSERT_NOT_NULL(pWiphy, SWL_RC_INVALID_PARAM, ME, "NULL");
++    ASSERT_NOT_NULL(pRadioIdx, SWL_RC_INVALID_PARAM, ME, "NULL");
++
++    if(pWiphy->nRadios == 0) {
++        /* driver does not report a per-radio split: this wiphy exposes a single implicit radio */
++        *pRadioIdx = 0;
++        return SWL_RC_NOT_AVAILABLE;
++    }
++
++    for(uint32_t i = 0; i < pWiphy->nRadios; i++) {
++        wld_nl80211_wiphyRadioInfo_t* pRadio = &pWiphy->radios[i];
++        for(uint32_t j = 0; j < pRadio->nFreqRanges; j++) {
++            if((freqMHz >= pRadio->freqRanges[j].startMHz) && (freqMHz <= pRadio->freqRanges[j].endMHz)) {
++                *pRadioIdx = pRadio->radioIdx;
++                return SWL_RC_OK;
++            }
++        }
++    }
++
++    SAH_TRACEZ_ERROR(ME, "%s: no radio found serving freq %u MHz among %u reported radios", pWiphy->name, freqMHz, pWiphy->nRadios);
++    return SWL_RC_ERROR;
++}
++
+--- a/src/nl80211/wld_rad_nl80211.c
++++ b/src/nl80211/wld_rad_nl80211.c
+@@ -863,21 +863,61 @@
+ #define WSI_VALUE0_READD        2u    /* re-add device (Power Save OFF) */
+ 
+ uint32_t wld_rad_nl80211_getRadioIdx(T_Radio* pRad) {
+-    if(pRad->pBus == NULL) {
+-        return 0;
+-    }
+-    char* freqBand = amxd_object_get_cstring_t(pRad->pBus, "OperatingFrequencyBand", NULL);
+-    SAH_TRACEZ_INFO(ME, "Radio idx value=%s",freqBand);
+-    uint32_t idx = 0;
+-    if(freqBand != NULL) {
+-        if(swl_str_matches(freqBand, "5GHz")) {
+-            idx = 1;
+-        } else if(swl_str_matches(freqBand, "6GHz")) {
+-            idx = 2;
++    /*
++     * Fallback mapping (legacy behaviour): guess the radio index purely from
++     * the configured band. This is only correct when the driver happens to
++     * order its internal (combo) radio array as 2.4/5/6GHz, which is NOT
++     * guaranteed across boards - that order depends on HW/PCI device probe
++     * order (see ath12k_mac_allocate()), not on frequency band.
++     */
++    uint32_t fallbackIdx = 0;
++    if(pRad->pBus != NULL) {
++        char* freqBand = amxd_object_get_cstring_t(pRad->pBus, "OperatingFrequencyBand", NULL);
++        if(freqBand != NULL) {
++            if(swl_str_matches(freqBand, "5GHz")) {
++                fallbackIdx = 1;
++            } else if(swl_str_matches(freqBand, "6GHz")) {
++                fallbackIdx = 2;
++            }
++            free(freqBand);
+         }
+-        free(freqBand);
+     }
+-    return idx;
++
++    /*
++     * Prefer the live, driver-reported radio index for this radio's actual
++     * operating frequency (NL80211_ATTR_WIPHY_RADIOS), which reflects the
++     * real HW topology of this specific board.
++     */
++    wld_nl80211_wiphyInfo_t wiphyInfo;
++    memset(&wiphyInfo, 0, sizeof(wiphyInfo));
++    if(wld_rad_nl80211_getWiphyInfo(pRad, &wiphyInfo) < SWL_RC_OK) {
++        SAH_TRACEZ_WARNING(ME, "%s: failed to fetch wiphy info, falling back to band-based radio idx %u",
++                           pRad->Name, fallbackIdx);
++        return fallbackIdx;
++    }
++
++    uint32_t freqMHz = 0;
++    swl_chanspec_t chanSpec = SWL_CHANSPEC_NEW(pRad->channel, SWL_BW_20MHZ, pRad->operatingFrequencyBand);
++    if(swl_chanspec_channelToMHz(&chanSpec, &freqMHz) < SWL_RC_OK) {
++        SAH_TRACEZ_WARNING(ME, "%s: invalid channel %u, falling back to band-based radio idx %u",
++                           pRad->Name, pRad->channel, fallbackIdx);
++        return fallbackIdx;
++    }
++
++    uint32_t liveIdx = 0;
++    swl_rc_ne rc = wld_nl80211_getWiphyRadioIdxByFreq(&wiphyInfo, freqMHz, &liveIdx);
++    if(rc == SWL_RC_OK) {
++        SAH_TRACEZ_INFO(ME, "%s: radio idx value=%u (live, freq=%uMHz)", pRad->Name, liveIdx, freqMHz);
++        return liveIdx;
++    }
++    if(rc == SWL_RC_NOT_AVAILABLE) {
++        /* driver exposes a single implicit radio on this wiphy: idx is always 0 */
++        return 0;
++    }
++
++    SAH_TRACEZ_WARNING(ME, "%s: no live wiphy radio matches freq %uMHz, falling back to band-based radio idx %u",
++                       pRad->Name, freqMHz, fallbackIdx);
++    return fallbackIdx;
+ }
+ 
+ swl_rc_ne wld_rad_nl80211_setWsiBypassDevice(T_Radio* pRad, bool enable) {
