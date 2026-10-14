@@ -1,0 +1,177 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kartheek E <karte@qti.qualcomm.com>
+Date: 14 Oct 2026 13:30:00 +0530
+Subject: [PATCH] pwhm: streamline radio Green AP control
+
+Expose radio AntennaPowerSaveMode through one direct DM-to-nl80211 SET
+callback. Inline AP/MLO interface resolution and remove redundant Green AP
+wrapper and lifecycle functions.
+
+Signed-off-by: Kartheek E <karte@qti.qualcomm.com>
+---
+diff --git a/include/wld/wld_ap_nl80211.h b/include/wld/wld_ap_nl80211.h
+--- a/include/wld/wld_ap_nl80211.h
++++ b/include/wld/wld_ap_nl80211.h
+@@ -201,6 +201,7 @@
+ swl_rc_ne wld_ap_nl80211_sendVendorSubCmdAttr(T_AccessPoint* pAP, uint32_t oui, int subcmd, wld_nl80211_nlAttr_t* vendorAttr,
+                                               bool isSync, bool withAck, uint32_t flags, wld_nl80211_handler_f handler, void* priv);
+ 
++
+ /*
+  * @brief common function to send a management frame cmd
+  *
+diff --git a/odl/wld_radio.odl b/odl/wld_radio.odl
+--- a/odl/wld_radio.odl
++++ b/odl/wld_radio.odl
+@@ -4076,6 +4076,11 @@
+                         default false;
+                 }
+ 
++                /** Enable Green AP firmware power-save mode on this radio. */
++                %persistent bool AntennaPowerSaveMode {
++                        default false;
++                }
++
+                 /**
+                  * Enable strict passive scan on PCH (Primary Channel) channels.
+                  * When enabled, the radio performs passive-only scans on PCH channels.
+diff --git a/src/nl80211/wld_ap_nl80211.c b/src/nl80211/wld_ap_nl80211.c
+--- a/src/nl80211/wld_ap_nl80211.c
++++ b/src/nl80211/wld_ap_nl80211.c
+@@ -64,9 +64,9 @@
+  */
+ 
+ #include "wld_ap_nl80211.h"
++#include "wld_nl80211_compat.h"
+ #include "wld_ssid_nl80211_priv.h"
+ #include "swl/swl_common.h"
+-
+ #define ME "nlAP"
+ 
+ swl_rc_ne wld_ap_nl80211_setEvtListener(T_AccessPoint* pAP, void* pData, const wld_nl80211_evtHandlers_cb* const handlers) {
+diff --git a/src/nl80211/wld_nl80211_api.c b/src/nl80211/wld_nl80211_api.c
+--- a/src/nl80211/wld_nl80211_api.c
++++ b/src/nl80211/wld_nl80211_api.c
+@@ -1193,6 +1193,7 @@
+                                            wld_nl80211_handler_f handler, void* priv) {
+     swl_rc_ne rc = SWL_RC_INVALID_PARAM;
+     ASSERT_NOT_NULL(state, rc, ME, "NULL");
++    ASSERT_NOT_NULL(vendorAttr, rc, ME, "NULL");
+     ASSERT_FALSE((wDevId == 0) && (ifIndex == 0), rc, ME, "devices wDevId and index are 0");
+ 
+     NL_ATTRS(attribs,
+@@ -1205,13 +1206,29 @@
+         NL_ATTRS_ADD(&attribs, NL_ATTR_VAL(NL80211_ATTR_WDEV, wDevId));
+     }
+ 
+-    swl_unLiList_add(&attribs, vendorAttr);
++    /*
++     * swl_unLiList_add copies wld_nl80211_nlAttr_t, including the embedded
++     * nested list. Keep the caller-owned vendor attribute out of the
++     * recursive outer cleanup to avoid destroying its nested list twice.
++     */
++    ssize_t vendorAttrIndex = swl_unLiList_add(&attribs, vendorAttr);
++    if(vendorAttrIndex < 0) {
++        NL_ATTRS_CLEAR(&attribs);
++        return SWL_RC_ERROR;
++    }
+ 
+     if(withAck) {
+         rc = wld_nl80211_sendCmdSyncWithAck(state, NL80211_CMD_VENDOR, flags, ifIndex, &attribs);
+     } else {
+         rc = wld_nl80211_sendCmd(isSync, state, NL80211_CMD_VENDOR, flags, ifIndex, &attribs, handler, priv, NULL);
+     }
++
++    /* Remove the shallow copy without recursively cleaning vendorAttr. */
++    if(swl_unLiList_remove(&attribs, vendorAttrIndex) < 0) {
++        /* The shallow vendor copy is still present; do not recursively clean it. */
++        swl_unLiList_destroy(&attribs);
++        return SWL_RC_ERROR;
++    }
+     NL_ATTRS_CLEAR(&attribs);
+ 
+     return rc;
+diff --git a/src/wld_radio.c b/src/wld_radio.c
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -69,6 +69,12 @@
+ #include <stdint.h>
+ #include <net/if.h>
+ #include "wld_nl80211_api.h"
++#include "wld_ssid_nl80211_priv.h"
++#include <linux/types.h>
++#include <mac80211/ath/qca-vendor.h>
++#ifndef QCA_NL80211_VENDOR_ID
++#define QCA_NL80211_VENDOR_ID OUI_QCA
++#endif
+ #include "wld_mld.h"
+ 
+ #include <string.h>
+@@ -104,6 +110,7 @@
+ #include "wld_hostapd_cfgFile.h"
+ #include "wld_wpaSupp_cfgFile.h"
+ #include "wld_rad_nl80211.h"
++#include "wld_ap_nl80211.h"
+ #include "wld_linuxIfStats.h"
+ #include "wld_linuxIfUtils.h"
+ #include "wld_dm_trans.h"
+@@ -6626,6 +6633,51 @@
+  *   true  -> value0=1  (bypass/remove device, Power Save ON)
+  *   false -> value0=2  (re-add device,         Power Save OFF)
+  */
++static void s_setAntennaPowerSaveMode_pwf(void* priv _UNUSED,
++                                             amxd_object_t* object,
++                                             amxd_param_t* param _UNUSED,
++                                             const amxc_var_t* const newValue) {
++    T_Radio* pRad = wld_rad_fromObj(object);
++    ASSERTS_NOT_NULL(pRad, , ME, "NULL");
++    bool enable = amxc_var_dyncast(bool, newValue);
++    T_AccessPoint* pAP = wld_rad_getFirstActiveAp(pRad);
++    if(pAP == NULL) {
++        pAP = wld_rad_getFirstEnabledVap(pRad);
++    }
++    ASSERTS_NOT_NULL(pAP, , ME, "%s: no AP available", pRad->Name);
++
++    wld_nl80211_ifaceInfo_t ifaceInfo;
++    int32_t linkId = MLO_LINK_ID_UNKNOWN;
++    swl_rc_ne rc = wld_ssid_nl80211_getInterfaceInfoExt(pAP->pSSID, &ifaceInfo, &linkId);
++    ASSERTS_TRUE(swl_rc_isOk(rc), , ME, "%s: failed to resolve Green AP interface", pRad->Name);
++    ASSERTS_TRUE(ifaceInfo.isAp && (ifaceInfo.ifIndex > 0), , ME,
++                 "%s: invalid Green AP interface", pRad->Name);
++    if(ifaceInfo.nMloLinks > 0) {
++        ASSERTS_TRUE(linkId >= 0, , ME, "%s: MLO link ID unavailable", pRad->Name);
++    } else {
++        linkId = 0;
++    }
++    ASSERTS_TRUE(linkId <= UINT8_MAX, , ME, "%s: invalid link ID %d", pRad->Name, linkId);
++
++    uint8_t mode = enable ? 1 : 0;
++    uint8_t linkIdValue = (uint8_t) linkId;
++    SAH_TRACEZ_INFO(ME, "GreenAP: enable=%d radio=%s ap=%s mode=%u iface=%s ifindex=%u link_id=%u",
++                    enable, pRad->Name, pAP->alias, mode, ifaceInfo.name, ifaceInfo.ifIndex, linkIdValue);
++    NL_ATTR_NESTED(vendorData, NL80211_ATTR_VENDOR_DATA);
++    NL_ATTRS_ADD(&vendorData.data.attribs,
++                 NL_ATTR_VAL(QCA_WLAN_VENDOR_ATTR_SET_GREEN_AP_ENABLE_MODE, mode));
++    NL_ATTRS_ADD(&vendorData.data.attribs,
++                 NL_ATTR_VAL(QCA_WLAN_VENDOR_ATTR_GREEN_AP_LINK_ID, linkIdValue));
++    rc = wld_nl80211_sendVendorSubCmdAttr(wld_nl80211_getSharedState(), QCA_NL80211_VENDOR_ID,
++                                           QCA_NL80211_VENDOR_SUBCMD_GREEN_AP, &vendorData,
++                                           true, true, 0, ifaceInfo.ifIndex, ifaceInfo.wDevId, NULL, NULL);
++    wld_nl80211_cleanNlAttr(&vendorData);
++    SAH_TRACEZ_INFO(ME, "GreenAP: command result=%d radio=%s mode=%u", rc, pRad->Name, mode);
++    if(rc < SWL_RC_OK) {
++        SAH_TRACEZ_ERROR(ME, "GreenAP: command failed radio=%s rc=%d", pRad->Name, rc);
++    }
++}
++
+ static void s_setPowerSaveEnable_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
+     SAH_TRACEZ_IN(ME);
+ 
+@@ -6707,6 +6759,7 @@
+                   SWLA_DM_PARAM_HDLR("AntennaGain2G", s_setAntennaGain2G_pwf),
+                   SWLA_DM_PARAM_HDLR("AntennaGain5G", s_setAntennaGain5G_pwf),
+                   SWLA_DM_PARAM_HDLR("PowerSaveEnable", s_setPowerSaveEnable_pwf),
++                   SWLA_DM_PARAM_HDLR("AntennaPowerSaveMode", s_setAntennaPowerSaveMode_pwf),
+                   SWLA_DM_PARAM_HDLR("StrictPassiveScan", s_setStrictPassiveScan_pwf),
+                   SWLA_DM_PARAM_HDLR("SetLowPower20MHz", _wld_rad_setLowPower20MHz_pwf),
+                   SWLA_DM_PARAM_HDLR("CSwOpts", s_setCSwOpts_pwf),
