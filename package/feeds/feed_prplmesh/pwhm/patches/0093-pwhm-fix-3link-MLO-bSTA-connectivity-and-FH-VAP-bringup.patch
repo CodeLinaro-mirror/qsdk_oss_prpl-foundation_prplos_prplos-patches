@@ -1,0 +1,343 @@
+From: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+Date: Tue, 14 Oct 2026 00:00:00 +0530
+Subject: [PATCH] pwhm: fix 3-link MLO bSTA connectivity delay and FH VAP bring-up issues
+
+Consolidates fixes for nine bugs on a 3-link MLO (2G/5G/6G) RepAP
+(debug1.txt - debug8.txt):
+
+Fix 1: s_syncOnEpConnected - add s_checkHapdDown to chanspec-sync skip.
+Fix 2: s_restoreFronthaul - override DFS FH target to non-DFS EP chanspec.
+Fix 3: s_stationScanStartedEvt - pre-disable FH on SCANNING with getRadState guard.
+Fix 4: wld_wpaSupp_ep_api - fall back to primary chanspec for partial MLO.
+Fix 5: s_syncOnEpConnected - use EP nl80211 chanspec not stale chanmgt value.
+Fix 6: wld_rad_hostapd_disable + s_doEnableHostapd - send DISABLE to ALL
+  AP BSS interfaces not just the first one.
+Fix 7->8: s_getCfgTgtChspec - use EP's actual nl80211 chanspec for FH config.
+  - Non-DFS EP chanspec: use directly (fixes 2.4GHz/6GHz stale chanmgt).
+  - DFS EP chanspec: use same channel (avoids EBUSY from mismatch).
+  - nl80211 fails: target-vs-current comparison fallback.
+Fix 9: s_doEnableHostapd - schedule GEN_FSM_ADD_LINK after FH restore ENABLE.
+  After wld_rad_resetApMldLinks() clears pwhm-side MLD link IDs and
+  wld_rad_hostapd_enable() re-starts the BSS, the AP VAPs come up as
+  standalone interfaces without any MLD link (wlan1.1 and wlan0.1 showed
+  type AP but no channels/links in iw dev output).
+  Root cause: s_doEnableHostapd() did not schedule GEN_FSM_ADD_LINK after
+  ENABLE, so s_doAddLink() was never triggered to re-add the BSS config
+  with the MLD link configuration to the MLO group.
+  Fix: after wld_rad_hostapd_enable(), when the radio is a shared hostapd
+  group member (wld_secDmn_isGrpMember) and the global ctrl iface is ready,
+  schedule GEN_FSM_ADD_LINK for every AP VAP on the radio. This triggers
+  s_doAddLink() for each AP which re-adds the BSS config via ADD bss_config
+  with the MLD link configuration, restoring the AP to the MLO group.
+
+Regression safety: Fix 9 is guarded by hasReadyGlobalCtrlIface() &&
+isGrpMember(pRad->hostapd). Non-MLO or non-group-member radios are
+unaffected. The per-AP ADD_LINK scheduling is the same path used by
+s_doEnableAp() when a VAP is enabled while hostapd is already running.
+
+Signed-off-by: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+---
+--- a/src/Plugin/wifiGen_fsm.c	2026-10-13 23:57:30.455856959 +0530
++++ b/src/Plugin/wifiGen_fsm.c	2026-10-14 02:17:23.925105826 +0530
+@@ -1127,10 +1127,29 @@
+ static void s_restoreFronthaul(T_Radio* pRad) {
+     if(wifiGen_hapd_isAlive(pRad) && s_checkHapdDown(pRad)) {
+         wld_epConnectionStatus_e connState = EPCS_DISABLED;
+-        wld_wpaSupp_ep_getConnState(wld_rad_getEnabledEndpoint(pRad), &connState);
++        T_EndPoint* pEnabledEP = wld_rad_getEnabledEndpoint(pRad);
++        wld_wpaSupp_ep_getConnState(pEnabledEP, &connState);
+         if((connState == EPCS_IDLE) || (connState == EPCS_DISABLED) ||
+            (connState == EPCS_PASSIVE)) {
+             SAH_TRACEZ_INFO(ME, "%s: restore fronthaul chanspec conf", pRad->Name);
++            swl_chanspec_t tgt = wld_chanmgt_getTgtChspec(pRad);
++            if(!wld_channel_is_band_usable(tgt) && (pEnabledEP != NULL)) {
++                swl_chanspec_t epCur = SWL_CHANSPEC_EMPTY;
++                wld_nl80211_ifaceInfo_t epIfInfo;
++                if(wld_ep_nl80211_getInterfaceInfo(pEnabledEP, &epIfInfo) >= SWL_RC_OK) {
++                    wld_nl80211_chanSpecNlToSwl(&epCur, &epIfInfo.chanSpec);
++                }
++                if((epCur.channel > 0) && wld_channel_is_band_usable(epCur) &&
++                   (epCur.band == tgt.band)) {
++                    SAH_TRACEZ_WARNING(ME, "%s: FH tgt %s is DFS; EP connected on non-DFS %s: "
++                                       "override FH tgt to avoid CAC on restore",
++                                       pRad->Name,
++                                       swl_typeChanspecExt_toBuf32(tgt).buf,
++                                       swl_typeChanspecExt_toBuf32(epCur).buf);
++                    wld_chanmgt_setTargetChanspec(pRad, epCur, false, CHAN_REASON_EP_MOVE,
++                                                 "ep connected noDFS restore");
++                }
++            }
+             pRad->pFA->mfn_wrad_setChanspec(pRad, true);
+         }
+     }
+@@ -1300,15 +1319,44 @@
+     if(wld_rad_hasMloSupport(pRad) && s_checkHapdDown(pRad)) {
+         SAH_TRACEZ_WARNING(ME, "%s: MLO radio FH down before ENABLE: flushing stale MLD link state",
+                            pRad->Name);
+-        wld_wpaCtrlMngr_t* pMgr = wld_secDmn_getWpaCtrlMgr(pRad->hostapd);
+-        wld_wpaCtrlInterface_t* pIface = wld_wpaCtrlMngr_getDefaultInterface(pMgr);
+-        if(pIface) {
+-            wld_wpaCtrl_sendCmdCheckResponseExt(pIface, "DISABLE", "OK", 5000);
++        /* Send DISABLE to every AP BSS interface so all AP vdevs on this radio
++         * release their channel contexts before ENABLE re-adds the MLD links.
++         * Sending DISABLE to only the first interface leaves other AP BSS vdevs
++         * (e.g. wlan2.2) active on their old channel, causing DUAL HOME
++         * CHANNEL CONFLICT when the bSTA or the newly enabled AP tries to
++         * use a different channel on the same radio. */
++        T_AccessPoint* pDisableAP = NULL;
++        wld_rad_forEachAp(pDisableAP, pRad) {
++            if(pDisableAP && wld_wpaCtrlInterface_isReady(pDisableAP->wpaCtrlInterface)) {
++                wld_wpaCtrl_sendCmdCheckResponseExt(pDisableAP->wpaCtrlInterface,
++                                                    "DISABLE", "OK", 5000);
++            }
+         }
+         wld_rad_resetApMldLinks(pRad);
+     }
+     wld_rad_hostapd_enable(pRad);
+     pRad->fsmRad.timeout_msec = 500;
++    /*
++     * After resetting MLD link IDs and re-enabling hostapd, schedule
++     * GEN_FSM_ADD_LINK for each AP VAP on this radio so the MLD link
++     * configuration is re-applied via s_doAddLink().  Without this,
++     * the AP VAP comes up as a standalone interface (no MLD link) when
++     * wld_rad_resetApMldLinks() was called before ENABLE.
++     * Only schedule ADD_LINK when the global hostapd control interface
++     * is available (same guard used in s_doEnableAp).
++     */
++    if(wld_secDmn_hasReadyGlobalCtrlIface(pRad->hostapd) &&
++       wld_secDmn_isGrpMember(pRad->hostapd)) {
++        T_AccessPoint* pAP = NULL;
++        wld_rad_forEachAp(pAP, pRad) {
++            if(pAP) {
++                SAH_TRACEZ_WARNING(ME, "%s: scheduling ADD_LINK for %s after FH restore ENABLE",
++                                   pRad->Name, pAP->alias);
++                setBitLongArray(pAP->fsm.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_ADD_LINK);
++                setBitLongArray(pRad->fsmRad.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_ADD_LINK);
++            }
++        }
++    }
+     return true;
+ }
+ 
+@@ -1690,6 +1738,7 @@
+     ASSERT_NOT_NULL(pSSID, , ME, "NULL");
+     SAH_TRACEZ_INFO(ME, "%s: connected endpoint", pEP->Name);
+     wld_nl80211_ifaceInfo_t epIfInfo;
++    memset(&epIfInfo, 0, sizeof(epIfInfo));
+     swl_rc_ne rc = wld_ep_nl80211_getInterfaceInfo(pEP, &epIfInfo);
+     if(swl_rc_isOk(rc)) {
+         const wld_nl80211_chanSpec_t* pNlChspec = &epIfInfo.chanSpec;
+@@ -1747,7 +1796,10 @@
+                  ((swl_typeChanspec_equals(wld_chanmgt_getTgtChspec(pRad), tgtChspec)) &&
+                   (swl_str_matches(pRad->targetChanspec.reasonExt, "ep preConnect")) &&
+                   (pRad->targetChanspec.isApplied == SWL_TRL_FALSE)) ||
+-                 (!wifiGen_hapd_isAlive(pRad)) || (!s_checkHapdActive(pRad)))) {
++                 (!wifiGen_hapd_isAlive(pRad)) || (!s_checkHapdActive(pRad)) ||
++                 /* FH was disabled to allow bSTA to connect; skip reconnect-for-chanspec-sync
++                  * so s_delayRestoreFronthaul (below) brings FH up without an extra disconnect. */
++                 (s_checkHapdDown(pRad)))) {
+                 wld_chanmgt_setTargetChanspec(pRad, tgtChspec, false, CHAN_REASON_EP_MOVE, "ep preConnect");
+                 if((swl_typeChanspec_equals(wld_chanmgt_getTgtChspec(pRad), tgtChspec)) &&
+                    (pRad->targetChanspec.isApplied != SWL_TRL_FALSE)) {
+@@ -1783,7 +1835,9 @@
+      * ch 64 causing DUAL_HOME_CHANNEL_CONFLICT and bSTA disconnect (reason=34).
+      */
+     {
+-        swl_chanspec_t curChspec = wld_chanmgt_getCurChspec(pRad);
++        swl_chanspec_t epCurChspec = SWL_CHANSPEC_EMPTY;
++        wld_nl80211_chanSpecNlToSwl(&epCurChspec, &epIfInfo.chanSpec);
++        swl_chanspec_t curChspec = (epCurChspec.channel > 0) ? epCurChspec : wld_chanmgt_getCurChspec(pRad);
+         swl_chanspec_t tgtChspec = wld_chanmgt_getTgtChspec(pRad);
+         if((s_checkHapdDown(pRad) || (pRad->status == RST_DORMANT)) &&
+            ((curChspec.channel == 0) || swl_typeChanspec_equals(curChspec, tgtChspec))) {
+--- a/src/Plugin/wifiGen_eventHandlers.c	2026-10-13 23:57:30.459857162 +0530
++++ b/src/Plugin/wifiGen_eventHandlers.c	2026-10-13 23:58:12.269976937 +0530
+@@ -2394,6 +2394,41 @@
+     ASSERT_NOT_NULL(pEP, , ME, "NULL");
+     ASSERT_NOT_NULL(ifName, , ME, "NULL");
+     SAH_TRACEZ_INFO(ME, "%s: EP start scan", pEP->Name);
++    if((pEP->connectionStatus != EPCS_CONNECTED) && (pEP->connectionStatus != EPCS_WPS_PAIRING)) {
++        T_Radio* pRad = pEP->pRadio;
++        ASSERT_NOT_NULL(pRad, , ME, "NULL");
++        chanmgt_rad_state radState = CM_RAD_UNKNOWN;
++        if(wifiGen_hapd_isAlive(pRad) &&
++           (wifiGen_hapd_getRadState(pRad, &radState) == SWL_RC_OK) &&
++           (radState != CM_RAD_DOWN) && (radState != CM_RAD_UNKNOWN)) {
++            SAH_TRACEZ_WARNING(ME, "%s: pre-disabling own FH on scan start to free channel for MLD link add",
++                               pEP->Name);
++            wld_rad_hostapd_disable(pRad);
++            wld_rad_resetApMldLinks(pRad);
++        }
++        T_SSID* pSSID = pEP->pSSID;
++        if(pSSID && pSSID->pMldLink) {
++            wld_for_eachNeighMldLink_safe(pNgLink, pSSID->pMldLink) {
++                T_SSID* pNgSSID = wld_mld_getLinkSsid(pNgLink);
++                if(!pNgSSID || (pNgSSID == pSSID)) {
++                    continue;
++                }
++                T_Radio* pNgRad = pNgSSID->RADIO_PARENT;
++                if(!pNgRad || (pNgRad == pRad)) {
++                    continue;
++                }
++                chanmgt_rad_state ngRadState = CM_RAD_UNKNOWN;
++                if(wifiGen_hapd_isAlive(pNgRad) &&
++                   (wifiGen_hapd_getRadState(pNgRad, &ngRadState) == SWL_RC_OK) &&
++                   (ngRadState != CM_RAD_DOWN) && (ngRadState != CM_RAD_UNKNOWN)) {
++                    SAH_TRACEZ_WARNING(ME, "%s: pre-disabling MLO neighbour FH %s on scan start",
++                                       pEP->Name, pNgRad->Name);
++                    wld_rad_hostapd_disable(pNgRad);
++                    wld_rad_resetApMldLinks(pNgRad);
++                }
++            }
++        }
++    }
+     wifiGen_refreshEpConnStatus(pEP);
+ }
+ 
+--- a/src/nl80211/wld_wpaSupp_ep_api.c	2026-10-13 23:57:30.459857162 +0530
++++ b/src/nl80211/wld_wpaSupp_ep_api.c	2026-10-13 23:58:12.273977139 +0530
+@@ -302,9 +302,18 @@
+         }
+     }
+     if(!connInfo.chSpec.channel) {
+-        SAH_TRACEZ_WARNING(ME, "%s: fail to find link status details", itfname);
+-        W_SWL_FREE(statusBufTmp);
+-        return SWL_RC_NOT_FOUND;
++        if(mainLinkChspec.channel > 0) {
++            SAH_TRACEZ_WARNING(ME, "%s: fail to find link status details for tgt band, "
++                               "using primary link chanspec %s as fallback",
++                               itfname,
++                               swl_typeChanspecExt_toBuf32(mainLinkChspec).buf);
++            connInfo.chSpec = mainLinkChspec;
++            connInfo.isMainLink = true;
++        } else {
++            SAH_TRACEZ_WARNING(ME, "%s: fail to find link status details", itfname);
++            W_SWL_FREE(statusBufTmp);
++            return SWL_RC_NOT_FOUND;
++        }
+     }
+ 
+     if((wld_wpaCtrl_getInReplyParamValStr(statusBuf, "address", macStr.cMac, SWL_MAC_CHAR_LEN) >= 0) && swl_mac_charIsValidStaMac(&macStr)) {
+--- a/src/nl80211/wld_rad_hostapd_api.c	2026-10-13 23:57:30.463857364 +0530
++++ b/src/nl80211/wld_rad_hostapd_api.c	2026-10-13 23:58:12.273977139 +0530
+@@ -477,12 +477,27 @@
+  */
+ swl_rc_ne wld_rad_hostapd_disable(T_Radio* pR) {
+     ASSERT_NOT_NULL(pR, SWL_RC_INVALID_PARAM, ME, "NULL");
+-    wld_wpaCtrlMngr_t* pMgr = wld_secDmn_getWpaCtrlMgr(pR->hostapd);
+-    wld_wpaCtrlInterface_t* pIface = wld_wpaCtrlMngr_getFirstReadyInterface(pMgr);
+-    ASSERT_NOT_NULL(pIface, SWL_RC_ERROR, ME, "%s: hostapd has no wpactrl iface ready", pR->Name);
+-    bool ret = wld_wpaCtrl_sendCmdCheckResponseExt(pIface, "DISABLE", "OK", 5000);
+-    ASSERTS_TRUE(ret, SWL_RC_ERROR, ME, "%s: disabling failed", wld_wpaCtrlInterface_getName(pIface));
+-    return SWL_RC_OK;
++    /* Send DISABLE to every AP BSS interface so all AP vdevs on this radio
++     * release their channel contexts.  Sending to only the first interface
++     * leaves secondary BSSes (e.g. wlan2.2) active on their old channel,
++     * causing DUAL HOME CHANNEL CONFLICT when the bSTA or a newly enabled
++     * AP tries to use a different channel on the same radio. */
++    swl_rc_ne rc = SWL_RC_ERROR;
++    T_AccessPoint* pAP = NULL;
++    wld_rad_forEachAp(pAP, pR) {
++        if(pAP && wld_wpaCtrlInterface_isReady(pAP->wpaCtrlInterface)) {
++            bool ret = wld_wpaCtrl_sendCmdCheckResponseExt(pAP->wpaCtrlInterface,
++                                                           "DISABLE", "OK", 5000);
++            SAH_TRACEZ_INFO(ME, "%s: DISABLE %s -> %s", pR->Name,
++                            wld_wpaCtrlInterface_getName(pAP->wpaCtrlInterface),
++                            ret ? "OK" : "FAIL");
++            if(ret) {
++                rc = SWL_RC_OK;
++            }
++        }
++    }
++    ASSERTS_TRUE(rc == SWL_RC_OK, SWL_RC_ERROR, ME, "%s: disabling all ifaces failed", pR->Name);
++    return rc;
+ }
+ 
+ /**
+--- a/src/nl80211/wld_hostapd_cfgFile.c	2026-10-13 23:57:30.463857364 +0530
++++ b/src/nl80211/wld_hostapd_cfgFile.c	2026-10-14 01:20:32.735574710 +0530
+@@ -79,6 +79,7 @@
+ #include "wld_wpaCtrlInterface.h"
+ #include "wld_wpaCtrl_api.h"
+ #include "wld_secDmn.h"
++#include "wld_ep_nl80211.h"
+ 
+ #define ME "hapdCfg"
+ 
+@@ -207,11 +208,71 @@
+     swl_chanspec_t defChspec = wld_chanmgt_getDefaultSupportedChanspec(pRad);
+ 
+     if(wld_rad_hasConnectedEp(pRad)) {
+-        tgtChspec = wld_chanmgt_getCurChspec(pRad);
+-        SAH_TRACEZ_WARNING(ME, "%s: radio is used by connected EP, keep current chspec %s",
+-                           pRad->Name,
+-                           swl_typeChanspecExt_toBuf32(tgtChspec).buf);
+-        return tgtChspec;
++        /*
++         * The EP is connected.  At FH enable time, getCurChspec() may still
++         * return the stale pre-connection FH chanspec (e.g. 6_37/320-1 =
++         * 6135 MHz) while the bSTA vdev is already running on a different
++         * channel (e.g. 6_161/320-2 = 6755 MHz).  s_saveChanChanged fires
++         * AFTER hostapd is enabled, so chanmgt current is not yet updated.
++         * Configuring the FH AP on a different channel than the bSTA causes
++         * DUAL HOME CHANNEL CONFLICT or EBUSY (-16) when setting beacons.
++         *
++         * Strategy:
++         * 1) Query the EP's actual nl80211 chanspec (ground-truth from kernel).
++         * 2) If it is valid and non-DFS → use it directly.
++         * 3) If it is DFS (bSTA connected on a DFS channel) → fall back to the
++         *    default supported non-DFS chanspec so the FH does not start a CAC.
++         * 4) Fallback: use the target chanspec if it is non-DFS and same band,
++         *    else use getCurChspec() (existing behaviour).
++         */
++        swl_chanspec_t epNlChspec = SWL_CHANSPEC_EMPTY;
++        T_EndPoint* pConnEP = wld_rad_getEnabledEndpoint(pRad);
++        if(pConnEP != NULL) {
++            wld_nl80211_ifaceInfo_t epIfInfo;
++            memset(&epIfInfo, 0, sizeof(epIfInfo));
++            if(wld_ep_nl80211_getInterfaceInfo(pConnEP, &epIfInfo) >= SWL_RC_OK) {
++                wld_nl80211_chanSpecNlToSwl(&epNlChspec, &epIfInfo.chanSpec);
++            }
++        }
++        if(epNlChspec.channel > 0) {
++            if(wld_channel_is_band_usable(epNlChspec)) {
++                SAH_TRACEZ_WARNING(ME, "%s: connected EP on non-DFS %s: use for FH config",
++                                   pRad->Name,
++                                   swl_typeChanspecExt_toBuf32(epNlChspec).buf);
++                return epNlChspec;
++            }
++            /*
++             * EP is on a DFS channel.  Return the EP's DFS chanspec directly so
++             * hostapd uses the same channel as the bSTA.  Using the default non-DFS
++             * chanspec instead causes EBUSY because the bSTA vdev already holds the
++             * DFS channel context on this radio — the two channels would conflict.
++             * mac80211's boot-up CAC on the same channel completes in ~60s at most;
++             * a channel mismatch wastes an extra enable/disable cycle first.
++             */
++            SAH_TRACEZ_WARNING(ME, "%s: connected EP on DFS %s: use same channel for FH "
++                               "(mac80211 boot-up CAC will run)",
++                               pRad->Name,
++                               swl_typeChanspecExt_toBuf32(epNlChspec).buf);
++            return epNlChspec;
++        } else {
++            /* nl80211 query failed (EP may be transitioning) — try target if usable */
++            swl_chanspec_t curChspec = wld_chanmgt_getCurChspec(pRad);
++            if((tgtChspec.channel > 0) && (tgtChspec.band == curChspec.band) &&
++               wld_channel_is_band_usable(tgtChspec) &&
++               !swl_typeChanspec_equals(tgtChspec, curChspec)) {
++                SAH_TRACEZ_WARNING(ME, "%s: connected EP: nl80211 unavail, tgt %s != cur %s, "
++                                   "using tgt for FH config",
++                                   pRad->Name,
++                                   swl_typeChanspecExt_toBuf32(tgtChspec).buf,
++                                   swl_typeChanspecExt_toBuf32(curChspec).buf);
++                return tgtChspec;
++            }
++            tgtChspec = curChspec;
++            SAH_TRACEZ_WARNING(ME, "%s: radio is used by connected EP, keep current chspec %s",
++                               pRad->Name,
++                               swl_typeChanspecExt_toBuf32(tgtChspec).buf);
++            return tgtChspec;
++        }
+     }
+ 
+     if(wld_rad_hasRunningEndpoint(pRad) && swl_chanspec_isDfs(tgtChspec)) {
