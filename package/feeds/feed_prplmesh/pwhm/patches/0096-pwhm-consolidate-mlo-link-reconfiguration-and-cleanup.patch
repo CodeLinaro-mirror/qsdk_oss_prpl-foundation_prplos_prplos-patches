@@ -1,0 +1,529 @@
+From: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
+Subject: [PATCH] pwhm: consolidate MLO link reconfiguration and cleanup
+
+This preserves link-scoped MLO reconfiguration, primary-link promotion,
+enabled-link restoration, empty-MLD cleanup, and logical hostapd anchor
+removal while avoiding a fragmented patch series.
+
+The changes remain scoped to the affected MLD and do not require restarting
+other MLDs sharing the same radio.
+
+Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
+---
+
+--- a/include/wld/wld_mld.h
++++ b/include/wld/wld_mld.h
+@@ -178,6 +178,9 @@
+     amxc_llist_t links;                                                    /* List of affiliated links belonging to this MLD */
+     wld_mldGroup_t* pGroup;                                                /* Back pointer to parent group */
+     wld_mldLink_t* pPrimLink;                                              /* Primary link for this MLD */
++    bool hostapdRemoved;                                                    /* Runtime MLD anchor was removed */
++    T_SSID* pHostapdAnchorSSID;                                             /* Original hostapd MLD anchor */
++    char hostapdAnchorIface[128];                                           /* Running hostapd MLD interface */
+     wld_mldCfg_t Cfg;
+     void* pExtCfg;                                                         /* extended mld configuration: defined per mld type */
+     wld_tidLinkMapConfig_t tidLinkMapConfig;                               /**< TID-to-Link mapping configuration */
+--- a/src/Plugin/wifiGen_fsm.c
++++ b/src/Plugin/wifiGen_fsm.c
+@@ -574,6 +574,225 @@
+     }
+ }
+ 
++static void s_cacheMloAnchor(T_SSID* pSSID);
++
++static T_AccessPoint* s_findRunningMloAnchorAp(T_AccessPoint* pAPContext) {
++    ASSERTS_NOT_NULL(pAPContext, NULL, ME, "NULL pAP context");
++    T_SSID* pSSID = pAPContext->pSSID;
++    if((pSSID == NULL) || (pSSID->pMldLink == NULL)) {
++        return NULL;
++    }
++
++    /* The link can already have MLDLinkID -1 when final-link cleanup runs.
++     * Query the AP being removed directly before filtering on WLD state. */
++    if((pAPContext->wpaCtrlInterface != NULL) &&
++       wld_wpaCtrlInterface_isReady(pAPContext->wpaCtrlInterface)) {
++        char runIface[128] = {0};
++        if(swl_rc_isOk(wld_ap_hostapd_getRunIface(pAPContext, runIface, sizeof(runIface)))) {
++            T_SSID* pAnchorSSID = wld_ssid_getSsidByIfName(runIface);
++            if((pAnchorSSID != NULL) && (pAnchorSSID->pMldLink == pSSID->pMldLink) &&
++               (pAnchorSSID->AP_HOOK != NULL)) {
++                return pAnchorSSID->AP_HOOK;
++            }
++        }
++    }
++
++    wld_mldLink_t* pLink = NULL;
++    wld_for_eachNeighMldLink(pLink, pSSID->pMldLink) {
++        T_SSID* pLinkSSID = wld_mld_getLinkSsid(pLink);
++        T_AccessPoint* pLinkAP = (pLinkSSID != NULL) ? pLinkSSID->AP_HOOK : NULL;
++        if((pLinkAP == NULL) || (pLinkAP->wpaCtrlInterface == NULL) ||
++           !wld_wpaCtrlInterface_isReady(pLinkAP->wpaCtrlInterface)) {
++            continue;
++        }
++
++        char runIface[128] = {0};
++        if(!swl_rc_isOk(wld_ap_hostapd_getRunIface(pLinkAP, runIface, sizeof(runIface)))) {
++            continue;
++        }
++
++        T_SSID* pAnchorSSID = wld_ssid_getSsidByIfName(runIface);
++        if((pAnchorSSID != NULL) && (pAnchorSSID->pMldLink == pSSID->pMldLink) &&
++           (pAnchorSSID->AP_HOOK != NULL)) {
++            return pAnchorSSID->AP_HOOK;
++        }
++    }
++    return NULL;
++}
++
++static T_AccessPoint* s_getRunningMloAnchorAp(T_AccessPoint* pAP) {
++    ASSERTS_NOT_NULL(pAP, NULL, ME, "NULL pAP");
++    T_SSID* pSSID = pAP->pSSID;
++    if((pSSID == NULL) || (pSSID->pMldLink == NULL)) {
++        return NULL;
++    }
++
++    /* The running hostapd MLD name takes precedence over a WLD primary
++     * link, which may now refer to a different physical radio. */
++    T_AccessPoint* pRunningAnchorAP = s_findRunningMloAnchorAp(pAP);
++    if(pRunningAnchorAP != NULL) {
++        return pRunningAnchorAP;
++    }
++
++    wld_mld_t* pMld = pSSID->pMldLink->pMld;
++    if((pMld != NULL) && (pMld->pHostapdAnchorSSID == NULL)) {
++        s_cacheMloAnchor(pSSID);
++    }
++    if((pMld != NULL) && (pMld->pHostapdAnchorSSID != NULL) &&
++       (pMld->pHostapdAnchorSSID->pMldLink == pSSID->pMldLink) &&
++       (pMld->pHostapdAnchorSSID->AP_HOOK != NULL)) {
++        return pMld->pHostapdAnchorSSID->AP_HOOK;
++    }
++
++    wld_mldLink_t* pLink = NULL;
++    wld_for_eachNeighMldLink(pLink, pSSID->pMldLink) {
++        T_SSID* pLinkSSID = wld_mld_getLinkSsid(pLink);
++        T_AccessPoint* pLinkAP = (pLinkSSID != NULL) ? pLinkSSID->AP_HOOK : NULL;
++        if((pLinkAP == NULL) || (pLinkAP->wpaCtrlInterface == NULL) ||
++           !wld_wpaCtrlInterface_isReady(pLinkAP->wpaCtrlInterface)) {
++            continue;
++        }
++
++        char runIface[128] = {0};
++        if(!swl_rc_isOk(wld_ap_hostapd_getRunIface(pLinkAP, runIface, sizeof(runIface)))) {
++            continue;
++        }
++
++        T_SSID* pAnchorSSID = wld_ssid_getSsidByIfName(runIface);
++        if((pAnchorSSID != NULL) && (pAnchorSSID->pMldLink == pSSID->pMldLink) &&
++           (pAnchorSSID->AP_HOOK != NULL)) {
++            return pAnchorSSID->AP_HOOK;
++        }
++    }
++    return NULL;
++}
++
++static void s_cacheMloAnchor(T_SSID* pSSID) {
++    ASSERTS_NOT_NULL(pSSID, , ME, "NULL pSSID");
++    ASSERTS_NOT_NULL(pSSID->pMldLink, , ME, "NULL MLD link");
++    wld_mld_t* pMld = pSSID->pMldLink->pMld;
++    ASSERTS_NOT_NULL(pMld, , ME, "NULL MLD");
++
++    /* The running MLD interface (for example wlan2.1) is a hostapd logical
++     * interface and is not represented by a WLD AP object. Keep its name so
++     * final-link cleanup can remove it even after WLD clears the link ID. */
++    if(swl_str_isEmpty(pMld->hostapdAnchorIface)) {
++        T_AccessPoint* pAP = pSSID->AP_HOOK;
++        if((pAP != NULL) && (pAP->wpaCtrlInterface != NULL) &&
++           wld_wpaCtrlInterface_isReady(pAP->wpaCtrlInterface)) {
++            char runIface[sizeof(pMld->hostapdAnchorIface)] = {0};
++            if(swl_rc_isOk(wld_ap_hostapd_getRunIface(pAP, runIface, sizeof(runIface))) &&
++               !swl_str_isEmpty(runIface)) {
++                swl_str_copy(pMld->hostapdAnchorIface,
++                             sizeof(pMld->hostapdAnchorIface), runIface);
++                SAH_TRACEZ_INFO(ME, "%s: cached running MLD anchor iface %s",
++                                pSSID->Name, pMld->hostapdAnchorIface);
++            }
++        }
++    }
++    T_AccessPoint* pRunningAnchorAP = s_findRunningMloAnchorAp(pSSID->AP_HOOK);
++    if((pRunningAnchorAP != NULL) && (pRunningAnchorAP->pSSID != NULL) &&
++       (pRunningAnchorAP->pSSID->pMldLink == pSSID->pMldLink) &&
++       ((pMld->pHostapdAnchorSSID == NULL) ||
++        (wld_mld_countNeighActiveLinks(pSSID->pMldLink) <= 1))) {
++        pMld->pHostapdAnchorSSID = pRunningAnchorAP->pSSID;
++        SAH_TRACEZ_INFO(ME, "%s: preserve running MLD anchor %s (active links:%u)",
++                        pSSID->Name, pRunningAnchorAP->alias,
++                        wld_mld_countNeighActiveLinks(pSSID->pMldLink));
++        return;
++    }
++    if(pMld->pHostapdAnchorSSID != NULL) {
++        return;
++    }
++
++    T_SSID* pMainAnchorSSID = NULL;
++    T_SSID* pPrimSSID = wld_mld_getPrimaryLinkSsid(pSSID->pMldLink);
++    if((pPrimSSID != NULL) && (pPrimSSID->pMldLink == pSSID->pMldLink) &&
++       (pPrimSSID->RADIO_PARENT != NULL)) {
++        T_AccessPoint* pMainAP = wld_rad_hostapd_getCfgMainVap(pPrimSSID->RADIO_PARENT);
++        if((pMainAP != NULL) && (pMainAP->pSSID != NULL) &&
++           (pMainAP->pSSID->pMldLink == pSSID->pMldLink) &&
++           (pMainAP->pSSID->AP_HOOK != NULL)) {
++            pMainAnchorSSID = pMainAP->pSSID;
++        }
++    }
++
++    wld_mldLink_t* pLink = NULL;
++    T_SSID* pSameLinkAnchorSSID = NULL;
++    wld_for_eachNeighMldLink(pLink, pSSID->pMldLink) {
++        T_SSID* pLinkSSID = wld_mld_getLinkSsid(pLink);
++        if((pLinkSSID == NULL) || (pLinkSSID->AP_HOOK == NULL)) {
++            continue;
++        }
++
++        char cfgIface[128] = {0};
++        if(!swl_rc_isOk(wld_ap_hostapd_getCfgInterface(pLinkSSID->AP_HOOK,
++                                                       cfgIface, sizeof(cfgIface)))) {
++            continue;
++        }
++
++        T_SSID* pAnchorSSID = wld_ssid_getSsidByIfName(cfgIface);
++        if((pAnchorSSID == NULL) || (pAnchorSSID->pMldLink != pSSID->pMldLink) ||
++           (pAnchorSSID->AP_HOOK == NULL)) {
++            continue;
++        }
++        if(pAnchorSSID != pLinkSSID) {
++            pMld->pHostapdAnchorSSID = pAnchorSSID;
++            return;
++        }
++        if(pSameLinkAnchorSSID == NULL) {
++            pSameLinkAnchorSSID = pAnchorSSID;
++        }
++    }
++
++    if(pMainAnchorSSID != NULL) {
++        pMld->pHostapdAnchorSSID = pMainAnchorSSID;
++    } else if(pSameLinkAnchorSSID != NULL) {
++        pMld->pHostapdAnchorSSID = pSameLinkAnchorSSID;
++    }
++}
++
++static void s_resetMloRuntimeState(T_SSID* pSSID) {
++    ASSERTS_NOT_NULL(pSSID, , ME, "NULL pSSID");
++    ASSERTS_NOT_NULL(pSSID->pMldLink, , ME, "NULL MLD link");
++    wld_mld_t* pMld = pSSID->pMldLink->pMld;
++    ASSERTS_NOT_NULL(pMld, , ME, "NULL MLD");
++
++    wld_mldLink_t* pLink = NULL;
++    wld_for_eachNeighMldLink_safe(pLink, pSSID->pMldLink) {
++        wld_mld_resetLinkId(pLink);
++        if(wld_mld_isLinkConfigured(pLink)) {
++            wld_mld_saveLinkConfigured(pLink, false);
++        }
++    }
++    pMld->hostapdRemoved = true;
++    pMld->pHostapdAnchorSSID = NULL;
++    memset(pMld->hostapdAnchorIface, 0, sizeof(pMld->hostapdAnchorIface));
++}
++
++/*
++ * A link removed with LINK_REMOVE is still present in the WLD MLD model, but
++ * its runtime MLDLinkID is reset to NO_LINK_ID. If the link is enabled again
++ * while another link of the same MLD is running, it must be added to that
++ * existing MLD before the regular VAP enable path is executed.
++ */
++static bool s_isEnabledMloLinkMissing(T_AccessPoint* pAP, T_Radio* pRad) {
++    ASSERTS_NOT_NULL(pAP, false, ME, "NULL pAP");
++    ASSERTS_NOT_NULL(pRad, false, ME, "NULL pRad");
++    T_SSID* pSSID = pAP->pSSID;
++    if((pSSID == NULL) || (pSSID->pMldLink == NULL) ||
++       !wld_mld_isLinkEnabled(pSSID->pMldLink) ||
++       wld_mld_isLinkActive(pSSID->pMldLink) ||
++       !s_isLinkRemoveSupported(pRad)) {
++        return false;
++    }
++    if(wld_mld_countNeighActiveLinks(pSSID->pMldLink) > 0) {
++        return true;
++    }
++    return (pSSID->pMldLink->pMld != NULL) &&
++           pSSID->pMldLink->pMld->hostapdRemoved;
++}
++
+ static bool s_doEnableAp(T_AccessPoint* pAP, T_Radio* pRad) {
+     ASSERTI_TRUE(pRad->enable, true, ME, "%s: radio disabled", pRad->Name);
+     ASSERTI_TRUE(wifiGen_hapd_isAlive(pRad), true, ME, "%s: hostapd stopped", pRad->Name);
+@@ -581,15 +800,53 @@
+     ASSERT_NOT_NULL(pMainAPCur, true, ME, "%s: no main vap iface for rad %s", pAP->alias, pRad->Name);
+     bool enable = wld_ap_isEnabledWithRef(pAP);
+     SAH_TRACEZ_INFO(ME, "%s: enable vap %d", pAP->alias, enable);
++    if(!enable && s_isLinkRemoveSupported(pRad) &&
++       (pAP->pSSID != NULL) && (pAP->pSSID->pMldLink != NULL) &&
++       (wld_mld_countNeighLinks(pAP->pSSID->pMldLink) > 1)) {
++        /* Capture the running MLD anchor before disabling the VAP clears
++         * the link status used by the later REMOVE_LINK action. */
++        s_cacheMloAnchor(pAP->pSSID);
++    }
+     wld_secDmn_action_rc_ne rc;
+     T_AccessPoint* pMainAPCfg = wld_rad_hostapd_getCfgMainVap(pRad);
+     bool mainIfaceChanged = ((pMainAPCur != pMainAPCfg) && ((pMainAPCur == NULL) || (pAP == pMainAPCur) || (pAP == pMainAPCfg)));
+     bool wpaCtrlEnaChanged = (wld_wpaCtrlInterface_checkConnectionPath(pAP->wpaCtrlInterface) != wld_hostapd_ap_needWpaCtrlIface(pAP));
++    if(enable && s_isEnabledMloLinkMissing(pAP, pRad) &&
++       wld_secDmn_hasReadyGlobalCtrlIface(pRad->hostapd)) {
++        SAH_TRACEZ_WARNING(ME, "%s: enabled MLO link is absent from running MLD: schedule link add",
++                           pAP->alias);
++        if(s_fetchHigherApplyAction(pRad->fsmRad.FSM_AC_BitActionArray, FSM_BW,
++                                     GEN_FSM_UPDATE_HOSTAPD, GEN_FSM_ENABLE_AP) < 0) {
++            setBitLongArray(pRad->fsmRad.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_ADD_LINK);
++            setBitLongArray(pAP->fsm.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_ADD_LINK);
++        }
++        return true;
++    }
+     if(mainIfaceChanged || wpaCtrlEnaChanged) {
+         wifiGen_hapd_enableVapWpaCtrlIface(pAP);
+         if(mainIfaceChanged) {
+-            SAH_TRACEZ_WARNING(ME, "%s: Main iface changed: sched re-add radio %s", pAP->alias, pRad->Name);
+-            s_schedNextAction(SECDMN_ACTION_OK_NEED_RE_ADD, pAP, pRad);
++            if(!enable && s_hasMultiLinkApMld(pRad) && s_isLinkRemoveSupported(pRad)) {
++                SAH_TRACEZ_WARNING(ME, "%s: disabled MLO main iface changed: remove link only on %s",
++                                   pAP->alias, pRad->Name);
++                clearBitLongArray(pAP->fsm.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_ENABLE_AP);
++                setBitLongArray(pAP->fsm.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_REMOVE_LINK);
++                setBitLongArray(pRad->fsmRad.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_REMOVE_LINK);
++                return true;
++            }
++            if(s_hasMultiLinkApMld(pRad) && s_isLinkRemoveSupported(pRad)) {
++                SAH_TRACEZ_WARNING(ME, "%s: MLO main iface changed: sched re-add link on %s",
++                                   pAP->alias, pRad->Name);
++                /*
++                 * s_doEnableAp() is the action currently being processed.
++                 * Clear it before scheduling RE_ADD_LINK; otherwise
++                 * s_schedNextAction() intentionally defers link re-add.
++                 */
++                clearBitLongArray(pAP->fsm.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_ENABLE_AP);
++                s_schedNextAction(SECDMN_ACTION_OK_NEED_RE_ADD_LINK, pAP, pRad);
++            } else {
++                SAH_TRACEZ_WARNING(ME, "%s: Main iface changed: sched re-add radio %s", pAP->alias, pRad->Name);
++                s_schedNextAction(SECDMN_ACTION_OK_NEED_RE_ADD, pAP, pRad);
++            }
+             return true;
+         }
+ 
+@@ -710,11 +967,20 @@
+     swl_rc_ne rc = wld_ap_hostapd_addBssConf(pAP);
+     if(!swl_rc_isOk(rc)) {
+         SAH_TRACEZ_ERROR(ME, "%s: failed to add BSS config for AP %s, scheduling RE_ADD", pRad->Name, pAP->alias);
+-        s_schedNextAction(SECDMN_ACTION_OK_NEED_RE_ADD, pAP, pRad);
++        if(s_hasMultiLinkApMld(pRad) && s_isLinkRemoveSupported(pRad)) {
++            SAH_TRACEZ_WARNING(ME, "%s: MLO BSS add failed, keeping retry link scoped", pAP->alias);
++            s_schedNextAction(SECDMN_ACTION_OK_NEED_RE_ADD_LINK, pAP, pRad);
++        } else {
++            s_schedNextAction(SECDMN_ACTION_OK_NEED_RE_ADD, pAP, pRad);
++        }
+         return true;
+     }
+ 
+     SAH_TRACEZ_INFO(ME, "%s: BSS config for AP %s added successfully", pRad->Name, pAP->alias);
++    if((pAP->pSSID != NULL) && (pAP->pSSID->pMldLink != NULL) &&
++       (pAP->pSSID->pMldLink->pMld != NULL)) {
++        pAP->pSSID->pMldLink->pMld->hostapdRemoved = false;
++    }
+     s_syncMultiApDepsOnBhAdd(pAP, pRad);
+     wld_wpaCtrlMngr_checkAllIfaces(wld_secDmn_getWpaCtrlMgr(pRad->hostapd));
+     setBitLongArray(pRad->fsmRad.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_SYNC_STATE);
+@@ -795,7 +1061,12 @@
+     swl_rc_ne rc = wld_ap_hostapd_linkRemove(pAP, pRad->mLReconfigurationCount);
+     if(!swl_rc_isOk(rc)) {
+         SAH_TRACEZ_ERROR(ME, "%s: MLO link remove failed, scheduling re-add", pAP->alias);
+-        s_schedNextAction(SECDMN_ACTION_OK_NEED_RE_ADD, pAP, pRad);
++        if(s_isLinkRemoveSupported(pRad)) {
++            SAH_TRACEZ_WARNING(ME, "%s: MLO link remove failed, keeping recovery link scoped", pAP->alias);
++            s_schedNextAction(SECDMN_ACTION_OK_NEED_RE_ADD_LINK, pAP, pRad);
++        } else {
++            s_schedNextAction(SECDMN_ACTION_OK_NEED_RE_ADD, pAP, pRad);
++        }
+         return true;
+     }
+ 
+@@ -875,6 +1146,78 @@
+     return true;
+ }
+ 
++static bool s_removeLastMloLink(T_AccessPoint* pAP, T_Radio* pRad) {
++    ASSERTS_NOT_NULL(pAP, true, ME, "NULL pAP");
++    ASSERTS_NOT_NULL(pRad, true, ME, "NULL pRad");
++    T_SSID* pSSID = pAP->pSSID;
++    ASSERTS_NOT_NULL(pSSID, true, ME, "NULL SSID");
++    ASSERTS_NOT_NULL(pSSID->pMldLink, true, ME, "NULL MLD link");
++
++    wld_mld_t* pMld = pSSID->pMldLink->pMld;
++    T_AccessPoint* pAnchorAP = s_getRunningMloAnchorAp(pAP);
++    swl_rc_ne rc = SWL_RC_OK;
++    if(pAnchorAP != NULL) {
++        SAH_TRACEZ_INFO(ME, "%s: removing empty MLD anchor %s", pAP->alias, pAnchorAP->alias);
++        rc = wld_ap_hostapd_removeBss(pAnchorAP);
++        if(!swl_rc_isOk(rc)) {
++            SAH_TRACEZ_ERROR(ME, "%s: failed to remove empty MLD anchor %s", pAP->alias, pAnchorAP->alias);
++            s_schedNextAction(SECDMN_ACTION_OK_NEED_RE_ADD_LINK, pAP, pRad);
++            return true;
++        }
++    } else if((pMld != NULL) && !swl_str_isEmpty(pMld->hostapdAnchorIface)) {
++        wld_wpaCtrlInterface_t* pGlobal = wld_secDmn_getGlobalCtrlIface(pRad->hostapd);
++        if((pGlobal == NULL) || !wld_wpaCtrlInterface_isReady(pGlobal)) {
++            SAH_TRACEZ_ERROR(ME, "%s: global hostapd control interface is not ready for MLD anchor %s",
++                             pAP->alias, pMld->hostapdAnchorIface);
++            s_schedNextAction(SECDMN_ACTION_OK_NEED_RE_ADD_LINK, pAP, pRad);
++            return true;
++        }
++        SAH_TRACEZ_WARNING(ME, "%s: removing cached logical MLD anchor %s",
++                           pAP->alias, pMld->hostapdAnchorIface);
++        rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pGlobal, "OK", "REMOVE %s",
++                                                  pMld->hostapdAnchorIface);
++        if(!swl_rc_isOk(rc)) {
++            SAH_TRACEZ_ERROR(ME, "%s: failed to remove cached logical MLD anchor %s",
++                             pAP->alias, pMld->hostapdAnchorIface);
++            s_schedNextAction(SECDMN_ACTION_OK_NEED_RE_ADD_LINK, pAP, pRad);
++            return true;
++        }
++    } else {
++        SAH_TRACEZ_WARNING(ME, "%s: empty MLD anchor already absent", pAP->alias);
++    }
++
++    s_resetMloRuntimeState(pSSID);
++    pRad->fsmRad.timeout_msec = 500;
++    return true;
++}
++
++/*
++ * A link can remain configured in WLD as an MLO member while hostapd is
++ * running it as a standalone BSS during an MLD-unit transition.  LINK_REMOVE
++ * is only valid for a running multi-link hostapd interface; remove the
++ * standalone BSS directly so the next link-add can join the existing MLD.
++ */
++static bool s_removeDetachedMloLink(T_AccessPoint* pAP, T_Radio* pRad) {
++    ASSERTS_NOT_NULL(pAP, true, ME, "NULL pAP");
++    ASSERTS_NOT_NULL(pRad, true, ME, "NULL pRad");
++    if(!wld_secDmn_hasReadyGlobalCtrlIface(pRad->hostapd)) {
++        SAH_TRACEZ_WARNING(ME, "%s: detached MLO link has no global ctrl iface, scheduling restart",
++                           pAP->alias);
++        s_schedNextAction(SECDMN_ACTION_OK_NEED_RESTART, pAP, pRad);
++        return true;
++    }
++
++    SAH_TRACEZ_INFO(ME, "%s: removing detached standalone MLO BSS before re-add", pAP->alias);
++    swl_rc_ne rc = wld_ap_hostapd_removeBss(pAP);
++    if(!swl_rc_isOk(rc)) {
++        SAH_TRACEZ_ERROR(ME, "%s: detached standalone MLO BSS removal failed", pAP->alias);
++        s_schedNextAction(SECDMN_ACTION_OK_NEED_RE_ADD_LINK, pAP, pRad);
++        return true;
++    }
++    pRad->fsmRad.timeout_msec = 500;
++    return true;
++}
++
+ /**
+  * @brief Removes an AP link or BSS from a running hostapd instance
+  *
+@@ -901,9 +1217,30 @@
+     uint32_t nLinks = 0;
+     bool isRemoveLinkSupported = s_isLinkRemoveSupported(pRad);
+     bool isMultiLink = (wld_ap_hostapd_getNumMldLinks(pAP, &nLinks) >= SWL_RC_OK) && (nLinks >= 2);
++    bool isConfiguredMlo = (pAP->pSSID != NULL) &&
++                          (pAP->pSSID->pMldLink != NULL) &&
++                          (wld_mld_countNeighLinks(pAP->pSSID->pMldLink) > 1);
++
++    if(isRemoveLinkSupported && isConfiguredMlo) {
++        /* Preserve the original hostapd MLD anchor before primary-link
++         * promotion can make the running physical link look like the anchor. */
++        s_cacheMloAnchor(pAP->pSSID);
++    }
++
++    if(isRemoveLinkSupported && isConfiguredMlo &&
++       (wld_mld_countNeighActiveLinks(pAP->pSSID->pMldLink) <= 1)) {
++        return s_removeLastMloLink(pAP, pRad);
++    }
+ 
+     /** nLinks >= 2 && LINK_REMOVE is supported */
++    /* The configured MLD may still contain this link while hostapd has
++     * already detached it as a standalone one-link BSS.  Do not issue
++     * LINK_REMOVE in that state; hostapd accepts it only for a real MLD. */
++    if(isRemoveLinkSupported && isConfiguredMlo && !isMultiLink) {
++        return s_removeDetachedMloLink(pAP, pRad);
++    }
++
+     if(isRemoveLinkSupported && isMultiLink) {
+         return s_removeMloLink(pAP, pRad);
+     }
+ 
+--- a/src/Plugin/wifiGen_mld.c
++++ b/src/Plugin/wifiGen_mld.c
+@@ -254,12 +254,56 @@
+     return pPrimLink;
+ }
+ 
++static T_SSID* s_getRunningMldAnchorSSID(T_SSID* pSSID) {
++    ASSERTS_NOT_NULL(pSSID, NULL, ME, "NULL");
++    ASSERTS_NOT_NULL(pSSID->pMldLink, NULL, ME, "NULL");
++
++    wld_mldLink_t* pLink = NULL;
++    wld_for_eachNeighMldLink(pLink, pSSID->pMldLink) {
++        T_SSID* pLinkSSID = wld_mld_getLinkSsid(pLink);
++        if((pLinkSSID == NULL) || (pLinkSSID->AP_HOOK == NULL) ||
++           (pLinkSSID->AP_HOOK->wpaCtrlInterface == NULL) ||
++           !wld_wpaCtrlInterface_isReady(pLinkSSID->AP_HOOK->wpaCtrlInterface)) {
++            continue;
++        }
++
++        char runIface[128] = {0};
++        if(!swl_rc_isOk(wld_ap_hostapd_getRunIface(pLinkSSID->AP_HOOK, runIface, sizeof(runIface)))) {
++            continue;
++        }
++
++        T_SSID* pAnchorSSID = wld_ssid_getSsidByIfName(runIface);
++        if((pAnchorSSID != NULL) && (pAnchorSSID->pMldLink != NULL) &&
++           (wld_mld_getPrimaryLink(pAnchorSSID->pMldLink) ==
++            wld_mld_getPrimaryLink(pSSID->pMldLink))) {
++            return pAnchorSSID;
++        }
++    }
++
++    return NULL;
++}
++
+ T_SSID* wifiGen_mld_selectPrimLinkSSID(T_SSID* pSSID) {
+     ASSERTS_NOT_NULL(pSSID, NULL, ME, "NULL");
+     if(!wld_mld_isLinkUsable(pSSID->pMldLink)) {
+         return pSSID;
+     }
+     wld_mldLink_t* pCurPrimLink = wld_mld_getPrimaryLink(pSSID->pMldLink);
++    if(!wld_mld_isLinkUsable(pCurPrimLink)) {
++        wld_mldLink_t* pNewPrimLink = wld_mld_firstUsableNeighLinkByFreq(pSSID->pMldLink);
++        if((pNewPrimLink != NULL) && (pNewPrimLink != pCurPrimLink) &&
++           swl_rc_isOk(wld_mld_setPrimaryLink(pNewPrimLink))) {
++            SAH_TRACEZ_INFO(ME, "SSID %s promotes MLD primary link to %s",
++                            pSSID->Name, wld_mld_getLinkName(pNewPrimLink));
++            pCurPrimLink = pNewPrimLink;
++        }
++    }
++    T_SSID* pRunningAnchorSSID = s_getRunningMldAnchorSSID(pSSID);
++    if(pRunningAnchorSSID != NULL) {
++        SAH_TRACEZ_INFO(ME, "SSID %s uses running MLD anchor %s",
++                        pSSID->Name, pRunningAnchorSSID->Name);
++        return pRunningAnchorSSID;
++    }
+     if(wld_mld_isLinkConfigured(pCurPrimLink)) {
+         SAH_TRACEZ_INFO(ME, "SSID %s has already a primLink %s",
+                         pSSID->Name, wld_mld_getLinkName(pCurPrimLink));
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -2439,6 +2439,12 @@
+         }
+ 
+         wld_hostapd_bssConfig_t* bssConfig = NULL;
++        const char* bssIface = swl_mapChar_get(pCurrVapParams, "bss");
++        const char* mainIface = swl_mapChar_get(pCurrVapParams, "interface");
++        if(swl_str_isEmpty(bssIface) && swl_str_isEmpty(mainIface)) {
++            SAH_TRACEZ_WARNING(ME, "%s: skip per-BSS config without interface name", pAP->alias);
++            continue;
++        }
+         if(!wld_hostapd_createBssConfig(&bssConfig, pRadConfigMap, pCurrVapParams)) {
+             SAH_TRACEZ_ERROR(ME, "%s: Failed to create bss config", pAP->alias);
+             continue;
