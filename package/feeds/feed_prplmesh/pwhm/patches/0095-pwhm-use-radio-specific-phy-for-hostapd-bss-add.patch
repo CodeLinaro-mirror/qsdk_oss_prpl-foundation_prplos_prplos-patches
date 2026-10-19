@@ -1,0 +1,63 @@
+From: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
+Subject: [PATCH] pwhm: use radio-specific PHY for hostapd BSS additions
+
+When multiple radios share one wiphy, hostapd identifies an existing
+interface using the PHY string in the bss_config command. The radio_idx in
+the configuration file is only used after hostapd has selected or created
+that interface. Since hostapd names the existing interfaces as phyX.<idx>,
+using phyX causes a new interface to be created instead of reusing the
+requested radio.
+
+Pass the radio-specific PHY name to both radio and per-BSS additions. The
+index is resolved from the live NL80211 WIPHY_RADIOS information, matching
+the radio_idx written to the hostapd configuration.
+
+Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
+---
+ src/nl80211/wld_rad_hostapd_api.c | 5 ++++-
+ src/nl80211/wld_hostapd_ap_api.c  | 5 ++++-
+ 2 files changed, 8 insertions(+), 2 deletions(-)
+
+--- a/src/nl80211/wld_rad_hostapd_api.c
++++ b/src/nl80211/wld_rad_hostapd_api.c
+@@ -62,5 +62,6 @@
+ #include "wld_hostapd_cfgFile.h"
+ #include "wld_hostapd_cfgManager_priv.h"
+ #include "swl/map/swl_mapCharFmt.h"
++#include "wld_rad_nl80211.h"
+ 
+ #define ME "hapdRad"
+@@ -524,8 +525,10 @@ swl_rc_ne wld_rad_hostapd_addConf(T_Radio* pR) {
+     wld_wpaCtrlInterface_t* pgIface = wld_secDmn_getGlobalCtrlIface(pR->hostapd);
+     ASSERT_NOT_NULL(pgIface, SWL_RC_ERROR, ME, "%s: hostapd has no global iface ready", pR->Name);
+     ASSERT_STR(pR->wiphyName, SWL_RC_ERROR, ME, "%s: Empty wPhy name", pR->Name);
+     swl_rc_ne rc;
+-    rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pgIface, "OK", "ADD bss_config=%s:%s", pR->wiphyName, pR->hostapd->cfgFile);
++    uint32_t radioIdx = wld_rad_nl80211_getRadioIdx(pR);
++    rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pgIface, "OK", "ADD bss_config=%s.%u:%s",
++                                             pR->wiphyName, radioIdx, pR->hostapd->cfgFile);
+     //the call may timeout while being applied, but that only happens on success
+     if(rc == SWL_RC_NOT_AVAILABLE) {
+         rc = SWL_RC_CONTINUE;
+--- a/src/nl80211/wld_hostapd_ap_api.c
++++ b/src/nl80211/wld_hostapd_ap_api.c
+@@ -93,5 +93,6 @@
+ #include "wld_assocdev.h"
+ #include "swl/swl_hex.h"
+ #include "swl/swl_common_mac.h"
++#include "wld_rad_nl80211.h"
+ 
+ #define ME "hapdAP"
+@@ -1726,7 +1727,9 @@ swl_rc_ne wld_ap_hostapd_addBssConf(T_AccessPoint* pAP) {
+     ASSERTI_FALSE(swl_str_isEmpty(confFilePath), SWL_RC_ERROR, ME, "%s: empty config file", pAP->alias);
+ 
+     SAH_TRACEZ_INFO(ME, "%s: adding bss config using %s", pAP->alias, confFilePath);
+-    swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pgIface, "OK", "ADD bss_config=%s:%s", pRad->wiphyName, confFilePath);
++    uint32_t radioIdx = wld_rad_nl80211_getRadioIdx(pRad);
++    swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pgIface, "OK", "ADD bss_config=%s.%u:%s",
++                                                       pRad->wiphyName, radioIdx, confFilePath);
+     ASSERT_TRUE(swl_rc_isOk(rc), rc, ME, "%s: fail to add bss config", pAP->alias);
+ 
+     return rc;
+-- 
+2.43.0

@@ -1,0 +1,42 @@
+From: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
+Subject: [PATCH] pwhm: populate live radio index in hostapd config
+
+Use the driver-reported radio index resolved by wld_rad_nl80211_getRadioIdx()
+when generating hostapd configuration files. This keeps hostapd's radio_idx
+aligned with the radio index reported by `iw phy ... info`, even when the
+driver probe order differs from the 2.4/5/6 GHz band order.
+
+Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
+---
+ src/nl80211/wld_hostapd_cfgFile.c    | 3 +++
+ src/nl80211/wld_hostapd_cfgManager.c | 2 +-
+ 2 files changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/nl80211/wld_hostapd_cfgFile.c b/src/nl80211/wld_hostapd_cfgFile.c
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -62,6 +62,7 @@
+ #include "wld.h"
+ #include "wld_radio.h"
+ #include "wld_accesspoint.h"
++#include "wld_rad_nl80211.h"
+ #include "wld_ssid.h"
+ #include "wld_util.h"
+ #include "swl/swl_hex.h"
+@@ -262,6 +263,8 @@
+     ASSERTS_NOT_NULL(pRad, , ME, "NULL");
+     ASSERTW_TRUE(pRad->nrPossibleChannels > 0, , ME, "%s: rad has no possible channels", pRad->Name);
+     swl_mapChar_add(radConfigMap, "driver", "nl80211");
++    swl_mapCharFmt_addValInt32(radConfigMap, "radio_idx",
++                               (int32_t) wld_rad_nl80211_getRadioIdx(pRad));
+     swl_mapCharFmt_addValInt32(radConfigMap, "logger_syslog", 127);
+     swl_mapCharFmt_addValInt32(radConfigMap, "logger_syslog_level", 2);
+     swl_mapCharFmt_addValInt32(radConfigMap, "logger_stdout", 127);
+diff --git a/src/nl80211/wld_hostapd_cfgManager.c b/src/nl80211/wld_hostapd_cfgManager.c
+--- a/src/nl80211/wld_hostapd_cfgManager.c
++++ b/src/nl80211/wld_hostapd_cfgManager.c
+@@ -212,1 +212,1 @@
+-        "hw_mode", "channel", "country_code",
++        "radio_idx", "hw_mode", "channel", "country_code",
+-- 
+2.43.0
