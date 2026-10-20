@@ -1,0 +1,87 @@
+From: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+Date: Tue, 20 Oct 2026 00:00:00 +0530
+Subject: [PATCH] pwhm: fix WdsInterfaceName on wrong AP for single-link WDS
+
+Bug: 5G Single-Link WDS Reproducer
+  - STA associates on AccessPoint.5 / wlan1.2 (AP-STA-CONNECTED).
+  - WDS link is created on AccessPoint.4 / wlan2.2 (wlan2.2.sta1),
+    i.e. WDS-STA-INTERFACE-ADDED fires on a *different* AP than the
+    one the station actually associated to.
+  - s_wdsCreatedEvt() always called wld_vap_findOrCreateAssociatedDevice()
+    on pRef's own AP (AP4), which silently created a second, empty
+    T_AssociatedDevice there, instead of reusing the real one already
+    created under AP5. Result: AccessPoint.5 shows a successful
+    association but WdsInterfaceName stays empty (it got set on the
+    orphan device under AP4 instead), and association bookkeeping is
+    split across two AccessPoint instances for the same station.
+
+Fix: before creating a new AssociatedDevice under pRef's AP, look it
+up first in pRef's own station list (unchanged fast path for the
+normal same-radio case), then fall back to a global by-mac lookup
+across all APs -- reusing that device only if it is already Active,
+to avoid resurrecting the older WPS-stale-entry bug that the previous
+comment in this function warned about.
+
+Signed-off-by: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+---
+--- a/src/Plugin/wifiGen_eventHandlers.c
++++ b/src/Plugin/wifiGen_eventHandlers.c
+@@ -1903,12 +1903,20 @@
+ }
+
+ static void s_wdsCreatedEvt(void* pRef, char* ifName, char* wdsIntfName, swl_macBin_t* macAddress) {
+-    /* pRef is the AP whose VAP fired WDS-STA-INTERFACE-ADDED.  Always use it
+-     * for both device lookup and WDS entry creation so that the pAD->object
+-     * that wld_vap_sync_device writes into is anchored under the correct AP DM
+-     * instance.  Using getAssociatedApByMac here pulled in the old WPS-created
+-     * pAD from another AP (whose pAD->object points at a different AccessPoint),
+-     * causing WdsInterfaceName to land on the wrong AccessPoint. */
++    /* pRef is the AP whose VAP fired WDS-STA-INTERFACE-ADDED: it is always the
++     * owner of the WDS interface itself (passed to wld_ad_addWdsEntry() below).
++     * The AssociatedDevice may already exist under a *different* AP though,
++     * e.g. when the station associates on one radio/VAP (AP-STA-CONNECTED on
++     * AccessPoint.5/wlan1.2) while the WDS link is reported on another VAP
++     * (WDS-STA-INTERFACE-ADDED on AccessPoint.4/wlan2.2), as happens in
++     * multi-radio WDS backhaul setups. Reuse that existing device instead of
++     * creating a second, empty one under pRef - else WdsInterfaceName (and
++     * getLastAssocReq data) end up split across two AccessPoint instances for
++     * the same physical station.
++     * Check pRef's own station list first (unchanged, typical single-radio
++     * flow) and only fall back to the global by-mac lookup when the match is
++     * already Active, to avoid reintroducing the old WPS issue where a stale
++     * leftover pAD from an unrelated AP got pulled in. */
+     T_AccessPoint* pAP = (T_AccessPoint*) pRef;
+     ASSERT_NOT_NULL(pAP, , ME, "NULL");
+     ASSERT_NOT_NULL(ifName, , ME, "NULL");
+@@ -1916,14 +1924,29 @@
+     SAH_TRACEZ_INFO(ME, "%s: connecting WDS station " MAC_PRINT_FMT " to intf %s", pAP->alias,
+                     MAC_PRINT_ARG(macAddress->bMac), wdsIntfName);
+
+-    T_AssociatedDevice* pAD = wld_vap_findOrCreateAssociatedDevice(pAP, macAddress);
++    T_AssociatedDevice* pAD = wld_vap_find_asociatedDevice(pAP, macAddress);
++    if(pAD == NULL) {
++        T_AccessPoint* pOwnerAP = wld_ad_getAssociatedApByMac(macAddress);
++        if((pOwnerAP != NULL) && (pOwnerAP != pAP)) {
++            T_AssociatedDevice* pExistingAD = wld_vap_find_asociatedDevice(pOwnerAP, macAddress);
++            if((pExistingAD != NULL) && pExistingAD->Active) {
++                SAH_TRACEZ_INFO(ME, "%s: WDS station " MAC_PRINT_FMT " already associated via %s, reusing its device",
++                                pAP->alias, MAC_PRINT_ARG(macAddress->bMac), pOwnerAP->alias);
++                pAD = pExistingAD;
++            }
++        }
++    }
++    if(pAD == NULL) {
++        pAD = wld_vap_findOrCreateAssociatedDevice(pAP, macAddress);
++    }
+     ASSERT_NOT_NULL(pAD, , ME, "%s: Failure to create associated device "MAC_PRINT_FMT, pAP->alias, MAC_PRINT_ARG(macAddress->bMac));
+
+     pAD->Active = true;
+     /* AssociatedDevice should have only one WDS interface.
+      * delete old one, if any is still there */
+     wld_ad_delWdsEntry(pAD);
+-    /* and create new one */
++    /* and create new one, anchored on pAP (the actual owner of the WDS
++     * interface) even when pAD lives under a different AccessPoint instance */
+     wld_ad_addWdsEntry(pAP, pAD, wdsIntfName);
+
+     pAP->pFA->mfn_wvap_get_single_station_stats(pAD);
