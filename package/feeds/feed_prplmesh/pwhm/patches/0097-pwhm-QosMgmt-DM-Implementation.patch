@@ -1,0 +1,1081 @@
+From 25f302d5fa0732b3ad2c89525f9c94eee559d945 Mon Sep 17 00:00:00 2001
+From: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+Date: Thu, 22 Oct 2026 23:57:58 +0530
+Subject: [PATCH] pwhm: QoSMgmt DM Implementation
+
+Change-Id: I9b43e3a596fe1f9b6fbe06168219a133c1acd5d7
+Signed-off-by: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+---
+
+diff --git a/include/wld/wld.h b/include/wld/wld.h
+index 3f72283..f335e96 100644
+--- a/include/wld/wld.h
++++ b/include/wld/wld.h
+@@ -235,6 +235,32 @@ enum {
+ 
+ #define MAXNROF_MFENTRY       (32)
+ #define MAXNROF_PFENTRY       (32)
++
++/**
++ * @def MAXNROF_STA_FOR_MSCS_SCS
++ * @brief Maximum number of stations that can have active MSCS or SCS descriptors.
++ */
++#define MAXNROF_STA_FOR_MSCS_SCS    (256)
++
++/**
++ * @def MAXNROF_DESCENTRIES
++ * @brief Maximum number of QoS descriptor entries across all clients.
++ *
++ * Each client can have up to 4 QoS Management descriptors (Stream Classification Service
++ * or Mirrored Stream Classification Service rules). This limit is calculated as:
++ * MAXNROF_STA_FOR_MSCS_SCS * 4
++ */
++#define MAXNROF_DESCENTRIES      (MAXNROF_STA_FOR_MSCS_SCS * 4)
++
++/**
++ * @def WLD_QOSMGMT_DESCRIPTOR_MAX_LEN
++ * @brief Maximum length of a QoS Management descriptor hex string (including null terminator).
++ *
++ * The descriptor is a hex-encoded string representing the IEEE 802.11 QoS Management
++ * frame body. This must be an even-length hex string with minimum 8 characters.
++ */
++#define WLD_QOSMGMT_DESCRIPTOR_MAX_LEN 256
++
+ #define NR_OF_STICKY_UNAUTHORIZED_STATIONS 1
+ #define MAXNROF_STAENTRY (wld_getMaxNrSta() + NR_OF_STICKY_UNAUTHORIZED_STATIONS)
+ 
+@@ -1312,6 +1338,11 @@ typedef struct wld_radioCap {
+     wld_radioWiFi8Cap_t apCap8;
+     wld_radioWiFi8Cap_t staCap8;
+     wld_tidLinkMapCapability_e tidLinkMapCapability;  /**< TID-to-Link mapping hardware capability */
++    bool mscsSupported;                               /* Mirrored Stream Classification Service feature is supported on this radio */
++    bool scsSupported;                                /* Stream Classification Service feature is supported on this radio */
++    bool qosMapSupported;                             /* DSCP-to-UP QoS Map support */
++    bool dscpPolicySupported;                         /* DSCP Policy Request support */
++    bool scsTrafficDescriptionSupported;              /* SCS traffic description support */
+ } wld_radioCap_t;
+ 
+ typedef struct {
+@@ -1871,6 +1902,38 @@ typedef struct {
+     amxd_object_t* object;
+ } wld_vendorIe_t;
+ 
++/**
++ * @struct wld_qosMgmtDescriptor_t
++ * @brief Represents a single QoS Management Descriptor entry for a client station.
++ *
++ * This structure holds the configuration for one Stream Classification Service (SCS)
++ * or Mirrored Stream Classification Service (MSCS) descriptor associated with a
++ * specific client MAC address.
++ */
++typedef struct {
++    swl_macBin_t mac;
++    char descriptor[WLD_QOSMGMT_DESCRIPTOR_MAX_LEN];
++    uint32_t qmid;
++} wld_qosMgmtDescriptor_t;
++
++/**
++ * @struct wld_qosMgmtConfig_t
++ * @brief QoS Management configuration state for an IEEE 802.11 access point.
++ *
++ * This structure maintains the complete QoS Management state including:
++ * - Feature enable/disable flags for SCS and MSCS
++ * - Active QoS descriptors for all connected clients
++ */
++typedef struct {
++    bool SCSEnable;   /**< Enable Stream Classification Service feature on this AP */
++    bool MSCSEnable;  /**< Enable Mirrored Stream Classification Service feature on this AP */
++    bool hostapdCfgSynced; /**< Initial enable flags have been read from saved hostapd config */
++
++    /* QoS Management descriptors */
++    wld_qosMgmtDescriptor_t QosMgmtDescriptors[MAXNROF_DESCENTRIES];
++    size_t QosMgmtDescriptorCount;
++
++} wld_qosMgmtConfig_t;
+ 
+ typedef enum {
+     WLD_VAP_DRIVER_CFG_CHANGE_BSS_MAX_IDLE_PERIOD,
+@@ -1932,6 +1995,7 @@ struct S_ACCESSPOINT {
+     char R0KHKey[KHKEY_MAX_LEN];                /* R0 key used by the AP */
+     uint16_t mobilityDomain;                    /* MobilityDomain, common to all APs inside the network */
+     wld_cfg11u_t cfg11u;
++    wld_qosMgmtConfig_t qosMgmt;                /* QoS management configuration parameters. */
+     swl_security_apMode_m secModesAvailable;    /* Bit pattern for available security modes */
+     swl_security_apMode_m secModesSupported;    /* Bit pattern for supported security modes */
+     swl_security_apMode_e secModeEnabled;       /* ModesSupported. */
+@@ -2496,6 +2560,7 @@ typedef swl_rc_ne (APIENTRY* PFN_WVAP_VAP_UPDATE_ADL)(T_AccessPoint* vap);
+ typedef int (APIENTRY* PFN_WVAP_VAP_ENABLE)(T_AccessPoint* vap, int enable, int set);
+ typedef int (APIENTRY* PFN_WVAP_VAP_ENABLE_WMM)(T_AccessPoint* vap, int enable, int set);
+ typedef int (APIENTRY* PFN_WVAP_VAP_ENABLE_UAPSD)(T_AccessPoint* vap, int enable, int set);
++typedef int (APIENTRY* PFN_WVAP_VAP_ENABLE_SCS_MSCS)(T_AccessPoint* vap, int enable);
+ typedef int (APIENTRY* PFN_WVAP_VAP_SSID)(T_AccessPoint* vap, char* buf, int bufsize, int set);
+ typedef int (APIENTRY* PFN_WVAP_SYNC)(T_AccessPoint* vap, int set);
+ typedef int (APIENTRY* PFN_WVAP_SEC_SYNC)(T_AccessPoint* vap, int set);
+@@ -2731,6 +2796,20 @@ typedef struct S_CWLD_FUNC_TABLE {
+ 
+     swl_rc_ne (* mfn_wvap_updateConfigMap)(T_AccessPoint* pAP, swl_mapChar_t* configMap); /**< Update the current hostapd vap parameters map, to add or delete parameters */
+ 
++    /**
++     * @brief Sets the QoS Management Descriptor for a specific client on the access point.
++     *
++     * This function pointer refers to a function that configures the QoS Management Descriptor
++     * (either SCS or MSCS) for a given client MAC address on the specified access point.
++     *
++     * @param pAP Pointer to the T_AccessPoint structure representing the access point.
++     * @param qmid QoS Management Identifier.
++     * @param descriptor Pointer to a string containing the QoS Management Descriptor to set.
++     * @param client_mac BSTA/associated STA MAC address used as the first SCS_CONFIGURE argument.
++     * @return swl_rc_ne Status code indicating success or failure of the operation.
++     */
++    swl_rc_ne (* mfn_wvap_set_qosmgmt_descriptor)(T_AccessPoint* pAP, uint32_t qmid, const char* descriptor, swl_macBin_t client_mac);
++
+     PFN_WVAP_VAP_UPDATE_ADL mfn_wvap_update_rssi_stats;                                   /**< Update rssi of associated devices */
+     /** Update the stats counters of requested accesspoint BSS */
+     swl_rc_ne (* mfn_wvap_update_ap_stats)(T_AccessPoint* vap);
+@@ -2738,6 +2817,8 @@ typedef struct S_CWLD_FUNC_TABLE {
+     PFN_WVAP_VAP_ENABLE mfn_wvap_enable;                         /**< Set/Get VAP Enable/Disable state */
+     PFN_WVAP_VAP_ENABLE_WMM mfn_wvap_enable_wmm;                 /**< Set/Get WMM state */
+     PFN_WVAP_VAP_ENABLE_UAPSD mfn_wvap_enable_uapsd;             /**< Set/Get UAPSD state */
++    PFN_WVAP_VAP_ENABLE_SCS_MSCS mfn_wvap_enable_scs;            /**< Set/Get SCS state */
++    PFN_WVAP_VAP_ENABLE_SCS_MSCS mfn_wvap_enable_mscs;           /**< Set/Get MSCS state */
+     PFN_WVAP_VAP_SSID mfn_wvap_ssid;                             /**< Set/Get SSID, change hide/show SSID */
+     PFN_WVAP_VAP_BSSID mfn_wvap_bssid;                           /**< Set/Get BSSID */
+     PFN_WVAP_SYNC mfn_wvap_sync;                                 /**< Sync Enable/Disabel */
+diff --git a/include/wld/wld_nl80211_compat.h b/include/wld/wld_nl80211_compat.h
+index 68761a9..c007a0f 100644
+--- a/include/wld/wld_nl80211_compat.h
++++ b/include/wld/wld_nl80211_compat.h
+@@ -179,6 +179,9 @@
+ #endif //NL80211_FREQUENCY_ATTR_NO_IR
+ #define __NL80211_FREQUENCY_ATTR_NO_IBSS NL80211_FREQUENCY_ATTR(4)
+ #define NL80211_CMD_SET_QOS_MAP NL80211_CMD(104)
++#ifndef NL80211_CMD_QOS_MGMT
++#define NL80211_CMD_QOS_MGMT NL80211_CMD(181)
++#endif
+ #define NL80211_CMD_VENDOR NL80211_CMD(103)
+ #define NL80211_ATTR_VENDOR_ID NL80211_ATTR(195)
+ #define NL80211_ATTR_VENDOR_SUBCMD NL80211_ATTR(196)
+diff --git a/include/wld/wld_nl80211_types.h b/include/wld/wld_nl80211_types.h
+index af13b30..826fc4e 100644
+--- a/include/wld/wld_nl80211_types.h
++++ b/include/wld/wld_nl80211_types.h
+@@ -200,6 +200,7 @@ typedef struct {
+     swl_80211_hecap_macCapInfo_t heMacCapabilities;                         /* HE(High Efficiency) 802.11ax mac capabilities */
+     swl_80211_hecap_phyCapInfo_t hePhyCapabilities;                         /* HE(High Efficiency) 802.11ax phy capabilities */
+     swl_80211_hecap_MCSCap_t heMcsCaps[SWL_80211_HECAP_MCS_CAP_ARRAY_SIZE]; /* The Supported HE-MCS and NSS Set */
++    uint8_t ehtMacCapabilities[WLD_WIPHY_IFTYPE_MAX][2];
+     swl_80211_ehtcap_phyCapInfo_t ehtPhyCapabilities;
+     uint8_t uhrMacCapabilities[WLD_WIPHY_IFTYPE_MAX][6];
+     uint8_t uhrPhyCapabilities[WLD_WIPHY_IFTYPE_MAX][5];
+@@ -212,7 +213,11 @@ typedef struct {
+     bool channelSwitch; // support Channel Switch Announcement
+     bool survey;        // support Survey API
+     bool WMMCapability; // support WME
++    bool mgmtFrameTx;   // support tx of management/action frames
++    bool registerFrame; // support receiving registered management/action frames
++    bool qosMgmt;       // support QoS management command (SCS/MSCS/DSCP policy)
+     bool remainOnChannel; // support Remain On Channel (off-channel monitoring)
++    bool supportedCommandsSeen; // NL80211_ATTR_SUPPORTED_COMMANDS was present in the wiphy response
+ } wld_nl80211_wiphySuppCmds;
+ 
+ typedef struct {
+@@ -231,6 +236,10 @@ typedef struct {
+     bool nstrSupport[WLD_WIPHY_IFTYPE_MAX];                // support NSTR mlo mode (along with MLMR or EMLMR)
+     uint8_t maxNumSimultenousLinks[WLD_WIPHY_IFTYPE_MAX];  // max num of simultenuous auxiliary links
+     uint8_t tidLinkMapCapability;                          // TID-to-Link mapping hardware capability from NL80211
++    bool mscsSupport[WLD_WIPHY_IFTYPE_MAX];                // Mirrored Stream Classification Service support
++    bool scsSupport[WLD_WIPHY_IFTYPE_MAX];                 // Stream Classification Service support
++    bool qosMapSupport[WLD_WIPHY_IFTYPE_MAX];              // QoS Map support from extended capabilities
++    bool scsTrafficDescriptionSupport[WLD_WIPHY_IFTYPE_MAX]; // SCS traffic description support
+ } wld_nl80211_wiphyExtCapas;
+ 
+ #define WLD_NL80211_WIPHY_MAX_RADIOS MAXNROF_RADIO       //max number of individual (combo) radios a single wiphy can expose over NL80211_ATTR_WIPHY_RADIOS
+diff --git a/include_priv/Plugin/wifiGen_vap.h b/include_priv/Plugin/wifiGen_vap.h
+index a74f73d..152d872 100644
+--- a/include_priv/Plugin/wifiGen_vap.h
++++ b/include_priv/Plugin/wifiGen_vap.h
+@@ -114,4 +114,7 @@ swl_rc_ne wifiGen_vap_getMloStats(T_AccessPoint* pAP, wld_mloStats_t* pStats);
+ swl_rc_ne wifiGen_vap_addVendorIe(T_AccessPoint* pAP, wld_vendorIe_t* vendorIe);
+ swl_rc_ne wifiGen_vap_delVendorIe(T_AccessPoint* pAP, wld_vendorIe_t* vendorIe);
+ swl_rc_ne wifiGen_vap_enabVendorIe(T_AccessPoint* pAP, int enable);
++int wifiGen_vap_enableScs(T_AccessPoint* pAP, int enable);
++int wifiGen_vap_enableMscs(T_AccessPoint* pAP, int enable);
++swl_rc_ne wifiGen_vap_setQosMgmtDescriptor(T_AccessPoint* pAP, uint32_t qmid, const char* descriptor, swl_macBin_t clientMac);
+ #endif /* INCLUDE_PRIV_PLUGIN_WIFIGEN_VAP_H_ */
+diff --git a/odl/wld.odl.m4 b/odl/wld.odl.m4
+index 040016c..7e17cb3 100644
+--- a/odl/wld.odl.m4
++++ b/odl/wld.odl.m4
+@@ -115,6 +115,7 @@ m4_ifelse(DISABLE_PERSIST,y,``
+                    "apNeigh" = 200,
+                    "apRssi" = 200,
+                    "apSec" = 200,
++                   "apQosMgmt" = 200,
+                    "bStaMld" = 200,
+                    "chan" = 200,
+                    "chanDfs" = 200,
+diff --git a/odl/wld_accesspoint.odl b/odl/wld_accesspoint.odl
+index 9b15bb4..56cb534 100644
+--- a/odl/wld_accesspoint.odl
++++ b/odl/wld_accesspoint.odl
+@@ -110,6 +110,8 @@ define rrm_t{
+ 		event 'MgmtActionFrameReceived!';
+ 		event 'wpaCtrlEvents!';
+ 		event 'BSS-TM-RESP!';
++		event 'SCSRequestEvent!';
++		event 'SCSNotifyEvent!';
+ 
+ 		/**
+ 		 * <b>kickStation</b>
+@@ -596,6 +598,80 @@ define rrm_t{
+ 			%persistent string QoSMapSet;
+ 		}
+ 
++		/**
++		 * Object encapsulating QoS Management configuration parameters.
++		 * This object manages MSCS (Mirrored Stream Classification Service) and
++		 * SCS (Stream Classification Service) features for QoS traffic management.
++		 */
++		%persistent object QoSMgmt {
++			on event "*" call wld_apQosMgmt_setConf_ocf;
++
++			/**
++			 * Enable or disable Mirrored Stream Classification Service (MSCS) for this VAP.
++			 */
++			%persistent bool MSCSEnable {
++				default true;
++			}
++
++			/**
++			 * Enable or disable Stream Classification Service (SCS) for this VAP.
++			 */
++			%persistent bool SCSEnable {
++				default true;
++			}
++
++			/**
++			 * List of QoS Management Descriptors (MSCS/SCS).
++			 * Each entry is indexed by qmid and MACAddress, and includes the descriptor.
++			 */
++			%persistent object QosMgmtDesc[] {
++				on action destroy call wld_ap_deleteQosMgmtDesc_odf;
++				on event "*" call wld_apQosMgmtDescEntry_setConf_ocf;
++
++				/**
++				 * [Alias] A unique identifier for this QoS Management Descriptor entry.
++				 */
++				%unique %key string Alias;
++
++				/**
++				 * MAC address of the client station for this QoS descriptor.
++				 */
++				%read-only string MACAddress;
++
++				/**
++				 * QoS Management Identifier - unique ID for this descriptor.
++				 */
++				%read-only uint16 qmid;
++
++				/**
++				 * The descriptor content defining QoS classification rules.
++				 */
++				%read-only string Descriptor;
++			}
++
++			/**
++			 * Add/modify/remove QoS Management Descriptor (MSCS/SCS).
++			 * @param qmid: QOS management id
++			 * @param MACAddress: BSTA/associated STA MAC address used as bsta_mac in SCS_CONFIGURE
++			 * @param Descriptor: SCS/MSCS descriptor (hex string)
++			 */
++			void handleQosMgmtDesc(
++				%in %mandatory uint16 qmid,
++				%in %mandatory string MACAddress,
++				%in %mandatory string Descriptor);
++
++			/**
++			 * Retrieve SCS context from hostapd for a station.
++			 * @param MACAddress: MAC address of the client
++			 * @param InfoType: scs_list, scs_info, or qm_info. Defaults to scs_list.
++			 * @param ID: SCS ID for scs_info, or QM ID for qm_info.
++			 */
++			string GetSCSParams(%in %mandatory string MACAddress,
++			                    %in string InfoType,
++			                    %in uint32 ID);
++
++		}
++
+ 		/**
+ 		 * The maximum number of devices that can simultaneously be connected to the access point.
+ 		 *
+diff --git a/odl/wld_radio.odl b/odl/wld_radio.odl
+index a707270..6a71a0f 100644
+--- a/odl/wld_radio.odl
++++ b/odl/wld_radio.odl
+@@ -3376,6 +3376,41 @@ define probelist_t{
+ 			}
+ 		}
+ 
++		/**
++		 * Indicates if Mirrored Stream Classification Service (MSCS) is supported.
++		 */
++		%read-only bool MSCSSupport {
++			on action read call wld_radStaMon_getQosSupport_prf;
++		}
++
++		/**
++		 * Indicates if Stream Classification Service (SCS) is supported.
++		 */
++		%read-only bool SCSSupport {
++			on action read call wld_radStaMon_getQosSupport_prf;
++		}
++
++		/**
++		 * Indicates if DSCP-to-UP QoS Map distribution is supported.
++		 */
++		%read-only bool QoSMapSupport {
++			on action read call wld_radStaMon_getQosSupport_prf;
++		}
++
++		/**
++		 * Indicates if SCS traffic descriptions are supported.
++		 */
++		%read-only bool QMSCSTrafficDescriptionSupport {
++			on action read call wld_radStaMon_getQosSupport_prf;
++		}
++
++		/**
++		 * Support for sending DSCP Policy Requests to associated STAs.
++		 */
++		%read-only bool DSCPSupport {
++			on action read call wld_rad_getDscpSupport_prf;
++		}
++
+ 		/**
+ 		 * List of event counters.
+ 		 * This list aims will track the number of events that happen
+diff --git a/src/ChannelManagement/wld_chanmgt.c b/src/ChannelManagement/wld_chanmgt.c
+index 1b25238..8c19829 100644
+--- a/src/ChannelManagement/wld_chanmgt.c
++++ b/src/ChannelManagement/wld_chanmgt.c
+@@ -1368,7 +1368,7 @@ amxd_status_t _wld_chanmgt_getRadarDetectCount_prf(amxd_object_t* object,
+ 
+     uint32_t count = 0;
+     int ret = wld_rad_nl80211_getRadarDetectCount(pRad, &count);
+-    SAH_TRACEZ_ERROR(ME, "%s: Get radarcount= %d for, ret=%d", pRad->Name,count, ret);
++    SAH_TRACEZ_INFO(ME, "%s: Get radarcount= %d for, ret=%d", pRad->Name,count, ret);
+     if (ret == 0) {
+         amxc_var_set(uint32_t, retval, count);
+         return amxd_status_ok;
+diff --git a/src/Plugin/makefile b/src/Plugin/makefile
+index 43c9b98..aecbe8f 100644
+--- a/src/Plugin/makefile
++++ b/src/Plugin/makefile
+@@ -10,7 +10,7 @@ TARGET_SO = $(OBJDIR)/Plugin/wld.so.$(VERSION)
+ SRCDIR = .
+ INCDIR = ../../include
+ INCDIR_PRIV = ../../include_priv
+-INCDIRS = $(INCDIR_PRIV) $(if $(STAGINGDIR), $(STAGINGDIR)/include) $(if $(STAGINGDIR), $(STAGINGDIR)/usr/include) $(if $(STAGINGDIR), $(STAGINGDIR)/usr/include/libnl3)
++INCDIRS = $(INCDIR_PRIV) $(INCDIR) $(if $(STAGINGDIR), $(STAGINGDIR)/include) $(if $(STAGINGDIR), $(STAGINGDIR)/usr/include) $(if $(STAGINGDIR), $(STAGINGDIR)/usr/include/libnl3)
+ STAGING_LIBDIR = $(if $(STAGINGDIR), -L$(STAGINGDIR)/lib) $(if $(STAGINGDIR), -L$(STAGINGDIR)/usr/lib)
+ 
+ # files
+@@ -23,7 +23,6 @@ SUBDIRS = $(addprefix $(OBJDIR)/Plugin,$(patsubst $(SRCDIR)%,%/,$(SUBDIRS_BASE))
+ CFLAGS := $(CFLAGS) -std=gnu99 -fPIC -g -Wall -Werror -Wextra \
+ 		$(addprefix -I ,$(INCDIRS)) \
+ 		-I$(INCDIR_PRIV)/Plugin/ \
+-		-I$(INCDIR)/ \
+ 		-DSAHTRACES_ENABLED -DSAHTRACES_LEVEL_DEFAULT=500
+ CFLAGS += -Wformat -Wformat-security -Wimplicit-function-declaration -Wl,--no-undefined -Wno-unused-variable
+ LDFLAGS := -L$(OBJDIR) $(LDFLAGS) $(STAGING_LIBDIR) -Wl,-rpath,/lib -Wl,-rpath,/usr/lib -shared  -lsahtrace -lswlc -lswla -lamxo -lamxb -lamxc -lamxm -lamxp -lamxd
+diff --git a/src/Plugin/wifiGen.c b/src/Plugin/wifiGen.c
+index f791d46..6d37ab8 100644
+--- a/src/Plugin/wifiGen.c
++++ b/src/Plugin/wifiGen.c
+@@ -176,6 +176,9 @@ bool wifiGen_init() {
+     fta.mfn_wvap_disassoc_sta_reason = wifiGen_vap_disassoc_sta_reason;
+     fta.mfn_wvap_clean_sta = wifiGen_vap_clean_sta;
+     fta.mfn_wvap_ttlm_config = wifiGen_vap_ttlm_config;
++    fta.mfn_wvap_enable_scs = wifiGen_vap_enableScs;
++    fta.mfn_wvap_enable_mscs = wifiGen_vap_enableMscs;
++    fta.mfn_wvap_set_qosmgmt_descriptor = wifiGen_vap_setQosMgmtDescriptor;
+     fta.mfn_wvap_multiap_update_type = wifiGen_vap_multiap_update_type;
+     fta.mfn_wvap_multiap_update_profile = wifiGen_vap_multiap_update_profile;
+     fta.mfn_wvap_multiap_update_vlanid = wifiGen_vap_multiap_update_vlanid;
+@@ -343,4 +346,3 @@ bool wifiGen_deinit() {
+     s_init = false;
+     return true;
+ }
+-
+diff --git a/src/Plugin/wifiGen_eventHandlers.c b/src/Plugin/wifiGen_eventHandlers.c
+index 0833307..335aadf 100644
+--- a/src/Plugin/wifiGen_eventHandlers.c
++++ b/src/Plugin/wifiGen_eventHandlers.c
+@@ -295,6 +295,45 @@ static void s_handleDppCredentialEvent(T_AccessPoint* pAP, char* eventName, char
+     }
+ }
+ 
++static void s_addScsEventParam(amxc_var_t* data, const char* key, const char* val) {
++    ASSERTS_NOT_NULL(data, , ME, "NULL");
++    ASSERTS_STR(key, , ME, "empty key");
++    ASSERTS_STR(val, , ME, "empty val");
++    amxc_var_add_key(cstring_t, data, key, val);
++}
++
++static void s_addScsEventData(amxc_var_t* data, const char* eventName, const char* params) {
++    ASSERTS_NOT_NULL(data, , ME, "NULL");
++    ASSERTS_STR(eventName, , ME, "empty event");
++    ASSERTS_STR(params, , ME, "empty params");
++
++    amxc_var_add_key(cstring_t, data, "params", params);
++
++    char paramsCopy[1024] = {0};
++    swl_str_copy(paramsCopy, sizeof(paramsCopy), params);
++    const char* positionalKeysReq[] = {"client_mac", "bssid", "scs_descriptor"};
++    const char* positionalKeysStatus[] = {"client_mac", "bssid", "qmid", "status"};
++    const char** positionalKeys = swl_str_matches(eventName, "CTRL-EVENT-SCS-REQUEST-NOTIFY") ?
++        positionalKeysReq : positionalKeysStatus;
++    size_t maxPositionalKeys = swl_str_matches(eventName, "CTRL-EVENT-SCS-REQUEST-NOTIFY") ?
++        SWL_ARRAY_SIZE(positionalKeysReq) : SWL_ARRAY_SIZE(positionalKeysStatus);
++
++    char* savePtr = NULL;
++    char* token = strtok_r(paramsCopy, " \t", &savePtr);
++    size_t tokenIndex = 0;
++    while(token != NULL) {
++        char* sep = strchr(token, '=');
++        if(sep != NULL) {
++            *sep = '\0';
++            s_addScsEventParam(data, token, sep + 1);
++        } else if(tokenIndex < maxPositionalKeys) {
++            s_addScsEventParam(data, positionalKeys[tokenIndex], token);
++        }
++        tokenIndex++;
++        token = strtok_r(NULL, " \t", &savePtr);
++    }
++}
++
+ static void s_wpaCtrlIfaceStdEvt(void* userData, char* ifName, char* eventName, char* msgData) {
+     ASSERT_NOT_NULL(ifName, , ME, "NULL");
+     ASSERT_NOT_NULL(eventName, , ME, "NULL");
+@@ -315,6 +354,25 @@ static void s_wpaCtrlIfaceStdEvt(void* userData, char* ifName, char* eventName,
+         } else {
+             s_clearPendingDppCredentials(pAP);
+         }
++        if(swl_str_matches(eventName, "CTRL-EVENT-SCS-REQUEST-NOTIFY") ||
++           swl_str_matches(eventName, "CTRL-EVENT-SCS-STATUS-NOTIFY")) {
++            const char* scsEventName = swl_str_matches(eventName, "CTRL-EVENT-SCS-REQUEST-NOTIFY") ?
++                "SCSRequestEvent" : "SCSNotifyEvent";
++            char* params = strstr(msgData, eventName);
++            params = (params != NULL) ? params + strlen(eventName) : msgData;
++            while((*params == ' ') || (*params == '\t')) {
++                params++;
++            }
++
++            amxc_var_t notifMap;
++            amxc_var_init(&notifMap);
++            amxc_var_set_type(&notifMap, AMXC_VAR_ID_HTABLE);
++            amxc_var_t* data = amxc_var_add_key(amxc_htable_t, &notifMap, "Data", NULL);
++            amxc_var_add_key(cstring_t, data, "ifName", ifName);
++            s_addScsEventData(data, eventName, params);
++            amxd_object_trigger_signal(pAP->pBus, scsEventName, &notifMap);
++            amxc_var_clean(&notifMap);
++        }
+     } else if(debugIsEpPointer(pEP)) {
+         object = pEP->pBus;
+         if(strncmp(eventName, "DPP-", 4) == 0 &&
+diff --git a/src/Plugin/wifiGen_rad.c b/src/Plugin/wifiGen_rad.c
+index 0718456..cee5bdb 100644
+--- a/src/Plugin/wifiGen_rad.c
++++ b/src/Plugin/wifiGen_rad.c
+@@ -84,9 +84,73 @@
+ #include "wld/wld_wpaCtrlInterface.h"
+ #include "wld/wld_nl80211_attr.h"
+ #include "wld/wld_ap_nl80211.h"
++#include "wld/wld_hostapd_cfgManager.h"
+ 
+ #define ME "genHapd"
+ 
++static bool s_hostapdCfgParamToBool(const char* value) {
++    return (swl_str_matches(value, "1") ||
++            swl_str_matches(value, "true") ||
++            swl_str_matches(value, "TRUE") ||
++            swl_str_matches(value, "on") ||
++            swl_str_matches(value, "ON"));
++}
++
++static bool s_radioQosCapaDefault(T_Radio* pRad, const char* configKey) {
++    ASSERTS_NOT_NULL(pRad, false, ME, "NULL");
++    ASSERTS_STR(configKey, false, ME, "empty config key");
++
++    T_AccessPoint* pAP = NULL;
++    wld_rad_forEachAp(pAP, pRad) {
++        if(swl_str_matches(configKey, "enable_scs") && pAP->qosMgmt.SCSEnable) {
++            return true;
++        }
++        if(swl_str_matches(configKey, "enable_mscs") && pAP->qosMgmt.MSCSEnable) {
++            return true;
++        }
++        if(swl_str_matches(configKey, "enable_dscp_policy_capa") && pAP->WMMCapability) {
++            return true;
++        }
++    }
++    return false;
++}
++
++static int s_hostapdQosCapaState(T_Radio* pRad, const char* configKey, bool valueMeansCapability) {
++    ASSERTS_NOT_NULL(pRad, -1, ME, "NULL");
++    ASSERTS_STR(configKey, -1, ME, "empty config key");
++    ASSERTS_NOT_NULL(pRad->hostapd, -1, ME, "%s: no hostapd", pRad->Name);
++    ASSERTS_STR(pRad->hostapd->cfgFile, -1, ME, "%s: no hostapd cfg file", pRad->Name);
++
++    wld_hostapd_config_t* config = NULL;
++    bool ret = wld_hostapd_loadConfig(&config, pRad->hostapd->cfgFile);
++    ASSERTS_TRUE(ret, -1, ME, "%s: failed to load hostapd config %s", pRad->Name, pRad->hostapd->cfgFile);
++
++    const char* globalValue = wld_hostapd_getConfigParamValStr(config, NULL, configKey);
++    bool found = (swl_str_len(globalValue) > 0);
++    bool enabled = found && s_hostapdCfgParamToBool(globalValue);
++    T_AccessPoint* pAP = NULL;
++    wld_rad_forEachAp(pAP, pRad) {
++        if((pAP->pSSID == NULL) || swl_mac_binIsNull((swl_macBin_t*) pAP->pSSID->BSSID)) {
++            continue;
++        }
++        const char* bssValue = wld_hostapd_getConfigParamByBssidValStr(config, (swl_macBin_t*) pAP->pSSID->BSSID,
++                                                                        configKey);
++        found |= (swl_str_len(bssValue) > 0);
++        enabled |= s_hostapdCfgParamToBool(bssValue);
++    }
++    wld_hostapd_deleteConfig(config);
++    if(!found) {
++        return -1;
++    }
++    return (valueMeansCapability ? enabled : true) ? 1 : 0;
++}
++
++static bool s_hostapdQosCapaSupported(T_Radio* pRad, const char* configKey, bool valueMeansCapability) {
++    int hostapdState = s_hostapdQosCapaState(pRad, configKey, valueMeansCapability);
++    bool defaultCapa = s_radioQosCapaDefault(pRad, configKey);
++    return (hostapdState >= 0) ? (hostapdState == 1) : defaultCapa;
++}
++
+ 
+ 
+ SWL_TABLE(sPowerTable,
+@@ -709,6 +773,35 @@ int wifiGen_rad_supports(T_Radio* pRad, char* buf _UNUSED, int bufsize _UNUSED)
+     pRad->cap.apCap8.coordinatedSrSupport = pUhrBand->uhrSupported[WLD_WIPHY_IFTYPE_AP] && ((uhrApMac[4] & IEEE80211_UHR_MAC_CAP4_CO_SR_SUPP) != 0 || (uhrApPhy[2] & (IEEE80211_UHR_PHY_CAP2_CO_SR_MODE1_SUPP | IEEE80211_UHR_PHY_CAP2_CO_SR_MODE2_SUPP)) != 0);
+     pRad->cap.apCap8.coordinatedTdmaSupport = (wiphyInfo.mapcHwCapabilities & ATH12K_MAPC_CAP_COTDMA_SUPPORT) != 0;
+ 
++    bool ehtScsTrafficDescriptionSupport = false;
++    for(uint32_t band = 0; band < SWL_FREQ_BAND_MAX; band++) {
++        uint8_t ehtApMac0 = wiphyInfo.bands[band].ehtMacCapabilities[WLD_WIPHY_IFTYPE_AP][0];
++        if((ehtApMac0 & 0x20) != 0) {
++            ehtScsTrafficDescriptionSupport = true;
++        }
++    }
++
++    bool hostapdScsCapa = s_hostapdQosCapaSupported(pRad, "enable_scs", false);
++    bool hostapdMscsCapa = s_hostapdQosCapaSupported(pRad, "enable_mscs", false);
++    bool driverQosMgmtCapa = wiphyInfo.suppCmds.qosMgmt ||
++        wiphyInfo.extCapas.mscsSupport[WLD_WIPHY_IFTYPE_AP];
++    pRad->cap.mscsSupported = driverQosMgmtCapa ||
++        hostapdMscsCapa;
++    pRad->cap.scsSupported = wiphyInfo.extCapas.scsSupport[WLD_WIPHY_IFTYPE_AP] ||
++        driverQosMgmtCapa ||
++        hostapdScsCapa;
++    pRad->cap.qosMapSupported = wiphyInfo.extCapas.qosMapSupport[WLD_WIPHY_IFTYPE_AP] ||
++        wiphyInfo.suppCmds.WMMCapability;
++    bool hostapdDscpPolicyCapa = s_hostapdQosCapaSupported(pRad, "enable_dscp_policy_capa", true);
++    bool driverDscpPolicyCapa = (wiphyInfo.suppCmds.mgmtFrameTx &&
++                                 wiphyInfo.suppCmds.registerFrame) ||
++        driverQosMgmtCapa;
++    pRad->cap.dscpPolicySupported = driverDscpPolicyCapa || hostapdDscpPolicyCapa;
++    pRad->cap.scsTrafficDescriptionSupported =
++        wiphyInfo.extCapas.scsTrafficDescriptionSupport[WLD_WIPHY_IFTYPE_AP] ||
++        ((pOperBand->ehtMacCapabilities[WLD_WIPHY_IFTYPE_AP][0] & 0x20) != 0) ||
++        ehtScsTrafficDescriptionSupport;
++
+     if(wiphyInfo.suppMlo && (pOperBand->radStdsMask & M_SWL_RADSTD_BE)) {
+         wld_mldMgr_t* pMldMgr = pRad->vendor ? pRad->vendor->pMldMgr : NULL;
+         wld_mldCapa_t apMldCapa;
+diff --git a/src/Plugin/wifiGen_vap.c b/src/Plugin/wifiGen_vap.c
+index 73ed9fe..386ca83 100644
+--- a/src/Plugin/wifiGen_vap.c
++++ b/src/Plugin/wifiGen_vap.c
+@@ -902,3 +902,34 @@ swl_rc_ne wifiGen_vap_enabVendorIe(T_AccessPoint* pAP, int enable) {
+     wld_ap_doSync(pAP);
+     return SWL_RC_OK;
+ }
++
++int wifiGen_vap_enableScs(T_AccessPoint* pAP, int enable) {
++    ASSERT_NOT_NULL(pAP, SWL_RC_INVALID_PARAM, ME, "NULL");
++    const char* val = enable ? "1" : "0";
++    swl_rc_ne rcEnable = wld_hostapd_ap_sendCfgParam(pAP, "enable_scs", val);
++    swl_rc_ne rcDeferred = wld_hostapd_ap_sendCfgParam(pAP, "deferred_scs", val);
++    return (swl_rc_isOk(rcEnable) && swl_rc_isOk(rcDeferred)) ? SWL_RC_OK : SWL_RC_ERROR;
++}
++
++int wifiGen_vap_enableMscs(T_AccessPoint* pAP, int enable) {
++    ASSERT_NOT_NULL(pAP, SWL_RC_INVALID_PARAM, ME, "NULL");
++    const char* val = enable ? "1" : "0";
++    swl_rc_ne rc = wld_hostapd_ap_sendCfgParam(pAP, "enable_mscs", val);
++    return swl_rc_isOk(rc) ? SWL_RC_OK : SWL_RC_ERROR;
++}
++
++swl_rc_ne wifiGen_vap_setQosMgmtDescriptor(T_AccessPoint* pAP, uint32_t qmid, const char* descriptor, swl_macBin_t clientMac) {
++    ASSERT_NOT_NULL(pAP, SWL_RC_INVALID_PARAM, ME, "NULL");
++    ASSERTS_STR(descriptor, SWL_RC_INVALID_PARAM, ME, "empty descriptor");
++    ASSERT_NOT_NULL(pAP->pSSID, SWL_RC_INVALID_STATE, ME, "%s: no SSID", pAP->alias);
++    ASSERT_NOT_NULL(pAP->wpaCtrlInterface, SWL_RC_INVALID_STATE, ME, "%s: no hostapd ctrl iface", pAP->alias);
++
++    swl_macChar_t staMacChar;
++    swl_macChar_t apBssidChar;
++    swl_mac_binToChar(&staMacChar, &clientMac);
++    swl_mac_binToChar(&apBssidChar, (swl_macBin_t*) pAP->pSSID->BSSID);
++    return wld_wpaCtrl_sendCmdFmtCheckResponse(pAP->wpaCtrlInterface, "OK",
++                                               "SCS_CONFIGURE %s %s %u %s 1",
++                                               staMacChar.cMac, apBssidChar.cMac,
++                                               qmid, descriptor);
++}
+diff --git a/src/RadMgt/wld_rad_stamon.c b/src/RadMgt/wld_rad_stamon.c
+index b168700..19fa0a4 100644
+--- a/src/RadMgt/wld_rad_stamon.c
++++ b/src/RadMgt/wld_rad_stamon.c
+@@ -463,8 +463,55 @@ void wld_radio_updateNaStaMonitor(T_Radio* pRad, amxd_trans_t* trans) {
+     ASSERT_NOT_NULL(targetTrans, , ME, "NULL");
+ 
+     amxd_trans_set_bool(targetTrans, "OffChannelSupported", pRad->stationMonitorOffChannelSupported);
+-
+     swla_trans_finalize(&tmpTrans, NULL);
++
++    bool scsSupport = pRad->cap.scsSupported || pRad->cap.mscsSupported;
++
++    swla_trans_t radioTmpTrans;
++    targetTrans = swla_trans_init(&radioTmpTrans, trans, pRad->pBus);
++    ASSERT_NOT_NULL(targetTrans, , ME, "NULL");
++
++    amxd_trans_set_bool(targetTrans, "MSCSSupport", pRad->cap.mscsSupported);
++    amxd_trans_set_bool(targetTrans, "SCSSupport", scsSupport);
++    amxd_trans_set_bool(targetTrans, "QoSMapSupport", pRad->cap.qosMapSupported);
++    amxd_trans_set_bool(targetTrans, "QMSCSTrafficDescriptionSupport", pRad->cap.scsTrafficDescriptionSupported);
++
++    swla_trans_finalize(&radioTmpTrans, NULL);
++}
++
++amxd_status_t _wld_radStaMon_getQosSupport_prf(amxd_object_t* object,
++                                               amxd_param_t* param,
++                                               amxd_action_t reason,
++                                               const amxc_var_t* const args _UNUSED,
++                                               amxc_var_t* const retval,
++                                               void* priv _UNUSED) {
++    ASSERTS_NOT_NULL(param, amxd_status_unknown_error, ME, "NULL");
++    ASSERTS_EQUALS(reason, action_param_read, amxd_status_function_not_implemented, ME, "not impl");
++
++    T_Radio* pRad = wld_rad_fromObj(object);
++    if(pRad == NULL) {
++        pRad = wld_rad_fromObj(amxd_object_get_parent(object));
++    }
++    ASSERTS_NOT_NULL(pRad, amxd_status_ok, ME, "no radio mapped");
++
++    const char* paramName = amxd_param_get_name(param);
++    bool value = false;
++    if((paramName != NULL) && (strcmp(paramName, "MSCSSupport") == 0)) {
++        value = pRad->cap.mscsSupported;
++    } else if((paramName != NULL) && (strcmp(paramName, "SCSSupport") == 0)) {
++        value = pRad->cap.scsSupported || pRad->cap.mscsSupported;
++    } else if((paramName != NULL) && (strcmp(paramName, "QoSMapSupport") == 0)) {
++        value = pRad->cap.qosMapSupported;
++    } else if((paramName != NULL) && (strcmp(paramName, "QMSCSTrafficDescriptionSupport") == 0)) {
++        value = pRad->cap.scsTrafficDescriptionSupported;
++    } else {
++        SAH_TRACEZ_WARNING(ME, "%s: unexpected Radio QoS support param %s",
++                           pRad->Name, paramName ? paramName : "?");
++        return amxd_status_invalid_arg;
++    }
++
++    amxc_var_set(bool, retval, value);
++    return amxd_status_ok;
+ }
+ 
+ static int32_t wld_rad_staMon_getStats(amxc_var_t* myList, T_RssiEventing* ev, amxc_llist_t* devList) {
+@@ -699,4 +746,3 @@ void _wld_radStaMon_setConf_ocf(const char* const sig_name,
+                                 void* const priv _UNUSED) {
+     swla_dm_procObjEvtOfLocalDm(&sRadStaMonDmHdlrs, sig_name, data, priv);
+ }
+-
+diff --git a/src/nl80211/wld_hostapd_cfgFile.c b/src/nl80211/wld_hostapd_cfgFile.c
+index cf2c0a3..6e5fef9 100644
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -2053,9 +2053,11 @@ static bool s_setVapCommonConfig(T_AccessPoint* pAP, swl_mapChar_t* vapConfigMap
+         swl_mapCharFmt_addValInt32(vapConfigMap, "tx_queue_data3_acm", 0);
+         swl_mapCharFmt_addValInt32(vapConfigMap, "tx_queue_data3_noack", 0);
+ 
+-        /* SCS/MSCS and group management cipher */
+-        swl_mapCharFmt_addValInt32(vapConfigMap, "enable_scs", 1);
+-        swl_mapCharFmt_addValInt32(vapConfigMap, "enable_mscs", 1);
++        /* QoS management capabilities and group management cipher */
++        swl_mapCharFmt_addValInt32(vapConfigMap, "enable_scs", pAP->qosMgmt.SCSEnable ? 1 : 0);
++        swl_mapCharFmt_addValInt32(vapConfigMap, "deferred_scs", pAP->qosMgmt.SCSEnable ? 1 : 0);
++        swl_mapCharFmt_addValInt32(vapConfigMap, "enable_mscs", pAP->qosMgmt.MSCSEnable ? 1 : 0);
++        swl_mapCharFmt_addValInt32(vapConfigMap, "enable_dscp_policy_capa", 1);
+         swl_mapChar_add(vapConfigMap, "group_mgmt_cipher", "AES-128-CMAC");
+     }
+ 
+@@ -2123,9 +2125,11 @@ static bool s_setVapCommonConfig(T_AccessPoint* pAP, swl_mapChar_t* vapConfigMap
+         swl_mapCharFmt_addValInt32(vapConfigMap, "tx_queue_data3_acm", 0);
+         swl_mapCharFmt_addValInt32(vapConfigMap, "tx_queue_data3_noack", 0);
+ 
+-        /* SCS/MSCS and group management cipher */
+-        swl_mapCharFmt_addValInt32(vapConfigMap, "enable_scs", 1);
+-        swl_mapCharFmt_addValInt32(vapConfigMap, "enable_mscs", 1);
++        /* QoS management capabilities and group management cipher */
++        swl_mapCharFmt_addValInt32(vapConfigMap, "enable_scs", pAP->qosMgmt.SCSEnable ? 1 : 0);
++        swl_mapCharFmt_addValInt32(vapConfigMap, "deferred_scs", pAP->qosMgmt.SCSEnable ? 1 : 0);
++        swl_mapCharFmt_addValInt32(vapConfigMap, "enable_mscs", pAP->qosMgmt.MSCSEnable ? 1 : 0);
++        swl_mapCharFmt_addValInt32(vapConfigMap, "enable_dscp_policy_capa", 1);
+         swl_mapChar_add(vapConfigMap, "group_mgmt_cipher", "AES-128-CMAC");
+     }
+ 
+@@ -2196,9 +2200,11 @@ static bool s_setVapCommonConfig(T_AccessPoint* pAP, swl_mapChar_t* vapConfigMap
+         /* FILS Discovery for 6GHz passive scan support (802.11ax mandatory) */
+         swl_mapCharFmt_addValInt32(vapConfigMap, "fils_discovery_max_interval", 20);
+ 
+-        /* SCS/MSCS and group management cipher */
+-        swl_mapCharFmt_addValInt32(vapConfigMap, "enable_scs", 1);
+-        swl_mapCharFmt_addValInt32(vapConfigMap, "enable_mscs", 1);
++        /* QoS management capabilities and group management cipher */
++        swl_mapCharFmt_addValInt32(vapConfigMap, "enable_scs", pAP->qosMgmt.SCSEnable ? 1 : 0);
++        swl_mapCharFmt_addValInt32(vapConfigMap, "deferred_scs", pAP->qosMgmt.SCSEnable ? 1 : 0);
++        swl_mapCharFmt_addValInt32(vapConfigMap, "enable_mscs", pAP->qosMgmt.MSCSEnable ? 1 : 0);
++        swl_mapCharFmt_addValInt32(vapConfigMap, "enable_dscp_policy_capa", 1);
+         swl_mapChar_add(vapConfigMap, "group_mgmt_cipher", "AES-128-CMAC");
+     }
+ 
+diff --git a/src/nl80211/wld_nl80211_debug.c b/src/nl80211/wld_nl80211_debug.c
+index 2302729..50bc1cc 100644
+--- a/src/nl80211/wld_nl80211_debug.c
++++ b/src/nl80211/wld_nl80211_debug.c
+@@ -159,6 +159,14 @@ swl_rc_ne wld_nl80211_dumpWiphyInfo(wld_nl80211_wiphyInfo_t* pWiphyInfo, amxc_va
+     amxc_var_add_key(bool, pMap, "suppEMLMR[AP]", pWiphyInfo->extCapas.emlmrSupport[WLD_WIPHY_IFTYPE_AP]);
+     amxc_var_add_key(bool, pMap, "suppEMLSR[STA]", pWiphyInfo->extCapas.emlsrSupport[WLD_WIPHY_IFTYPE_STATION]);
+     amxc_var_add_key(bool, pMap, "suppEMLMR[STA]", pWiphyInfo->extCapas.emlmrSupport[WLD_WIPHY_IFTYPE_STATION]);
++    amxc_var_add_key(bool, pMap, "suppMSCS[AP]", pWiphyInfo->extCapas.mscsSupport[WLD_WIPHY_IFTYPE_AP]);
++    amxc_var_add_key(bool, pMap, "suppSCS[AP]", pWiphyInfo->extCapas.scsSupport[WLD_WIPHY_IFTYPE_AP]);
++    amxc_var_add_key(bool, pMap, "suppQoSMap[AP]", pWiphyInfo->extCapas.qosMapSupport[WLD_WIPHY_IFTYPE_AP] || pWiphyInfo->suppCmds.WMMCapability);
++    amxc_var_add_key(bool, pMap, "suppQoSMgmtCmd", pWiphyInfo->suppCmds.qosMgmt);
++    amxc_var_add_key(bool, pMap, "suppDSCPPolicy",
++                     (pWiphyInfo->suppCmds.mgmtFrameTx && pWiphyInfo->suppCmds.registerFrame) ||
++                     pWiphyInfo->suppCmds.qosMgmt);
++    amxc_var_add_key(bool, pMap, "suppSCSTrafficDescription[AP]", pWiphyInfo->extCapas.scsTrafficDescriptionSupport[WLD_WIPHY_IFTYPE_AP]);
+ 
+     amxc_var_t* cipherSuitesList = amxc_var_add_key(amxc_llist_t, pMap, "suppCiphers", NULL);
+ 
+@@ -313,4 +321,3 @@ swl_rc_ne wld_nl80211_dumpAllStationInfo(wld_nl80211_stationInfo_t* pAllStationI
+     amxc_var_clean(&localVar);
+     return SWL_RC_OK;
+ }
+-
+diff --git a/src/nl80211/wld_nl80211_parser.c b/src/nl80211/wld_nl80211_parser.c
+index 23aef15..6ba7244 100644
+--- a/src/nl80211/wld_nl80211_parser.c
++++ b/src/nl80211/wld_nl80211_parser.c
+@@ -785,18 +785,40 @@ static void s_parseEhtCapMcsSet(const struct nlattr* tbIfType, wld_nl80211_bandD
+     pBand->nSSMax = SWL_MAX(pBand->nSSMax, pMcsStd->numberOfSpatialStream);
+ }
+ 
++static void s_parseEhtCapMac(const struct nlattr* tbIfTypes, const struct nlattr* tbMac, wld_nl80211_bandDef_t* pBand) {
++    ASSERTS_NOT_NULL(tbIfTypes, , ME, "NULL");
++    ASSERTS_NOT_NULL(pBand, , ME, "NULL");
++    if(tbMac == NULL) {
++        return;
++    }
++
++    uint8_t ehtCapMac[2] = {0};
++    NLA_GET_DATA(ehtCapMac, tbMac, sizeof(ehtCapMac));
++    struct nlattr* ift = NULL;
++    int remIft = 0;
++    nla_for_each_nested(ift, tbIfTypes, remIft) {
++        if(nla_type(ift) == NL80211_IFTYPE_AP) {
++            memcpy(pBand->ehtMacCapabilities[WLD_WIPHY_IFTYPE_AP], ehtCapMac, sizeof(ehtCapMac));
++        } else if(nla_type(ift) == NL80211_IFTYPE_STATION) {
++            memcpy(pBand->ehtMacCapabilities[WLD_WIPHY_IFTYPE_STATION], ehtCapMac, sizeof(ehtCapMac));
++        }
++    }
++}
++
+ static swl_rc_ne s_parseEhtAttrs(struct nlattr* tbBand[], wld_nl80211_bandDef_t* pBand) {
+     ASSERTS_NOT_NULL(tbBand, SWL_RC_INVALID_PARAM, ME, "NULL");
+     ASSERTS_NOT_NULL(pBand, SWL_RC_INVALID_PARAM, ME, "NULL");
+     ASSERTS_NOT_NULL(tbBand[NL80211_BAND_ATTR_IFTYPE_DATA], SWL_RC_OK, ME, "no iftype data");
+     struct nlattr* nlIfType = NULL;
+     int rem = 0;
+-    struct nlattr* tbIfType[NL80211_BAND_IFTYPE_ATTR_EHT_CAP_MCS_SET + 1] = {};
++    struct nlattr* tbIfType[SWL_MAX(NL80211_BAND_IFTYPE_ATTR_EHT_CAP_MCS_SET,
++                                    NL80211_BAND_IFTYPE_ATTR_EHT_CAP_MAC) + 1] = {};
+     nla_for_each_nested(nlIfType, tbBand[NL80211_BAND_ATTR_IFTYPE_DATA], rem) {
+-        nla_parse(tbIfType, NL80211_BAND_IFTYPE_ATTR_EHT_CAP_MCS_SET, nla_data(nlIfType), nla_len(nlIfType), NULL);
++        nla_parse(tbIfType, SWL_ARRAY_SIZE(tbIfType) - 1, nla_data(nlIfType), nla_len(nlIfType), NULL);
+         if(!s_isSupportedNlIfType(tbIfType[NL80211_BAND_IFTYPE_ATTR_IFTYPES])) {
+             continue;
+         }
++        s_parseEhtCapMac(tbIfType[NL80211_BAND_IFTYPE_ATTR_IFTYPES], tbIfType[NL80211_BAND_IFTYPE_ATTR_EHT_CAP_MAC], pBand);
+         s_parseEhtCapPhy(tbIfType[NL80211_BAND_IFTYPE_ATTR_EHT_CAP_PHY], pBand);
+         s_parseEhtCapMcsSet(tbIfType[NL80211_BAND_IFTYPE_ATTR_EHT_CAP_MCS_SET], pBand);
+     }
+@@ -1105,6 +1127,21 @@ static swl_rc_ne s_parseIfTypeExtCapa(struct nlattr* tb[], wld_nl80211_wiphyInfo
+             }
+         }
+         ASSERTS_NOT_NULL(ifType, SWL_RC_ERROR, ME, "IfType not found");
++        if(tbCapa[NL80211_ATTR_EXT_CAPA] != NULL) {
++            const uint8_t* extCapa = nla_data(tbCapa[NL80211_ATTR_EXT_CAPA]);
++            uint32_t extCapaLen = nla_len(tbCapa[NL80211_ATTR_EXT_CAPA]);
++            uint8_t extCapa4 = (extCapaLen > 4) ? extCapa[4] : 0;
++            uint8_t extCapa6 = (extCapaLen > 6) ? extCapa[6] : 0;
++            uint8_t extCapa10 = (extCapaLen > 10) ? extCapa[10] : 0;
++            pWiphy->extCapas.qosMapSupport[*ifType] = (extCapaLen > 4) && ((extCapa4 & 0x01) != 0);
++            pWiphy->extCapas.scsSupport[*ifType] = (extCapaLen > 6) && ((extCapa6 & 0x40) != 0);
++            pWiphy->extCapas.mscsSupport[*ifType] = (extCapaLen > 10) && ((extCapa10 & 0x08) != 0);
++            if((*ifType == WLD_WIPHY_IFTYPE_AP) && pWiphy->extCapas.mscsSupport[*ifType]) {
++                pWiphy->extCapas.scsSupport[*ifType] = true;
++                pWiphy->suppCmds.qosMgmt = true;
++            }
++        }
++
+         // For MLO, NL80211_ATTR_EML_CAPABILITY and NL80211_ATTR_MLD_CAPA_AND_OPS are present.
+         if((tbCapa[NL80211_ATTR_EML_CAPABILITY] != NULL) && (tbCapa[NL80211_ATTR_MLD_CAPA_AND_OPS] != NULL)) {
+             pWiphy->extCapas.mloSupport[*ifType] = true;
+@@ -1133,7 +1170,10 @@ static swl_rc_ne s_parseIfTypeExtCapa(struct nlattr* tb[], wld_nl80211_wiphyInfo
+ static swl_rc_ne s_parseSuppCmds(struct nlattr* tb[], wld_nl80211_wiphyInfo_t* pWiphy) {
+     ASSERTS_NOT_NULL(tb, SWL_RC_INVALID_PARAM, ME, "NULL");
+     ASSERTS_NOT_NULL(pWiphy, SWL_RC_INVALID_PARAM, ME, "NULL");
+-    ASSERTS_NOT_NULL(tb[NL80211_ATTR_SUPPORTED_COMMANDS], SWL_RC_OK, ME, "No cmds to parse");
++    if(tb[NL80211_ATTR_SUPPORTED_COMMANDS] == NULL) {
++        return SWL_RC_OK;
++    }
++    pWiphy->suppCmds.supportedCommandsSeen = true;
+     struct nlattr* nlCmd;
+     int remCmd;
+     nla_for_each_nested(nlCmd, tb[NL80211_ATTR_SUPPORTED_COMMANDS], remCmd) {
+@@ -1149,6 +1189,12 @@ static swl_rc_ne s_parseSuppCmds(struct nlattr* tb[], wld_nl80211_wiphyInfo_t* p
+             pWiphy->suppCmds.survey = true;
+         } else if(nl80211Cmd == NL80211_CMD_SET_QOS_MAP) {
+             pWiphy->suppCmds.WMMCapability = true;
++        } else if(nl80211Cmd == NL80211_CMD_FRAME) {
++            pWiphy->suppCmds.mgmtFrameTx = true;
++        } else if(nl80211Cmd == NL80211_CMD_REGISTER_FRAME) {
++            pWiphy->suppCmds.registerFrame = true;
++        } else if(nl80211Cmd == NL80211_CMD_QOS_MGMT) {
++            pWiphy->suppCmds.qosMgmt = true;
+         } else if(nl80211Cmd == NL80211_CMD_REMAIN_ON_CHANNEL) {
+             pWiphy->suppCmds.remainOnChannel = true;
+         }
+@@ -1870,4 +1916,3 @@ swl_rc_ne wld_nl80211_parseRegChangeInfo(struct nlattr* tb[], wld_nl80211_regCha
+     pRegChangeInfo->selfManaged = tb[NL80211_ATTR_WIPHY_SELF_MANAGED_REG];
+     return SWL_RC_OK;
+ }
+-
+diff --git a/src/nl80211/wld_wpaCtrl_events.c b/src/nl80211/wld_wpaCtrl_events.c
+index 8276f33..7cb8f07 100644
+--- a/src/nl80211/wld_wpaCtrl_events.c
++++ b/src/nl80211/wld_wpaCtrl_events.c
+@@ -1038,6 +1038,11 @@ static void s_beaconResponseEvt(wld_wpaCtrlInterface_t* pInterface, char* event,
+     CALL_INTF(pInterface, fBeaconResponseCb, &station, &rrmBeaconResponse);
+ }
+ 
++static void s_scsEvt(wld_wpaCtrlInterface_t* pInterface, char* event, char* params) {
++    SAH_TRACEZ_INFO(ME, "%s: pwhm received wpaCtrlEvent: %s %s",
++                    pInterface->name, event, params ? params : "");
++}
++
+ SWL_TABLE(sWpaCtrlEvents,
+           ARR(char* evtName; void* evtParser; ),
+           ARR(swl_type_charPtr, swl_type_voidPtr),
+@@ -1061,6 +1066,8 @@ SWL_TABLE(sWpaCtrlEvents,
+               {"CTRL-EVENT-SAE-UNKNOWN-PASSWORD-IDENTIFIER", &s_apStationAssocFailure},
+               {"BSS-TM-RESP", &s_btmResponse},
+               {"CTRL-EVENT-CONNECTION-FAIL", &s_connFailEvent},
++              {"CTRL-EVENT-SCS-REQUEST-NOTIFY", &s_scsEvt},
++              {"CTRL-EVENT-SCS-STATUS-NOTIFY", &s_scsEvt},
+               {"CTRL-EVENT-STARTED-CHANNEL-SWITCH", &s_chanSwitchStartedEvtCb},
+               {"CTRL-EVENT-CHANNEL-SWITCH", &s_chanSwitchEvtCb},
+               {"CTRL-EVENT-STARTED-LINK-CHANNEL-SWITCH", &s_bStaMloLinkChanSwitchStartedEvtCb},
+diff --git a/src/wld_accesspoint.c b/src/wld_accesspoint.c
+index 39d3a46..0fcff5d 100644
+--- a/src/wld_accesspoint.c
++++ b/src/wld_accesspoint.c
+@@ -93,6 +93,7 @@
+ #include "Features/wld_persist.h"
+ #include "wld_extMod.h"
+ #include "wld_wpaCtrl_api.h"
++#include "wld_hostapd_cfgManager.h"
+ #include "wld_hostapd_cfgFile.h"
+ 
+ #define ME "ap"
+@@ -261,6 +262,8 @@ static void s_setDefaults(T_AccessPoint* pAP, T_Radio* pRad, const char* vapName
+     /* In case we've support for them, enable it by default. */
+     pAP->UAPSDEnable = (pAP->UAPSDCapability) ? 1 : 0;
+     pAP->WMMEnable = (pAP->WMMCapability) ? 1 : 0;
++    pAP->qosMgmt.SCSEnable = true;
++    pAP->qosMgmt.MSCSEnable = true;
+     pAP->WPS_ConfigMethodsSupported = (M_WPS_CFG_MTHD_LABEL | M_WPS_CFG_MTHD_DISPLAY_ALL | M_WPS_CFG_MTHD_PBC_ALL | M_WPS_CFG_MTHD_PIN);
+     pAP->WPS_ConfigMethodsEnabled = (M_WPS_CFG_MTHD_PBC | M_WPS_CFG_MTHD_PIN);
+     pAP->WPS_ApSetupLocked = FALSE;
+@@ -884,6 +887,57 @@ static const char* s_getModeEnabledStr(const T_AccessPoint* pAP) {
+     return swl_security_apModeToString(pAP->secModeEnabled, SWL_SECURITY_APMODEFMT_LEGACY);
+ }
+ 
++static bool s_hostapdCfgParamToBool(const char* value) {
++    return (swl_str_matches(value, "1") ||
++            swl_str_matches(value, "true") ||
++            swl_str_matches(value, "TRUE") ||
++            swl_str_matches(value, "on") ||
++            swl_str_matches(value, "ON"));
++}
++
++static const char* s_getHostapdCfgParamForAp(wld_hostapd_config_t* config, T_AccessPoint* pAP, const char* key) {
++    ASSERTS_NOT_NULL(config, NULL, ME, "NULL");
++    ASSERTS_NOT_NULL(pAP, NULL, ME, "NULL");
++    ASSERTS_STR(key, NULL, ME, "empty key");
++
++    const char* value = NULL;
++    if((pAP->pSSID != NULL) && !swl_mac_binIsNull((swl_macBin_t*) pAP->pSSID->BSSID)) {
++        value = wld_hostapd_getConfigParamByBssidValStr(config, (swl_macBin_t*) pAP->pSSID->BSSID, key);
++    }
++    if(swl_str_len(value) == 0) {
++        value = wld_hostapd_getConfigParamValStr(config, NULL, key);
++    }
++    return value;
++}
++
++static void s_initQosMgmtFromHostapdConfig(T_AccessPoint* pAP) {
++    ASSERTS_NOT_NULL(pAP, , ME, "NULL");
++    ASSERTS_FALSE(pAP->qosMgmt.hostapdCfgSynced, , ME, "%s: QoSMgmt already synced from hostapd config", pAP->alias);
++    ASSERTS_NOT_NULL(pAP->pRadio, , ME, "%s: no radio", pAP->alias);
++    ASSERTS_NOT_NULL(pAP->pRadio->hostapd, , ME, "%s: no hostapd", pAP->alias);
++    ASSERTS_STR(pAP->pRadio->hostapd->cfgFile, , ME, "%s: no hostapd cfg file", pAP->alias);
++    ASSERTS_NOT_NULL(pAP->pSSID, , ME, "%s: no SSID", pAP->alias);
++
++    wld_hostapd_config_t* config = NULL;
++    bool ret = wld_hostapd_loadConfig(&config, pAP->pRadio->hostapd->cfgFile);
++    ASSERTS_TRUE(ret, , ME, "%s: failed to load hostapd config %s", pAP->alias, pAP->pRadio->hostapd->cfgFile);
++    pAP->qosMgmt.hostapdCfgSynced = true;
++
++    const char* scs = s_getHostapdCfgParamForAp(config, pAP, "enable_scs");
++    const char* mscs = s_getHostapdCfgParamForAp(config, pAP, "enable_mscs");
++    const char* dscpPolicy = s_getHostapdCfgParamForAp(config, pAP, "enable_dscp_policy_capa");
++    if(swl_str_len(scs) > 0) {
++        pAP->qosMgmt.SCSEnable = s_hostapdCfgParamToBool(scs);
++    }
++    if(swl_str_len(mscs) > 0) {
++        pAP->qosMgmt.MSCSEnable = s_hostapdCfgParamToBool(mscs);
++    }
++    if((swl_str_len(dscpPolicy) > 0) && s_hostapdCfgParamToBool(dscpPolicy)) {
++        pAP->pRadio->cap.dscpPolicySupported = true;
++    }
++    wld_hostapd_deleteConfig(config);
++}
++
+ void SyncData_AP2OBJ(amxd_object_t* object, T_AccessPoint* pAP, int set) {
+     char TBuf[256];
+     amxc_var_t variant;
+@@ -898,6 +952,8 @@ void SyncData_AP2OBJ(amxd_object_t* object, T_AccessPoint* pAP, int set) {
+     amxd_object_t* secObj = amxd_object_findf(object, "Security");
+     amxd_object_t* wpsObj = amxd_object_findf(object, "WPS");
+     if(set & SET) {
++        s_initQosMgmtFromHostapdConfig(pAP);
++
+         amxd_trans_t trans;
+         ASSERT_TRANSACTION_INIT(object, &trans, , ME, "%s : trans init failure", pAP->name);
+ 
+@@ -959,6 +1015,14 @@ void SyncData_AP2OBJ(amxd_object_t* object, T_AccessPoint* pAP, int set) {
+             amxd_trans_set_uint32_t(&trans, "MaxAssociatedDevices", pAP->MaxStations);
+         }
+ 
++        amxd_object_t* qosMgmtObj = amxd_object_findf(object, "QoSMgmt");
++        if(qosMgmtObj != NULL) {
++            amxd_trans_select_object(&trans, qosMgmtObj);
++            amxd_trans_set_bool(&trans, "SCSEnable", pAP->qosMgmt.SCSEnable);
++            amxd_trans_set_bool(&trans, "MSCSEnable", pAP->qosMgmt.MSCSEnable);
++            amxd_trans_select_object(&trans, object);
++        }
++
+         /** IEEE80211r part */
+ 
+         amxd_object_t* obj11r = amxd_object_findf(object, "IEEE80211r");
+diff --git a/src/wld_functionTable.c b/src/wld_functionTable.c
+index 35d27a2..acdfd1c 100644
+--- a/src/wld_functionTable.c
++++ b/src/wld_functionTable.c
+@@ -321,6 +321,8 @@ DEF_TRAP(T_AccessPoint, mfn_wvap_fsm_nodelay);
+ DEF_TRAP_int_int(T_AccessPoint, mfn_wvap_enable);
+ DEF_TRAP_int_int(T_AccessPoint, mfn_wvap_enable_wmm);
+ DEF_TRAP_int_int(T_AccessPoint, mfn_wvap_enable_uapsd);
++DEF_TRAP_int(T_AccessPoint, mfn_wvap_enable_scs);
++DEF_TRAP_int(T_AccessPoint, mfn_wvap_enable_mscs);
+ DEF_TRAP_char_int_int(T_AccessPoint, mfn_wvap_ssid);
+ DEF_TRAP_int(T_AccessPoint, mfn_wvap_sync);
+ DEF_TRAP_int(T_AccessPoint, mfn_wvap_sec_sync);
+@@ -727,6 +729,9 @@ static swl_rc_ne TRAP_mfn_wvap_updateConfigMap(T_AccessPoint* pAP _UNUSED, swl_m
+     return SWL_RC_OK;
+ }
+ 
++static swl_rc_ne TRAP_mfn_wvap_set_qosmgmt_descriptor(T_AccessPoint* pAP _UNUSED, uint32_t qmid _UNUSED, const char* descriptor _UNUSED, swl_macBin_t client_mac _UNUSED) {
++    return SWL_RC_NOT_IMPLEMENTED;
++}
+ static swl_rc_ne TRAP_mfn_wendpoint_updateConfigMaps(T_EndPoint* pEP _UNUSED, wld_wpaSupp_config_t* configMap _UNUSED) {
+     return SWL_RC_OK;
+ }
+@@ -864,6 +869,8 @@ void wld_functionTable_init(vendor_t* vendor, T_CWLD_FUNC_TABLE* fta) {
+     FTA_ASSIGN(mfn_wvap_kick_sta_reason);
+     FTA_ASSIGN(mfn_wvap_disassoc_sta_reason);
+     FTA_ASSIGN(mfn_wvap_ttlm_config);
++    FTA_ASSIGN(mfn_wvap_enable_scs);
++    FTA_ASSIGN(mfn_wvap_enable_mscs);
+     FTA_ASSIGN(mfn_wvap_clean_sta);
+     FTA_ASSIGN(mfn_wvap_multiap_update_type);
+     FTA_ASSIGN(mfn_wvap_multiap_update_profile);
+@@ -895,6 +902,7 @@ void wld_functionTable_init(vendor_t* vendor, T_CWLD_FUNC_TABLE* fta) {
+     FTA_ASSIGN(mfn_on_bridge_state_change);
+     FTA_ASSIGN(mfn_wvap_update_assoc_dev);
+     FTA_ASSIGN(mfn_wvap_updateConfigMap);
++    FTA_ASSIGN(mfn_wvap_set_qosmgmt_descriptor);
+     FTA_ASSIGN(mfn_wrad_update_chaninfo);
+     FTA_ASSIGN(mfn_wrad_update_prob_req);
+     FTA_ASSIGN(mfn_wvap_updated_neighbour);
+@@ -926,4 +934,3 @@ void wld_functionTable_init(vendor_t* vendor, T_CWLD_FUNC_TABLE* fta) {
+ 
+     FTA_ASSIGN(mfn_wvdr_setDmnExecSettings);
+ }
+-
+diff --git a/src/wld_radio.c b/src/wld_radio.c
+index e88c395..24e1be5 100644
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -328,6 +328,22 @@ amxd_status_t _wld_rad_getSupportedFrequencyBands_prf(amxd_object_t* object,
+     return amxd_status_ok;
+ }
+ 
++amxd_status_t _wld_rad_getDscpSupport_prf(amxd_object_t* object,
++                                          amxd_param_t* param,
++                                          amxd_action_t reason,
++                                          const amxc_var_t* const args _UNUSED,
++                                          amxc_var_t* const retval,
++                                          void* priv _UNUSED) {
++    ASSERTS_NOT_NULL(param, amxd_status_unknown_error, ME, "NULL");
++    ASSERTS_EQUALS(reason, action_param_read, amxd_status_function_not_implemented, ME, "not impl");
++    T_Radio* pR = wld_rad_fromObj(object);
++    ASSERTS_NOT_NULL(pR, amxd_status_ok, ME, "no radio mapped");
++
++    bool dscpSupport = pR->cap.dscpPolicySupported || pR->cap.mscsSupported;
++    amxc_var_set(bool, retval, dscpSupport);
++    return amxd_status_ok;
++}
++
+ amxd_status_t _wld_rad_validateChannel_pvf(amxd_object_t* object _UNUSED,
+                                            amxd_param_t* param,
+                                            amxd_action_t reason _UNUSED,
+@@ -7671,4 +7687,3 @@ amxd_status_t _getEHTOperations(amxd_object_t* object,
+     SAH_TRACEZ_OUT(ME);
+     return amxd_status_ok;
+ }
+-
