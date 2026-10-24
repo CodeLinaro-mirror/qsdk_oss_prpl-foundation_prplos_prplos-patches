@@ -1,19 +1,28 @@
 From: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
 Subject: [PATCH] pwhm: consolidate MLO link reconfiguration and cleanup
 
-This preserves link-scoped MLO reconfiguration, primary-link promotion,
+Preserve link-scoped MLO reconfiguration, primary-link promotion,
 enabled-link restoration, empty-MLD cleanup, and logical hostapd anchor
-removal while avoiding a fragmented patch series.
+removal. Exclude a departing link from primary election and retain the
+remaining links in their original MLD.
 
-The changes remain scoped to the affected MLD and do not require restarting
-other MLDs sharing the same radio.
+When a moved primary owns the runtime anchor name, serialize removal of
+only that runtime MLD using verified interface names and link IDs. Persist
+the retained MLD owner across independent radio FSM callbacks, restore its
+replacement primary first, and queue siblings only after that add succeeds.
+Save all retained links' configured state before selecting the primary.
+
+Keep remove/add retries local to the affected MLD and avoid radio or shared
+hostapd restarts for these operations. Defer MBSSID transmitter removal when
+unrelated MLDs depend on it. Radio-wide operations and genuine daemon
+failure recovery retain their existing scope.
 
 Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
 ---
 
 --- a/include/wld/wld_mld.h
 +++ b/include/wld/wld_mld.h
-@@ -178,6 +178,9 @@
+@@ -185,10 +185,15 @@
      amxc_llist_t links;                                                    /* List of affiliated links belonging to this MLD */
      wld_mldGroup_t* pGroup;                                                /* Back pointer to parent group */
      wld_mldLink_t* pPrimLink;                                              /* Primary link for this MLD */
@@ -23,9 +32,92 @@ Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
      wld_mldCfg_t Cfg;
      void* pExtCfg;                                                         /* extended mld configuration: defined per mld type */
      wld_tidLinkMapConfig_t tidLinkMapConfig;                               /**< TID-to-Link mapping configuration */
+     wld_tidLinkMap_t tidLinkMapList[TID_LINK_MAP_DIRECTION_MAX][TID_NUM];  /**< Link maps per direction and TID [direction][tid] */
++    bool hostapdRebuildPending;                                            /* Serialize migration of this MLD's runtime anchor */
++    T_SSID* pPendingMovedLink;                                             /* Link moved out while runtime anchor is being migrated */
+ };
+ 
+ /**
 --- a/src/Plugin/wifiGen_fsm.c
 +++ b/src/Plugin/wifiGen_fsm.c
-@@ -574,6 +574,225 @@
+@@ -76,6 +76,7 @@
+ #include "wld/wld_wpaCtrlGSock.h"
+ #include "wld/wld_secDmn.h"
+ #include "wld/wld_bStaMld.h"
++#include "wld/Utils/wld_autoCommitMgr.h"
+ 
+ #include "wifiGen_fsm.h"
+ 
+@@ -462,6 +463,49 @@
+  * Using a counter (not a bool) handles multi-radio MLO re-adds correctly. */
+ static int s_pendingAcsReAddCount = 0;
+ 
++/* Removing an MBSSID transmitter also removes its non-transmitted BSSs in
++ * hostapd. Never use that path to recover an edit of an independent MLD. */
++static bool s_hasForeignMldOnRadio(T_AccessPoint* pAP, T_Radio* pRad) {
++    wld_mld_t* pMld = ((pAP->pSSID != NULL) && (pAP->pSSID->pMldLink != NULL)) ?
++        pAP->pSSID->pMldLink->pMld : NULL;
++    T_AccessPoint* pOther = NULL;
++    wld_rad_forEachAp(pOther, pRad) {
++        if((pOther == pAP) || !wld_wpaCtrlInterface_isReady(pOther->wpaCtrlInterface)) {
++            continue;
++        }
++        wld_mld_t* pOtherMld = ((pOther->pSSID != NULL) && (pOther->pSSID->pMldLink != NULL)) ?
++            pOther->pSSID->pMldLink->pMld : NULL;
++        if((pMld == NULL) || (pOtherMld != pMld)) {
++            return true;
++        }
++    }
++    return false;
++}
++
++static bool s_isUnsafeMbssidRemoval(T_AccessPoint* pAP, T_Radio* pRad) {
++    if(!wld_rad_hasMbssidAds(pRad) || !s_hasForeignMldOnRadio(pAP, pRad)) {
++        return false;
++    }
++    T_AccessPoint* pTxAP = wld_rad_hostapd_getRunMainVap(pRad);
++    return (pTxAP == NULL) || (pTxAP == pAP);
++}
++
++static bool s_hasForeignMldInDaemon(T_AccessPoint* pAP, T_Radio* pRad) {
++    wld_secDmnGrp_t* pGroup = wld_secDmn_getGrp(pRad->hostapd);
++    T_Radio* pOtherRad = NULL;
++    wld_for_eachRad(pOtherRad) {
++        if((pOtherRad != pRad) &&
++           ((pGroup == NULL) || (pOtherRad->hostapd == NULL) ||
++            (wld_secDmn_getGrp(pOtherRad->hostapd) != pGroup))) {
++            continue;
++        }
++        if(s_hasForeignMldOnRadio(pAP, pOtherRad)) {
++            return true;
++        }
++    }
++    return false;
++}
++
+ /**
+  * @brief schedule next conf applying fsm action after setting a dynamic param
+  * when no higher applying action (ie more global) is already scheduled
+@@ -475,6 +519,18 @@
+ static void s_schedNextAction(wld_secDmn_action_rc_ne action, T_AccessPoint* pAP, T_Radio* pRad) {
+     ASSERTS_NOT_NULL(pRad, , ME, "NULL");
+     wld_wpaCtrlInterface_t* pgIface = wld_secDmn_getGlobalCtrlIface(pRad->hostapd);
++
++    if((pAP != NULL) && (pAP->pSSID != NULL) &&
++       (pAP->pSSID->pMldLink != NULL) && wifiGen_hapd_isRunning(pRad) &&
++       s_isLinkRemoveSupported(pRad) && s_hasForeignMldInDaemon(pAP, pRad) &&
++       ((action == SECDMN_ACTION_OK_NEED_RESTART) ||
++        (action == SECDMN_ACTION_OK_NEED_RE_ADD) ||
++        (action == SECDMN_ACTION_OK_NEED_TOGGLE) ||
++        (action == SECDMN_ACTION_OK_NEED_SIGHUP) ||
++        (action == SECDMN_ACTION_OK_NEED_RELOAD))) {
++        SAH_TRACEZ_WARNING(ME, "%s: keep MLD apply action %d BSS scoped", pAP->alias, action);
++        action = SECDMN_ACTION_OK_NEED_RE_ADD_LINK;
++    }
+ 
+     /** read current running fsm action for AP and Radio */
+     int32_t radFsmBit = NO_ACTION_ID;
+@@ -574,6 +630,178 @@
      }
  }
  
@@ -50,53 +142,6 @@ Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
 +                return pAnchorSSID->AP_HOOK;
 +            }
 +        }
-+    }
-+
-+    wld_mldLink_t* pLink = NULL;
-+    wld_for_eachNeighMldLink(pLink, pSSID->pMldLink) {
-+        T_SSID* pLinkSSID = wld_mld_getLinkSsid(pLink);
-+        T_AccessPoint* pLinkAP = (pLinkSSID != NULL) ? pLinkSSID->AP_HOOK : NULL;
-+        if((pLinkAP == NULL) || (pLinkAP->wpaCtrlInterface == NULL) ||
-+           !wld_wpaCtrlInterface_isReady(pLinkAP->wpaCtrlInterface)) {
-+            continue;
-+        }
-+
-+        char runIface[128] = {0};
-+        if(!swl_rc_isOk(wld_ap_hostapd_getRunIface(pLinkAP, runIface, sizeof(runIface)))) {
-+            continue;
-+        }
-+
-+        T_SSID* pAnchorSSID = wld_ssid_getSsidByIfName(runIface);
-+        if((pAnchorSSID != NULL) && (pAnchorSSID->pMldLink == pSSID->pMldLink) &&
-+           (pAnchorSSID->AP_HOOK != NULL)) {
-+            return pAnchorSSID->AP_HOOK;
-+        }
-+    }
-+    return NULL;
-+}
-+
-+static T_AccessPoint* s_getRunningMloAnchorAp(T_AccessPoint* pAP) {
-+    ASSERTS_NOT_NULL(pAP, NULL, ME, "NULL pAP");
-+    T_SSID* pSSID = pAP->pSSID;
-+    if((pSSID == NULL) || (pSSID->pMldLink == NULL)) {
-+        return NULL;
-+    }
-+
-+    /* The running hostapd MLD name takes precedence over a WLD primary
-+     * link, which may now refer to a different physical radio. */
-+    T_AccessPoint* pRunningAnchorAP = s_findRunningMloAnchorAp(pAP);
-+    if(pRunningAnchorAP != NULL) {
-+        return pRunningAnchorAP;
-+    }
-+
-+    wld_mld_t* pMld = pSSID->pMldLink->pMld;
-+    if((pMld != NULL) && (pMld->pHostapdAnchorSSID == NULL)) {
-+        s_cacheMloAnchor(pSSID);
-+    }
-+    if((pMld != NULL) && (pMld->pHostapdAnchorSSID != NULL) &&
-+       (pMld->pHostapdAnchorSSID->pMldLink == pSSID->pMldLink) &&
-+       (pMld->pHostapdAnchorSSID->AP_HOOK != NULL)) {
-+        return pMld->pHostapdAnchorSSID->AP_HOOK;
 +    }
 +
 +    wld_mldLink_t* pLink = NULL;
@@ -251,10 +296,15 @@ Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
  static bool s_doEnableAp(T_AccessPoint* pAP, T_Radio* pRad) {
      ASSERTI_TRUE(pRad->enable, true, ME, "%s: radio disabled", pRad->Name);
      ASSERTI_TRUE(wifiGen_hapd_isAlive(pRad), true, ME, "%s: hostapd stopped", pRad->Name);
-@@ -581,15 +800,53 @@
+@@ -581,15 +809,58 @@
      ASSERT_NOT_NULL(pMainAPCur, true, ME, "%s: no main vap iface for rad %s", pAP->alias, pRad->Name);
      bool enable = wld_ap_isEnabledWithRef(pAP);
      SAH_TRACEZ_INFO(ME, "%s: enable vap %d", pAP->alias, enable);
++    if(!enable && s_isUnsafeMbssidRemoval(pAP, pRad)) {
++        SAH_TRACEZ_ERROR(ME, "%s: refuse disable of MBSSID transmitter used by other MLDs", pAP->alias);
++        pRad->fsmRad.timeout_msec = 1000;
++        return false;
++    }
 +    if(!enable && s_isLinkRemoveSupported(pRad) &&
 +       (pAP->pSSID != NULL) && (pAP->pSSID->pMldLink != NULL) &&
 +       (wld_mld_countNeighLinks(pAP->pSSID->pMldLink) > 1)) {
@@ -307,87 +357,230 @@ Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
              return true;
          }
  
-@@ -710,11 +967,20 @@
+@@ -602,7 +873,8 @@
+             }
+             return true;
+         } else if(!enable) {
+-            if(wld_rad_hasMbssidAds(pRad) && (pAP != pMainAPCur)) {
++            if(wld_rad_hasMbssidAds(pRad) && (pAP != pMainAPCur) &&
++               !s_isLinkRemoveSupported(pRad) && !s_hasForeignMldOnRadio(pAP, pRad)) {
+                 SAH_TRACEZ_WARNING(ME, "%s: disabling non Tx BSS, scheduling re-add link of Tx bss %s", pAP->alias, pMainAPCur->alias);
+                 s_clearApAcAction(pRad, GEN_FSM_ENABLE_AP);
+                 s_schedNextAction(SECDMN_ACTION_OK_NEED_RE_ADD_LINK, pMainAPCur, pRad);
+@@ -665,9 +937,8 @@
+  *
+  * @return true to continue FSM processing
+  *
+- * @note If no radio configuration exists yet, schedules GEN_FSM_ADD_HOSTAPD instead
+- *       of attempting to add a BSS directly.
+- * @note On failure, schedules SECDMN_ACTION_OK_NEED_RE_ADD to retry adding the global config.
++ * @note Waits for global control and any pending MLD migration.
++ * @note On failure, retains only this ADD_LINK action for retry.
+  */
+ static bool s_doAddLink(T_AccessPoint* pAP, T_Radio* pRad) {
+     ASSERTS_NOT_NULL(pAP, true, ME, "NULL pAP");
+@@ -675,23 +946,32 @@
+     ASSERTS_TRUE(wifiGen_hapd_isRunning(pRad), true, ME, "%s: hostapd stopped", pRad->Name);
+     ASSERTW_FALSE(wld_secDmn_isGrpRestarting(pRad->hostapd), true, ME, "%s: hostapd group is restarting: skip adding bss conf", pRad->Name);
+ 
++    if(!wld_ap_isEnabledWithRef(pAP)) {
++        return true;
++    }
++    wld_mld_t* pMld = ((pAP->pSSID != NULL) && (pAP->pSSID->pMldLink != NULL)) ?
++        pAP->pSSID->pMldLink->pMld : NULL;
++    if(pMld != NULL) {
++        if(pMld->hostapdRebuildPending) {
++            pRad->fsmRad.timeout_msec = 500;
++            return false;
++        }
++        /* Radio FSMs run independently. Create a migrated MLD on its selected
++         * primary before allowing the remaining links to join it. */
++        T_SSID* pPrimSSID = wifiGen_mld_selectPrimLinkSSID(pAP->pSSID);
++        if(pMld->hostapdRemoved && (pPrimSSID != NULL) &&
++           (pPrimSSID != pAP->pSSID) && (pPrimSSID->AP_HOOK != NULL)) {
++            pRad->fsmRad.timeout_msec = 100;
++            return false;
++        }
++    }
++
+     if(!wld_secDmn_hasReadyGlobalCtrlIface(pRad->hostapd)) {
+-        SAH_TRACEZ_WARNING(ME, "%s: link add can not be sent => need to restart", pAP->alias);
+-        s_schedNextAction(SECDMN_ACTION_OK_NEED_RESTART, pAP, pRad);
+-    }
+-
+-    if(!wld_secDmn_hasAvailableCtrlIface(pRad->hostapd)) {
+-        if(wld_secDmn_hasReadyGlobalCtrlIface(pRad->hostapd)) {
+-            SAH_TRACEZ_WARNING(ME, "%s: per-BSS ctrl ifaces not yet available, using global iface for incremental add",
+-                               pAP->alias);
+-        } else {
+-            SAH_TRACEZ_WARNING(ME, "%s: no conf added yet, falling back to full radio config add", pAP->alias);
+-            s_setApplyAction(pRad->fsmRad.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_ADD_HOSTAPD, GEN_FSM_ADD_LINK);
+-            s_clearRadLowerApplyActions(pRad, GEN_FSM_ADD_HOSTAPD);
+-            s_clearRadDynConfActions(pRad);
+-            return true;
+-        }
+-    }
++        SAH_TRACEZ_WARNING(ME, "%s: wait for global control before BSS add", pAP->alias);
++        pRad->fsmRad.timeout_msec = 500;
++        return false;
++    }
++
+ 
+     /**
+      * Adding an MLO BSS will fail if the primary BSS is non-MLO.
+@@ -709,12 +989,47 @@
+     SAH_TRACEZ_INFO(ME, "%s: adding BSS config for AP %s", pRad->Name, pAP->alias);
      swl_rc_ne rc = wld_ap_hostapd_addBssConf(pAP);
      if(!swl_rc_isOk(rc)) {
-         SAH_TRACEZ_ERROR(ME, "%s: failed to add BSS config for AP %s, scheduling RE_ADD", pRad->Name, pAP->alias);
+-        SAH_TRACEZ_ERROR(ME, "%s: failed to add BSS config for AP %s, scheduling RE_ADD", pRad->Name, pAP->alias);
 -        s_schedNextAction(SECDMN_ACTION_OK_NEED_RE_ADD, pAP, pRad);
-+        if(s_hasMultiLinkApMld(pRad) && s_isLinkRemoveSupported(pRad)) {
-+            SAH_TRACEZ_WARNING(ME, "%s: MLO BSS add failed, keeping retry link scoped", pAP->alias);
-+            s_schedNextAction(SECDMN_ACTION_OK_NEED_RE_ADD_LINK, pAP, pRad);
-+        } else {
-+            s_schedNextAction(SECDMN_ACTION_OK_NEED_RE_ADD, pAP, pRad);
-+        }
-         return true;
+-        return true;
++        SAH_TRACEZ_ERROR(ME, "%s: BSS add failed; retain only this ADD_LINK action", pAP->alias);
++        pRad->fsmRad.timeout_msec = 1000;
++        return false;
      }
  
      SAH_TRACEZ_INFO(ME, "%s: BSS config for AP %s added successfully", pRad->Name, pAP->alias);
 +    if((pAP->pSSID != NULL) && (pAP->pSSID->pMldLink != NULL) &&
 +       (pAP->pSSID->pMldLink->pMld != NULL)) {
-+        pAP->pSSID->pMldLink->pMld->hostapdRemoved = false;
++        wld_mld_t* pAddedMld = pAP->pSSID->pMldLink->pMld;
++        bool wasHostapdRemoved = pAddedMld->hostapdRemoved;
++        pAddedMld->hostapdRemoved = false;
++        /* Keep the marker until the replacement primary is back. */
++        if(pAddedMld->pPendingMovedLink != NULL) {
++            T_SSID* pPrimSSID = wifiGen_mld_selectPrimLinkSSID(pAP->pSSID);
++            if(pPrimSSID == pAP->pSSID) {
++                pAddedMld->pPendingMovedLink = NULL;
++            }
++        }
++        /* The primary link is queued first so another radio cannot hold the
++         * FSM lock while waiting for it. Queue the remaining links only after
++         * the rebuilt MLD has an active runtime anchor. */
++        if(wasHostapdRemoved) {
++            wld_mldLink_t* pRestoreLink = NULL;
++            wld_for_eachNeighMldLink(pRestoreLink, wld_mld_firstLink(pAddedMld)) {
++                T_SSID* pRestoreSSID = wld_mld_getLinkSsid(pRestoreLink);
++                if((pRestoreSSID == NULL) || (pRestoreSSID == pAP->pSSID) ||
++                   (pRestoreSSID->AP_HOOK == NULL) ||
++                   !wld_mld_isLinkUsable(pRestoreLink) ||
++                   wld_mld_isLinkActive(pRestoreLink)) {
++                    continue;
++                }
++                setBitLongArray(pRestoreSSID->AP_HOOK->fsm.FSM_BitActionArray,
++                                FSM_BW, GEN_FSM_ADD_LINK);
++                setBitLongArray(pRestoreSSID->AP_HOOK->pRadio->fsmRad.FSM_BitActionArray,
++                                FSM_BW, GEN_FSM_MOD_HOSTAPD);
++                SAH_TRACEZ_WARNING(ME, "%s: queue retained MLD link %s after primary add",
++                                   pAP->alias, pRestoreSSID->AP_HOOK->alias);
++                wld_autoCommitMgr_notifyVapEdit(pRestoreSSID->AP_HOOK);
++            }
++        }
 +    }
      s_syncMultiApDepsOnBhAdd(pAP, pRad);
      wld_wpaCtrlMngr_checkAllIfaces(wld_secDmn_getWpaCtrlMgr(pRad->hostapd));
      setBitLongArray(pRad->fsmRad.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_SYNC_STATE);
-@@ -795,7 +1061,12 @@
+@@ -724,55 +1039,11 @@
+ }
+ 
+ /**
+- * @brief Removes the primary MLO link prior to removing the current non-primary link.
+- *
+- * During MLO reconfiguration triggered by a new MLD link selection, need to remove
+- * the primary link first. This ensures proper sequencing of link removal operations.
+- *
+- * @param pAP  Pointer to the current access point being removed
+- * @param pRad Pointer to the radio owning the access point
+- *
+- * @return true  if primary link removal was initiated; caller must wait for completion
+- *         false if primary link removal is not needed; proceed with current link removal
+- *
+- * @note Only applicable when LINK_REMOVE command is supported by hostapd
+- */
+-static bool s_tryRemovePrimLinkFirst(T_AccessPoint* pAP, T_Radio* pRad) {
+-    ASSERTS_NOT_NULL(pAP, false, ME, "NULL");
+-    ASSERTS_NOT_NULL(pRad, false, ME, "NULL");
+-    ASSERTI_TRUE(s_isLinkRemoveSupported(pRad), false, ME, "LINK_REMOVE is not supported");
+-
+-    char primIface[128] = {0};
+-    wld_ap_hostapd_getCfgInterface(pAP, primIface, sizeof(primIface));
+-    T_AccessPoint* pPrimAP = wld_vap_from_name(primIface);
+-    ASSERTI_FALSE((pPrimAP == NULL) || (pAP == pPrimAP), false,
+-                  ME, "No distinct primary AP found, nothing to do");
+-    ASSERTI_TRUE(isBitSetLongArray(pPrimAP->fsm.FSM_BitActionArray, FSM_BW, GEN_FSM_MOD_MLD), false,
+-                 ME, "%s: Primary link doesn't require any configuration", pPrimAP->alias);
+-
+-    int32_t curLinkId = NO_LINK_ID;
+-    wld_ap_hostapd_getMldLinkId(pPrimAP, &curLinkId);
+-    ASSERTI_TRUE(curLinkId >= 0, false, ME, "%s: Primary Link is already removed", pPrimAP->alias);
+-
+-    SAH_TRACEZ_INFO(ME, "%s: removing primary link '%s' before current link", pAP->alias, pPrimAP->alias);
+-    swl_rc_ne rc = wld_ap_hostapd_linkRemove(pPrimAP, pRad->mLReconfigurationCount);
+-    if(!swl_rc_isOk(rc)) {
+-        SAH_TRACEZ_WARNING(ME, "%s: primary link '%s' removal failed, proceeding with current link removal",
+-                           pAP->alias, pPrimAP->alias);
+-        return false;
+-    }
+-
+-    SAH_TRACEZ_INFO(ME, "%s: primary link '%s' removal command sent",
+-                    pAP->alias, pPrimAP->alias);
+-    return true;
+-}
+-
+-/**
+  * @brief Removes an MLO link from a running hostapd instance
+  *
+  * Performs graceful MLO link removal using the LINK_REMOVE command, which allows
+  * hostapd to advertise the ML Reconfiguration IE in beacon frames before the
+- * link disappears. Checks if primary link removal is needed first.
++ * link disappears. Only the requested link is removed.
+  *
+  * @param pAP  Pointer to the access point (MLO link) to remove
+  * @param pRad Pointer to the radio owning the access point
+@@ -780,23 +1051,17 @@
+  * @return true  when link removal completes successfully or scheduling is done
+  *         false when waiting for primary link removal to complete
+  *
+- * @note On failure, schedules SECDMN_ACTION_OK_NEED_RE_ADD for full re-add
++ * @note On failure, retains this REMOVE_LINK action for retry.
+  */
+ static bool s_removeMloLink(T_AccessPoint* pAP, T_Radio* pRad) {
+     ASSERTS_NOT_NULL(pAP, true, ME, "NULL");
+     ASSERTS_NOT_NULL(pRad, true, ME, "NULL");
+-    if(s_tryRemovePrimLinkFirst(pAP, pRad)) {
+-        pRad->fsmRad.timeout_msec = pRad->beaconPeriod * pRad->mLReconfigurationCount + 300;
+-        /** Waiting for primary link removal to complete */
+-        return false;
+-    }
+-
+     SAH_TRACEZ_INFO(ME, "%s: removing MLO link", pAP->alias);
      swl_rc_ne rc = wld_ap_hostapd_linkRemove(pAP, pRad->mLReconfigurationCount);
      if(!swl_rc_isOk(rc)) {
-         SAH_TRACEZ_ERROR(ME, "%s: MLO link remove failed, scheduling re-add", pAP->alias);
+-        SAH_TRACEZ_ERROR(ME, "%s: MLO link remove failed, scheduling re-add", pAP->alias);
 -        s_schedNextAction(SECDMN_ACTION_OK_NEED_RE_ADD, pAP, pRad);
-+        if(s_isLinkRemoveSupported(pRad)) {
-+            SAH_TRACEZ_WARNING(ME, "%s: MLO link remove failed, keeping recovery link scoped", pAP->alias);
-+            s_schedNextAction(SECDMN_ACTION_OK_NEED_RE_ADD_LINK, pAP, pRad);
-+        } else {
-+            s_schedNextAction(SECDMN_ACTION_OK_NEED_RE_ADD, pAP, pRad);
-+        }
-         return true;
+-        return true;
++        SAH_TRACEZ_ERROR(ME, "%s: MLO link remove failed; wait before retrying this link", pAP->alias);
++        pRad->fsmRad.timeout_msec = 1000;
++        return false;
      }
  
-@@ -875,6 +1146,78 @@
+     SAH_TRACEZ_INFO(ME, "%s: MLO link remove command sent successfully", pAP->alias);
+@@ -875,6 +1140,219 @@
      return true;
  }
  
 +static bool s_removeLastMloLink(T_AccessPoint* pAP, T_Radio* pRad) {
-+    ASSERTS_NOT_NULL(pAP, true, ME, "NULL pAP");
-+    ASSERTS_NOT_NULL(pRad, true, ME, "NULL pRad");
-+    T_SSID* pSSID = pAP->pSSID;
-+    ASSERTS_NOT_NULL(pSSID, true, ME, "NULL SSID");
-+    ASSERTS_NOT_NULL(pSSID->pMldLink, true, ME, "NULL MLD link");
-+
-+    wld_mld_t* pMld = pSSID->pMldLink->pMld;
-+    T_AccessPoint* pAnchorAP = s_getRunningMloAnchorAp(pAP);
-+    swl_rc_ne rc = SWL_RC_OK;
-+    if(pAnchorAP != NULL) {
-+        SAH_TRACEZ_INFO(ME, "%s: removing empty MLD anchor %s", pAP->alias, pAnchorAP->alias);
-+        rc = wld_ap_hostapd_removeBss(pAnchorAP);
-+        if(!swl_rc_isOk(rc)) {
-+            SAH_TRACEZ_ERROR(ME, "%s: failed to remove empty MLD anchor %s", pAP->alias, pAnchorAP->alias);
-+            s_schedNextAction(SECDMN_ACTION_OK_NEED_RE_ADD_LINK, pAP, pRad);
-+            return true;
-+        }
-+    } else if((pMld != NULL) && !swl_str_isEmpty(pMld->hostapdAnchorIface)) {
-+        wld_wpaCtrlInterface_t* pGlobal = wld_secDmn_getGlobalCtrlIface(pRad->hostapd);
-+        if((pGlobal == NULL) || !wld_wpaCtrlInterface_isReady(pGlobal)) {
-+            SAH_TRACEZ_ERROR(ME, "%s: global hostapd control interface is not ready for MLD anchor %s",
-+                             pAP->alias, pMld->hostapdAnchorIface);
-+            s_schedNextAction(SECDMN_ACTION_OK_NEED_RE_ADD_LINK, pAP, pRad);
-+            return true;
-+        }
-+        SAH_TRACEZ_WARNING(ME, "%s: removing cached logical MLD anchor %s",
-+                           pAP->alias, pMld->hostapdAnchorIface);
-+        rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pGlobal, "OK", "REMOVE %s",
-+                                                  pMld->hostapdAnchorIface);
-+        if(!swl_rc_isOk(rc)) {
-+            SAH_TRACEZ_ERROR(ME, "%s: failed to remove cached logical MLD anchor %s",
-+                             pAP->alias, pMld->hostapdAnchorIface);
-+            s_schedNextAction(SECDMN_ACTION_OK_NEED_RE_ADD_LINK, pAP, pRad);
-+            return true;
-+        }
-+    } else {
-+        SAH_TRACEZ_WARNING(ME, "%s: empty MLD anchor already absent", pAP->alias);
++    /* STATUS says there is one runtime link. Remove that exact BSS even if
++     * its AP has already joined a different WLD MLD. */
++    if(!swl_rc_isOk(wld_ap_hostapd_removeBss(pAP))) {
++        pRad->fsmRad.timeout_msec = 1000;
++        return false;
 +    }
-+
-+    s_resetMloRuntimeState(pSSID);
++    wld_wpaCtrlInterface_close(pAP->wpaCtrlInterface);
++    wld_ssid_setMLDLinkID(pAP->pSSID, NO_LINK_ID);
++    if((pAP->pSSID != NULL) && (pAP->pSSID->pMldLink != NULL) &&
++       (wld_mld_countNeighActiveLinks(pAP->pSSID->pMldLink) == 0)) {
++        s_resetMloRuntimeState(pAP->pSSID);
++    }
 +    pRad->fsmRad.timeout_msec = 500;
 +    return true;
 +}
@@ -399,33 +592,237 @@ Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
 + * standalone BSS directly so the next link-add can join the existing MLD.
 + */
 +static bool s_removeDetachedMloLink(T_AccessPoint* pAP, T_Radio* pRad) {
-+    ASSERTS_NOT_NULL(pAP, true, ME, "NULL pAP");
-+    ASSERTS_NOT_NULL(pRad, true, ME, "NULL pRad");
-+    if(!wld_secDmn_hasReadyGlobalCtrlIface(pRad->hostapd)) {
-+        SAH_TRACEZ_WARNING(ME, "%s: detached MLO link has no global ctrl iface, scheduling restart",
-+                           pAP->alias);
-+        s_schedNextAction(SECDMN_ACTION_OK_NEED_RESTART, pAP, pRad);
-+        return true;
++    return s_removeLastMloLink(pAP, pRad);
++}
++
++/* A hostapd MLD is keyed by its runtime interface name. When that name's
++ * owning AP moves to another WLD MLD, it cannot be reused until all BSSs of
++ * the old runtime MLD are removed. Serialize that migration here, instead of
++ * letting independent radio FSMs remove/add the same anchor concurrently.
++ * DONE means no migration; OK means removed; errors retain REMOVE_LINK. */
++static swl_rc_ne s_removeMovedMloAnchor(T_AccessPoint* pAP, T_Radio* pRad) {
++    struct {
++        T_AccessPoint* ap;
++        int32_t linkId;
++    } members[16];
++    size_t count = 0;
++    uint32_t expected = 0;
++    size_t targetCount = 0;
++    size_t sourceCount = 0;
++    wld_mld_t* pTarget = ((pAP->pSSID != NULL) && (pAP->pSSID->pMldLink != NULL)) ?
++        pAP->pSSID->pMldLink->pMld : NULL;
++    wld_mld_t* pSource = NULL;
++    wld_mld_t* pMarkedSource = NULL;
++    T_Radio* pOtherRad = NULL;
++    wld_for_eachRad(pOtherRad) {
++        T_AccessPoint* pOther = NULL;
++        wld_rad_forEachAp(pOther, pOtherRad) {
++            wld_mld_t* pOtherMld = ((pOther->pSSID != NULL) && (pOther->pSSID->pMldLink != NULL)) ?
++                pOther->pSSID->pMldLink->pMld : NULL;
++            if((pOtherMld != NULL) && (pOtherMld != pTarget) &&
++               pOtherMld->hostapdRebuildPending &&
++               swl_str_matches(pOtherMld->hostapdAnchorIface, pAP->alias)) {
++                if((pSource != NULL) && (pSource != pOtherMld)) {
++                    return SWL_RC_INVALID_STATE;
++                }
++                pSource = pOtherMld;
++            }
++            char runIface[128] = {0};
++            if(!wld_wpaCtrlInterface_isReady(pOther->wpaCtrlInterface) ||
++               !swl_rc_isOk(wld_ap_hostapd_getRunIface(pOther, runIface, sizeof(runIface))) ||
++               !swl_str_matches(runIface, pAP->alias)) {
++                continue;
++            }
++            /* The old WLD MLD is marked before registerLink() extracts the
++             * moving link. Use that marker as the authoritative owner of
++             * the links to restore; runtime membership is observed through
++             * separate radio callbacks and is therefore order-dependent. */
++            if((pOtherMld != NULL) &&
++               (pOtherMld->pPendingMovedLink != NULL) &&
++               ((pOtherMld->pPendingMovedLink->pMldLink == NULL) ||
++                (pOtherMld->pPendingMovedLink->pMldLink->pMld != pOtherMld))) {
++                if((pMarkedSource != NULL) && (pMarkedSource != pOtherMld)) {
++                    return SWL_RC_INVALID_STATE;
++                }
++                pMarkedSource = pOtherMld;
++            }
++            int32_t linkId = NO_LINK_ID;
++            uint32_t nLinks = 0;
++            if(!swl_rc_isOk(wld_ap_hostapd_getMldLinkId(pOther, &linkId)) || (linkId < 0)) {
++                continue;
++            }
++            if((count >= SWL_ARRAY_SIZE(members)) ||
++               !swl_rc_isOk(wld_ap_hostapd_getNumMldLinks(pOther, &nLinks))) {
++                return SWL_RC_INVALID_STATE;
++            }
++            expected = SWL_MAX(expected, nLinks);
++            members[count].ap = pOther;
++            members[count++].linkId = linkId;
++            if(pOtherMld == pTarget) {
++                targetCount++;
++            } else if(pOtherMld != NULL) {
++                sourceCount++;
++            }
++            if((pOther != pAP) && (pOtherMld != pTarget)) {
++                if((pOtherMld == NULL) || ((pSource != NULL) && (pSource != pOtherMld))) {
++                    return SWL_RC_INVALID_STATE;
++                }
++                pSource = pOtherMld;
++            }
++        }
++    }
++    if(pSource == NULL) {
++        return SWL_RC_DONE;
++    }
++    if(pMarkedSource != NULL) {
++        SAH_TRACEZ_WARNING(ME, "%s: select marked retained MLD unit %d for runtime rebuild",
++                           pAP->alias, pMarkedSource->unit);
++        pSource = pMarkedSource;
++    }
++    /* The runtime MLD can temporarily contain links from two WLD MLDs while
++     * an MLDUnit update is being applied.  Radio FSMs are independent, so
++     * the first callback may be for a link that remains in the larger WLD
++     * group.  Rebuild that larger group; otherwise recovery restores only
++     * the one link that moved out and leaves the retained links standalone. */
++    if((pMarkedSource == NULL) && (pTarget != NULL) && (targetCount > sourceCount)) {
++        SAH_TRACEZ_INFO(ME, "%s: select retained MLD unit %d for runtime rebuild (%zu links vs %zu)",
++                        pAP->alias, pTarget->unit, targetCount, sourceCount);
++        pSource = pTarget;
++    }
++    /* Verify the complete runtime membership before issuing any REMOVE. */
++    if(count != expected) {
++        SAH_TRACEZ_ERROR(ME, "%s: defer MLD migration: mapped %zu of %u runtime links",
++                         pAP->alias, count, expected);
++        return SWL_RC_INVALID_STATE;
++    }
++    wld_wpaCtrlInterface_t* pGlobal = wld_secDmn_getGlobalCtrlIface(pRad->hostapd);
++    if(!wld_wpaCtrlInterface_isReady(pGlobal)) {
++        return SWL_RC_INVALID_STATE;
++    }
++    for(size_t i = 0; i < count; i++) {
++        if(s_isUnsafeMbssidRemoval(members[i].ap, members[i].ap->pRadio)) {
++            SAH_TRACEZ_ERROR(ME, "%s: MLD migration requires MBSSID transmitter handover; preserve other MLDs",
++                             members[i].ap->alias);
++            return SWL_RC_INVALID_STATE;
++        }
++        for(size_t j = i + 1; j < count; j++) {
++            if(members[i].linkId == members[j].linkId) {
++                return SWL_RC_INVALID_STATE;
++            }
++        }
++    }
++    pSource->hostapdRebuildPending = true;
++    swl_str_copy(pSource->hostapdAnchorIface, sizeof(pSource->hostapdAnchorIface), pAP->alias);
++
++    /* Remove auxiliaries first, and the name-owning AP last. Numeric link
++     * IDs are read from hostapd, never from the already updated WLD model. */
++    for(size_t remaining = count; remaining > 0; remaining--) {
++        size_t selected = 0;
++        for(size_t i = 1; i < remaining; i++) {
++            if((members[selected].ap == pAP) ||
++               ((members[i].ap != pAP) && (members[i].linkId > members[selected].linkId))) {
++                selected = i;
++            }
++        }
++        T_AccessPoint* pMember = members[selected].ap;
++        SAH_TRACEZ_WARNING(ME, "%s: migrate only runtime MLD %s, remove link %d",
++                           pMember->alias, pAP->alias, members[selected].linkId);
++        swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pGlobal, "OK", "REMOVE %s %d",
++                                                         pAP->alias, members[selected].linkId);
++        if(!swl_rc_isOk(rc)) {
++            return rc;
++        }
++        wld_wpaCtrlInterface_close(pMember->wpaCtrlInterface);
++        wld_ssid_setMLDLinkID(pMember->pSSID, NO_LINK_ID);
++        members[selected] = members[remaining - 1];
 +    }
 +
-+    SAH_TRACEZ_INFO(ME, "%s: removing detached standalone MLO BSS before re-add", pAP->alias);
-+    swl_rc_ne rc = wld_ap_hostapd_removeBss(pAP);
-+    if(!swl_rc_isOk(rc)) {
-+        SAH_TRACEZ_ERROR(ME, "%s: detached standalone MLO BSS removal failed", pAP->alias);
-+        s_schedNextAction(SECDMN_ACTION_OK_NEED_RE_ADD_LINK, pAP, pRad);
-+        return true;
++    pSource->hostapdRebuildPending = false;
++    pSource->hostapdRemoved = true;
++    pSource->pHostapdAnchorSSID = NULL;
++    pSource->hostapdAnchorIface[0] = '\0';
++    T_AccessPoint* restore[16];
++    size_t nRestore = 0;
++    wld_mldLink_t* pLink = NULL;
++    wld_for_eachNeighMldLink(pLink, wld_mld_firstLink(pSource)) {
++        T_SSID* pSSID = wld_mld_getLinkSsid(pLink);
++        if((pSSID == NULL) || (pSSID->AP_HOOK == NULL) || !wld_mld_isLinkUsable(pLink)) {
++            continue;
++        }
++        if(nRestore < SWL_ARRAY_SIZE(restore)) {
++            restore[nRestore++] = pSSID->AP_HOOK;
++        }
 +    }
-+    pRad->fsmRad.timeout_msec = 500;
-+    return true;
++    /* Saving configured state may reorder the link list. */
++    for(size_t i = 0; i < nRestore; i++) {
++        T_AccessPoint* pMember = restore[i];
++        wld_mld_saveLinkConfigured(pMember->pSSID->pMldLink, true);
++    }
++    /* Queue only the elected replacement primary. The other radios must not
++     * acquire the FSM lock and then wait for this link; they are queued by
++     * s_doAddLink() after the primary has created the runtime MLD anchor. */
++    T_SSID* pRestorePrimSSID = (nRestore > 0) ?
++        wifiGen_mld_selectPrimLinkSSID(restore[0]->pSSID) : NULL;
++    if((pRestorePrimSSID == NULL) && (nRestore > 0)) {
++        pRestorePrimSSID = restore[0]->pSSID;
++    }
++    for(size_t i = 0; i < nRestore; i++) {
++        T_AccessPoint* pMember = restore[i];
++        if((pRestorePrimSSID != NULL) && (pMember->pSSID != pRestorePrimSSID)) {
++            continue;
++        }
++        setBitLongArray(pMember->fsm.FSM_BitActionArray, FSM_BW, GEN_FSM_ADD_LINK);
++        setBitLongArray(pMember->pRadio->fsmRad.FSM_BitActionArray, FSM_BW, GEN_FSM_MOD_HOSTAPD);
++        wld_autoCommitMgr_notifyVapEdit(pMember);
++    }
++    SAH_TRACEZ_WARNING(ME, "%s: queued primary %s for retained MLD unit %d (%zu remaining links deferred)",
++                       pAP->alias, (pRestorePrimSSID != NULL) ? pRestorePrimSSID->Name : "none",
++                       pSource->unit, (nRestore > 0) ? (nRestore - 1) : 0);
++    return SWL_RC_OK;
 +}
 +
  /**
   * @brief Removes an AP link or BSS from a running hostapd instance
   *
-@@ -901,9 +1217,30 @@
+@@ -895,16 +1373,59 @@
+     ASSERTS_TRUE(wifiGen_hapd_isRunning(pRad), true, ME, "%s: hostapd stopped", pRad->Name);
+     ASSERTW_FALSE(wld_secDmn_isGrpRestarting(pRad->hostapd), true, ME,
+                   "%s: hostapd group is restarting, skipping link remove", pAP->alias);
++    wld_mld_t* pMld = ((pAP->pSSID != NULL) && (pAP->pSSID->pMldLink != NULL)) ?
++        pAP->pSSID->pMldLink->pMld : NULL;
++    if((pMld != NULL) && pMld->hostapdRebuildPending &&
++       !swl_str_matches(pMld->hostapdAnchorIface, pAP->alias)) {
++        pRad->fsmRad.timeout_msec = 500;
++        return false;
++    }
++    swl_rc_ne migration = s_removeMovedMloAnchor(pAP, pRad);
++    if(migration != SWL_RC_DONE) {
++        pRad->fsmRad.timeout_msec = 500;
++        return swl_rc_isOk(migration);
++    }
+     ASSERTS_TRUE(wld_wpaCtrlInterface_isReady(pAP->wpaCtrlInterface), true, ME,
+                  "%s: wpaCtrl disconnected", pAP->alias);
+ 
++    if(s_isUnsafeMbssidRemoval(pAP, pRad)) {
++        SAH_TRACEZ_ERROR(ME, "%s: refuse removal of MBSSID transmitter used by other MLDs", pAP->alias);
++        pRad->fsmRad.timeout_msec = 1000;
++        return false;
++    }
++
      uint32_t nLinks = 0;
      bool isRemoveLinkSupported = s_isLinkRemoveSupported(pRad);
-     bool isMultiLink = (wld_ap_hostapd_getNumMldLinks(pAP, &nLinks) >= SWL_RC_OK) && (nLinks >= 2);
+-    bool isMultiLink = (wld_ap_hostapd_getNumMldLinks(pAP, &nLinks) >= SWL_RC_OK) && (nLinks >= 2);
+-
+-    /** nLinks >= 2 && LINK_REMOVE is supported */
++    if(!swl_rc_isOk(wld_ap_hostapd_getNumMldLinks(pAP, &nLinks))) {
++        pRad->fsmRad.timeout_msec = 500;
++        return false;
++    }
++    bool isMultiLink = (nLinks >= 2);
++    /* Runtime membership wins over the destination WLD group's link count. */
+     if(isRemoveLinkSupported && isMultiLink) {
+         return s_removeMloLink(pAP, pRad);
++    }
 +    bool isConfiguredMlo = (pAP->pSSID != NULL) &&
 +                          (pAP->pSSID->pMldLink != NULL) &&
 +                          (wld_mld_countNeighLinks(pAP->pSSID->pMldLink) > 1);
@@ -440,22 +837,67 @@ Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
 +       (wld_mld_countNeighActiveLinks(pAP->pSSID->pMldLink) <= 1)) {
 +        return s_removeLastMloLink(pAP, pRad);
 +    }
- 
-     /** nLinks >= 2 && LINK_REMOVE is supported */
++
++    /** nLinks >= 2 && LINK_REMOVE is supported */
 +    /* The configured MLD may still contain this link while hostapd has
 +     * already detached it as a standalone one-link BSS.  Do not issue
 +     * LINK_REMOVE in that state; hostapd accepts it only for a real MLD. */
 +    if(isRemoveLinkSupported && isConfiguredMlo && !isMultiLink) {
 +        return s_removeDetachedMloLink(pAP, pRad);
-+    }
-+
-     if(isRemoveLinkSupported && isMultiLink) {
-         return s_removeMloLink(pAP, pRad);
      }
  
+     /** nLinks >=2 && LINK_REMOVE is not supported */
+@@ -1542,11 +2063,47 @@
+     return true;
+ }
+ 
++static bool s_hasMovedMloAnchor(T_AccessPoint* pAP) {
++    wld_mld_t* pTarget = ((pAP->pSSID != NULL) && (pAP->pSSID->pMldLink != NULL)) ?
++        pAP->pSSID->pMldLink->pMld : NULL;
++    T_Radio* pRad = NULL;
++    wld_for_eachRad(pRad) {
++        T_AccessPoint* pOther = NULL;
++        wld_rad_forEachAp(pOther, pRad) {
++            if((pOther == pAP) || (pOther->pSSID == NULL) ||
++               (pOther->pSSID->pMldLink == NULL)) {
++                continue;
++            }
++            wld_mld_t* pMld = pOther->pSSID->pMldLink->pMld;
++            if((pMld == NULL) || (pMld == pTarget)) {
++                continue;
++            }
++            if(pMld->hostapdRebuildPending && swl_str_matches(pMld->hostapdAnchorIface, pAP->alias)) {
++                return true;
++            }
++            char runIface[128] = {0};
++            if(wld_wpaCtrlInterface_isReady(pOther->wpaCtrlInterface) &&
++               swl_rc_isOk(wld_ap_hostapd_getRunIface(pOther, runIface, sizeof(runIface))) &&
++               swl_str_matches(runIface, pAP->alias)) {
++                return true;
++            }
++        }
++    }
++    return false;
++}
++
+ static bool s_doSetApMld(T_AccessPoint* pAP, T_Radio* pRad) {
+     ASSERTS_NOT_NULL(pAP, true, ME, "NULL");
+     ASSERTI_TRUE(wifiGen_hapd_isRunning(pRad), true, ME, "%s: hostapd stopped", pRad->Name);
+     ASSERTI_TRUE(wld_secDmn_hasGlobalCtrlIface(pRad->hostapd), true, ME, "%s: hapd has no available global socket", pRad->Name);
+     ASSERTI_TRUE(wld_rad_isMloCapable(pRad), true, ME, "%s: not mlo capable", pRad->Name);
++    /* Numeric MLDUnit is not a hostapd configuration key. For a moving
++     * anchor, interface/mld_ap/address can all compare equal even though
++     * other runtime links now belong to a different WLD MLD. */
++    if(s_hasMovedMloAnchor(pAP)) {
++        s_schedNextAction(SECDMN_ACTION_OK_NEED_RE_ADD_LINK, pAP, pRad);
++        return true;
++    }
+     SAH_TRACEZ_INFO(ME, "%s: checking mld conf changes", pAP->alias);
+     wld_secDmn_action_rc_ne rc = wld_ap_hostapd_setMldParams(pAP);
+     ASSERT_FALSE(rc < SECDMN_ACTION_OK_DONE, true, ME, "%s: fail to set common params", pAP->alias);
 --- a/src/Plugin/wifiGen_mld.c
 +++ b/src/Plugin/wifiGen_mld.c
-@@ -254,12 +254,56 @@
+@@ -254,12 +254,57 @@
      return pPrimLink;
  }
  
@@ -479,8 +921,9 @@ Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
 +
 +        T_SSID* pAnchorSSID = wld_ssid_getSsidByIfName(runIface);
 +        if((pAnchorSSID != NULL) && (pAnchorSSID->pMldLink != NULL) &&
-+           (wld_mld_getPrimaryLink(pAnchorSSID->pMldLink) ==
-+            wld_mld_getPrimaryLink(pSSID->pMldLink))) {
++           (pSSID->pMldLink->pMld != NULL) &&
++           (pAnchorSSID->pMldLink->pMld == pSSID->pMldLink->pMld) &&
++           (pAnchorSSID->mldUnit == pSSID->pMldLink->pMld->unit)) {
 +            return pAnchorSSID;
 +        }
 +    }
@@ -512,9 +955,114 @@ Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
      if(wld_mld_isLinkConfigured(pCurPrimLink)) {
          SAH_TRACEZ_INFO(ME, "SSID %s has already a primLink %s",
                          pSSID->Name, wld_mld_getLinkName(pCurPrimLink));
+@@ -279,6 +324,55 @@
+     wld_ap_hostapd_getCfgInterface(pAP, primIface, sizeof(primIface));
+     T_SSID* pPrimSSID = wld_ssid_getSsidByIfName(primIface);
+     return (pPrimSSID ? pPrimSSID->pMldLink : NULL);
++}
++
++static bool s_isRemainingActiveLink(wld_mldLink_t* pLink, wld_mld_t* pMld) {
++    T_SSID* pSSID = wld_mld_getLinkSsid(pLink);
++    return (pSSID != NULL) && (pMld != NULL) &&
++           (pLink->pMld == pMld) && (pSSID->mldUnit == pMld->unit) &&
++           wld_mld_isLinkEnabled(pLink) && wld_mld_isLinkActive(pLink) &&
++           wld_mld_isLinkConfigured(pLink) &&
++           wld_mld_checkUsableLinkBasicConditions(pLink);
++}
++
++static void s_promotePrimaryLinkForReconfig(T_SSID* pSSID) {
++    ASSERTS_NOT_NULL(pSSID, , ME, "NULL");
++    ASSERTS_NOT_NULL(pSSID->pMldLink, , ME, "NULL");
++
++    wld_mldLink_t* pLink = pSSID->pMldLink;
++    wld_mld_t* pMld = pLink->pMld;
++    ASSERTS_NOT_NULL(pMld, , ME, "NULL MLD");
++    wld_mldLink_t* pCurPrimLink = wld_mld_getPrimaryLink(pLink);
++    /* MLDUnit is updated before the old group's UPDATE event. The moving
++     * link can still be enabled and active here; it is no longer a candidate
++     * for the old group's primary, regardless of its runtime link ID. */
++    if(s_isRemainingActiveLink(pCurPrimLink, pMld)) {
++        return;
++    }
++
++    wld_mldLink_t* pNewPrimLink = NULL;
++    wld_mldLink_t* pCandidate = NULL;
++    wld_for_eachNeighMldLink(pCandidate, pLink) {
++        if(!s_isRemainingActiveLink(pCandidate, pMld)) {
++            continue;
++        }
++        T_Radio* pRad = wld_mld_getLinkSsid(pCandidate)->RADIO_PARENT;
++        if((pRad == NULL) || (pRad->operatingFrequencyBand >= SWL_FREQ_BAND_EXT_NONE)) {
++            continue;
++        }
++        if((pNewPrimLink == NULL) ||
++           (pRad->operatingFrequencyBand <
++            wld_mld_getLinkSsid(pNewPrimLink)->RADIO_PARENT->operatingFrequencyBand)) {
++            pNewPrimLink = pCandidate;
++        }
++    }
++    if(pNewPrimLink == NULL) {
++        return;
++    }
++    if(swl_rc_isOk(wld_mld_setPrimaryLink(pNewPrimLink))) {
++        SAH_TRACEZ_INFO(ME, "SSID %s promotes MLD primary link to %s",
++                        pSSID->Name, wld_mld_getLinkName(pNewPrimLink));
++    }
+ }
+ 
+ /**
+@@ -293,6 +387,7 @@
+     ASSERTS_NOT_NULL(pSSID, SWL_RC_INVALID_PARAM, ME, "NULL");
+ 
+     wld_mldLink_t* pLink = pSSID->pMldLink;
++    s_promotePrimaryLinkForReconfig(pSSID);
+     T_AccessPoint* aNgAPs[wld_mld_countNeighLinks(pLink) + 1];
+     memset(aNgAPs, 0, sizeof(aNgAPs));
+     size_t nNgAPs = 0;
+@@ -313,7 +408,8 @@
+             bool needUpdateConf = false;
+             if(isConfigured != isUsable) {
+                 needUpdateConf = isConfigured;
+-            } else if(isConfigured && (pPrimLink == pLink)) {
++            } else if(isConfigured && (pPrimLink == pLink) &&
++                       (wld_mld_getPrimaryLink(pLink) == pLink)) {
+                 needUpdateConf = true;
+             } else {
+                 continue;
+--- a/src/nl80211/wld_hostapd_ap_api.c
++++ b/src/nl80211/wld_hostapd_ap_api.c
+@@ -1742,8 +1742,26 @@
+     wld_wpaCtrlInterface_t* pgIface = wld_secDmn_getGlobalCtrlIface(pRad->hostapd);
+     ASSERT_NOT_NULL(pgIface, SWL_RC_ERROR, ME, "%s: hostapd has no global iface ready", pRad->Name);
+ 
+-    SAH_TRACEZ_INFO(ME, "%s: removing bss config", pAP->alias);
+-    swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pgIface, "OK", "REMOVE %s", pAP->alias);
++    /* MLDUnit and the configured primary may already have changed. Address
++     * the running BSS by its actual interface and link ID, not its WLD alias.
++     * An unqualified REMOVE can remove a different link of the same MLD. */
++    char runIface[128] = {0};
++    int32_t linkId = NO_LINK_ID;
++    swl_rc_ne rc;
++    if(wld_wpaCtrlInterface_isReady(pAP->wpaCtrlInterface)) {
++        rc = wld_ap_hostapd_getRunIface(pAP, runIface, sizeof(runIface));
++        ASSERT_TRUE(swl_rc_isOk(rc) && !swl_str_isEmpty(runIface), SWL_RC_ERROR,
++                    ME, "%s: cannot identify runtime BSS for removal", pAP->alias);
++        rc = wld_ap_hostapd_getMldLinkId(pAP, &linkId);
++        ASSERT_TRUE(swl_rc_isOk(rc) || (pAP->pSSID == NULL) || (pAP->pSSID->pMldLink == NULL),
++                    SWL_RC_ERROR, ME, "%s: cannot identify runtime MLD link for removal", pAP->alias);
++    }
++    if(linkId >= 0) {
++        rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pgIface, "OK", "REMOVE %s %d", runIface, linkId);
++    } else {
++        rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pgIface, "OK", "REMOVE %s",
++                                               swl_str_isEmpty(runIface) ? pAP->alias : runIface);
++    }
+     ASSERT_TRUE(swl_rc_isOk(rc), rc, ME, "%s: fail to remove bss", pAP->alias);
+ 
+     return rc;
 --- a/src/nl80211/wld_hostapd_cfgFile.c
 +++ b/src/nl80211/wld_hostapd_cfgFile.c
-@@ -2439,6 +2439,12 @@
+@@ -2521,6 +2521,12 @@
          }
  
          wld_hostapd_bssConfig_t* bssConfig = NULL;
@@ -527,3 +1075,22 @@ Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
          if(!wld_hostapd_createBssConfig(&bssConfig, pRadConfigMap, pCurrVapParams)) {
              SAH_TRACEZ_ERROR(ME, "%s: Failed to create bss config", pAP->alias);
              continue;
+--- a/src/wld_ssid.c
++++ b/src/wld_ssid.c
+@@ -812,6 +812,16 @@
+     }
+     SAH_TRACEZ_INFO(ME, "%s: SET MLD_UNIT %d %d", pSSID->Name, pSSID->mldUnit, newMldUnit);
+ 
++    /* Keep the old MLD identified until all independent radio FSM callbacks
++     * have completed the runtime anchor migration. At this point the link
++     * still belongs to the old WLD MLD; registerLink() moves it below. */
++    wld_mld_t* pOldMld = ((pSSID->pMldLink != NULL) &&
++                          (pSSID->pMldLink->pMld != NULL)) ?
++        pSSID->pMldLink->pMld : NULL;
++    if((pOldMld != NULL) && (pSSID->mldUnit != newMldUnit)) {
++        pOldMld->pPendingMovedLink = pSSID;
++    }
++
+     pSSID->mldUnit = newMldUnit;
+     wld_mld_setLinkConfigured(pSSID->pMldLink, false);
+     if(pSSID->AP_HOOK != NULL) {
