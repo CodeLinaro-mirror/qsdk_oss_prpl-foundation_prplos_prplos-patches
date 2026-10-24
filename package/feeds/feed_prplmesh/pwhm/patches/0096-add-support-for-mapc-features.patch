@@ -1,0 +1,279 @@
+From 513e9fc08157b2baae2a933353b3e20038cef919 Mon Sep 17 00:00:00 2001
+From: Atchaya R <ratchaya@qti.qualcomm.com>
+Date: Sat, 24 Oct 2026 15:31:16 +0530
+Subject: [PATCH] pwhm: add support for all MAPC features
+
+Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
+---
+ odl/wld_accesspoint.odl | 110 +++++++++++++++++++++++++++++++++
+ src/wld_accesspoint.c   | 133 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 243 insertions(+)
+
+diff --git a/odl/wld_accesspoint.odl b/odl/wld_accesspoint.odl
+index 9b15bb4..b63666f 100644
+--- a/odl/wld_accesspoint.odl
++++ b/odl/wld_accesspoint.odl
+@@ -3185,6 +3185,116 @@ define rrm_t{
+ 			default false;
+ 		}
+ 
++		/**
++		 * MAPC (Multi-AP Coordination) sub-object.
++		 *
++		 * Provides configuration, commands, and events for MAPC operation
++		 * on this BSS (AccessPoint instance).
++		 */
++		object MAPC {
++
++			/** Fired when a MAPC-DISCOVERY-REPORT event is received on this BSS. */
++			event 'MAPCDiscoveryReport!';
++
++			/** Fired when a MAPC-NEGOTIATION-STATUS event is received on this BSS. */
++			event 'MAPCNegotiationStatus!';
++
++			/** Enable Coordinated Beamforming (BF) for this BSS. */
++			%persistent bool EnableCoordinatedBF {
++				default false;
++			}
++
++			/** Enable Coordinated Spatial Reuse (SR) for this BSS. */
++			%persistent bool EnableCoordinatedSR {
++				default false;
++			}
++
++			/** Enable Coordinated TDMA for this BSS. */
++			%persistent bool EnableCoordinatedTDMA {
++				default false;
++			}
++
++			/** Enable Coordinated Restricted Target Wake Time (RTWT) for this BSS. */
++			%persistent bool EnableCoordinatedRTWT {
++				default false;
++			}
++
++			/** Enable Coordinated Channel Reuse (CR) for this BSS. */
++			%persistent bool EnableCoordinatedCR {
++				default false;
++			}
++
++			/**
++			 * Trigger MAPC Negotiation Request with a peer BSS.
++			 * Sends: SET_MAPC_STA <peer_bssid> cotdma=<0|1>
++			 */
++			bool TriggerNegotiation(%in %mandatory string peer_bssid,
++			                        %in %mandatory bool cotdma);
++
++			/**
++			 * Set the MAPC allowed peer list.
++			 * Sends: SET_MAPC_VALID_COAP_LIST <MAC0> [MAC1 ... MACN]
++			 */
++			bool SetAllowedPeerList(%in %mandatory string peer_list);
++
++			/**
++			 * Configure CoTDMA policy for a peer from the CoTDMAPolicy table.
++			 * Sends: SET_MAPC_COTDMA_POLICY ...
++			 */
++			bool CoTDMAPolicyConfig(%in %mandatory uint32 policy_index);
++
++			/**
++			 * Configure CoTDMA End-to-End TXOP Sharing.
++			 * Sends: SET_MAPC_COTDMA_E2E_CONFIG <peer_bssid> enable=<0|1>
++			 */
++			bool SetCoTDMAE2EConfig(%in %mandatory string peer_bssid,
++			                        %in %mandatory bool enable);
++
++			/**
++			 * CoTDMAPolicy table.
++			 * Each entry describes the CoTDMA policy for one coordinated AP (peer).
++			 */
++			object CoTDMAPolicy[] {
++				counted with CoTDMAPolicyNumberOfEntries;
++
++				%persistent string CoordinatedBSSID;
++				%persistent string AccessCategory;
++				%persistent uint32 MaximumSharedTXOPDuration { default 0; }
++				%persistent uint32 MinimumSharedTXOPDuration { default 0; }
++				%persistent uint32 ServiceStartTime {
++					on action validate call check_range { min = 0, max = 32767 };
++					default 0;
++				}
++				%persistent uint32 ServiceInterval {
++					on action validate call check_range { min = 0, max = 32767 };
++					default 0;
++				}
++				%persistent uint32 Priority { default 0; }
++			}
++
++			/**
++			 * CoTDMATelemetry table.
++			 * Per-peer CoTDMA telemetry data. Read-only, populated from host events.
++			 */
++			object CoTDMATelemetry[] {
++				counted with CoTDMATelemetryNumberOfEntries;
++
++				string CoordinatedBSSID;
++
++				object AC[] {
++					counted with ACEntryNumberOfEntries;
++
++					string AccessCategory;
++					uint32 EstimatedQueueSize;
++					uint32 DelayBound;
++					uint32 Delay;
++					uint32 ExpectedSharedTXOPDuration;
++					uint32 ServiceStartTime;
++					uint32 ServiceInterval;
++				}
++			}
++		}
++
+ 	} /* object AccessPoint */
+     }
+ }
+diff --git a/src/wld_accesspoint.c b/src/wld_accesspoint.c
+index 39d3a46..d077d8a 100644
+--- a/src/wld_accesspoint.c
++++ b/src/wld_accesspoint.c
+@@ -4423,6 +4423,139 @@ amxd_status_t wld_ap_setDisassocLowAck_pwf(amxd_object_t* object,
+     return amxd_status_ok;
+ }
+ 
++/* Helper: get AP from MAPC sub-object (parent of MAPC is AccessPoint) */
++static T_AccessPoint* s_apFromMAPCObj(amxd_object_t* mapcObj) {
++    amxd_object_t* apObj = amxd_object_get_parent(mapcObj);
++    return wld_ap_fromObj(apObj);
++}
++
++/** _TriggerNegotiation: sends SET_MAPC_STA <peer_bssid> cotdma=<0|1> via wpa_ctrl.
++ *  Prerequisite: hostapd requires mapc_negotiation_mode=1 for manual triggers.
++ *  This function sets it automatically before sending SET_MAPC_STA. */
++amxd_status_t _TriggerNegotiation(amxd_object_t* object,
++                                   amxd_function_t* func _UNUSED,
++                                   amxc_var_t* args,
++                                   amxc_var_t* ret) {
++    T_AccessPoint* pAP = s_apFromMAPCObj(object);
++    ASSERTI_NOT_NULL(pAP, amxd_status_ok, ME, "No AP mapped");
++
++    const char* peer_bssid = amxc_var_constcast(cstring_t,
++        amxc_var_get_key(args, "peer_bssid", AMXC_VAR_FLAG_DEFAULT));
++    bool cotdma = amxc_var_dyncast(bool,
++        amxc_var_get_key(args, "cotdma", AMXC_VAR_FLAG_DEFAULT));
++
++    ASSERTI_NOT_NULL(peer_bssid, amxd_status_invalid_value, ME, "%s: missing peer_bssid", pAP->alias);
++    ASSERTI_TRUE(pAP->wpaCtrlInterface && wld_wpaCtrlInterface_isReady(pAP->wpaCtrlInterface),
++                 amxd_status_ok, ME, "%s: wpaCtrl not ready", pAP->alias);
++
++    /* hostapd requires mapc_negotiation_mode=1 before SET_MAPC_STA can be used */
++    wld_wpaCtrl_sendCmdCheckResponse(pAP->wpaCtrlInterface, "SET mapc_negotiation_mode 1", "OK");
++
++    /* hostapd requires mapc_cotdma_enable=1 when cotdma=1 */
++    if(cotdma) {
++        wld_wpaCtrl_sendCmdCheckResponse(pAP->wpaCtrlInterface, "SET mapc_cotdma_enable 1", "OK");
++    }
++
++    char cmd[256] = {0};
++    snprintf(cmd, sizeof(cmd), "SET_MAPC_STA %s cotdma=%d", peer_bssid, cotdma ? 1 : 0);
++    SAH_TRACEZ_INFO(ME, "%s: MAPC TriggerNegotiation: %s", pAP->alias, cmd);
++    bool ok = wld_wpaCtrl_sendCmdCheckResponse(pAP->wpaCtrlInterface, cmd, "OK");
++    amxc_var_set(bool, ret, ok);
++    return amxd_status_ok;
++}
++
++/** _SetAllowedPeerList: sends SET_MAPC_VALID_COAP_LIST <peer_list> via wpa_ctrl */
++amxd_status_t _SetAllowedPeerList(amxd_object_t* object,
++                                   amxd_function_t* func _UNUSED,
++                                   amxc_var_t* args,
++                                   amxc_var_t* ret) {
++    T_AccessPoint* pAP = s_apFromMAPCObj(object);
++    ASSERTI_NOT_NULL(pAP, amxd_status_ok, ME, "No AP mapped");
++
++    const char* peer_list = amxc_var_constcast(cstring_t,
++        amxc_var_get_key(args, "peer_list", AMXC_VAR_FLAG_DEFAULT));
++
++    ASSERTI_NOT_NULL(peer_list, amxd_status_invalid_value, ME, "%s: missing peer_list", pAP->alias);
++    ASSERTI_TRUE(pAP->wpaCtrlInterface && wld_wpaCtrlInterface_isReady(pAP->wpaCtrlInterface),
++                 amxd_status_ok, ME, "%s: wpaCtrl not ready", pAP->alias);
++
++    char cmd[512] = {0};
++    snprintf(cmd, sizeof(cmd), "SET_MAPC_VALID_COAP_LIST %s", peer_list);
++    SAH_TRACEZ_INFO(ME, "%s: MAPC SetAllowedPeerList: %s", pAP->alias, cmd);
++    bool ok = wld_wpaCtrl_sendCmdCheckResponse(pAP->wpaCtrlInterface, cmd, "OK");
++    amxc_var_set(bool, ret, ok);
++    return amxd_status_ok;
++}
++
++/** _CoTDMAPolicyConfig: reads CoTDMAPolicy[policy_index] and sends SET_MAPC_COTDMA_POLICY */
++amxd_status_t _CoTDMAPolicyConfig(amxd_object_t* object,
++                                   amxd_function_t* func _UNUSED,
++                                   amxc_var_t* args,
++                                   amxc_var_t* ret) {
++    T_AccessPoint* pAP = s_apFromMAPCObj(object);
++    ASSERTI_NOT_NULL(pAP, amxd_status_ok, ME, "No AP mapped");
++
++    uint32_t policy_index = amxc_var_dyncast(uint32_t,
++        amxc_var_get_key(args, "policy_index", AMXC_VAR_FLAG_DEFAULT));
++
++    ASSERTI_TRUE(pAP->wpaCtrlInterface && wld_wpaCtrlInterface_isReady(pAP->wpaCtrlInterface),
++                 amxd_status_ok, ME, "%s: wpaCtrl not ready", pAP->alias);
++
++    /* Find the CoTDMAPolicy entry by instance index */
++    amxd_object_t* policyObj = amxd_object_findf(object, "CoTDMAPolicy.%u.", policy_index);
++    if(!policyObj) {
++        SAH_TRACEZ_WARNING(ME, "%s: CoTDMAPolicy.%u not found", pAP->alias, policy_index);
++        amxc_var_set(bool, ret, false);
++        return amxd_status_ok;
++    }
++
++    /* Read policy parameters — use get_cstring_t (caller must free) for strings */
++    char* bssid = amxd_object_get_cstring_t(policyObj, "CoordinatedBSSID", NULL);
++    char* ac    = amxd_object_get_cstring_t(policyObj, "AccessCategory", NULL);
++    uint32_t max_txop    = amxd_object_get_uint32_t(policyObj, "MaximumSharedTXOPDuration", NULL);
++    uint32_t min_txop    = amxd_object_get_uint32_t(policyObj, "MinimumSharedTXOPDuration", NULL);
++    uint32_t svc_start   = amxd_object_get_uint32_t(policyObj, "ServiceStartTime", NULL);
++    uint32_t svc_interval = amxd_object_get_uint32_t(policyObj, "ServiceInterval", NULL);
++    uint32_t priority    = amxd_object_get_uint32_t(policyObj, "Priority", NULL);
++
++    char cmd[512] = {0};
++    snprintf(cmd, sizeof(cmd),
++             "SET_MAPC_COTDMA_POLICY %s ac=%s max_txop=%u min_txop=%u svc_start=%u svc_interval=%u priority=%u",
++             bssid ? bssid : "", ac ? ac : "",
++             max_txop, min_txop, svc_start, svc_interval, priority);
++    free(bssid);
++    free(ac);
++    SAH_TRACEZ_INFO(ME, "%s: MAPC CoTDMAPolicyConfig: %s", pAP->alias, cmd);
++    bool ok = wld_wpaCtrl_sendCmdCheckResponse(pAP->wpaCtrlInterface, cmd, "OK");
++    amxc_var_set(bool, ret, ok);
++    return amxd_status_ok;
++}
++
++/** _SetCoTDMAE2EConfig: sends SET_MAPC_COTDMA_E2E_CONFIG <peer_bssid> enable=<0|1> via wpa_ctrl */
++amxd_status_t _SetCoTDMAE2EConfig(amxd_object_t* object,
++                                   amxd_function_t* func _UNUSED,
++                                   amxc_var_t* args,
++                                   amxc_var_t* ret) {
++    T_AccessPoint* pAP = s_apFromMAPCObj(object);
++    ASSERTI_NOT_NULL(pAP, amxd_status_ok, ME, "No AP mapped");
++
++    const char* peer_bssid = amxc_var_constcast(cstring_t,
++        amxc_var_get_key(args, "peer_bssid", AMXC_VAR_FLAG_DEFAULT));
++    bool enable = amxc_var_dyncast(bool,
++        amxc_var_get_key(args, "enable", AMXC_VAR_FLAG_DEFAULT));
++
++    ASSERTI_NOT_NULL(peer_bssid, amxd_status_invalid_value, ME, "%s: missing peer_bssid", pAP->alias);
++    ASSERTI_TRUE(pAP->wpaCtrlInterface && wld_wpaCtrlInterface_isReady(pAP->wpaCtrlInterface),
++                 amxd_status_ok, ME, "%s: wpaCtrl not ready", pAP->alias);
++
++    char cmd[256] = {0};
++    snprintf(cmd, sizeof(cmd), "SET_MAPC_COTDMA_E2E_CONFIG %s enable=%d", peer_bssid, enable ? 1 : 0);
++    SAH_TRACEZ_INFO(ME, "%s: MAPC SetCoTDMAE2EConfig: %s", pAP->alias, cmd);
++    bool ok = wld_wpaCtrl_sendCmdCheckResponse(pAP->wpaCtrlInterface, cmd, "OK");
++    amxc_var_set(bool, ret, ok);
++    return amxd_status_ok;
++}
++
+ void _wld_ap_setConf_ocf(const char* const sig_name,
+                          const amxc_var_t* const data,
+                          void* const priv) {
+-- 
+2.34.1
+
