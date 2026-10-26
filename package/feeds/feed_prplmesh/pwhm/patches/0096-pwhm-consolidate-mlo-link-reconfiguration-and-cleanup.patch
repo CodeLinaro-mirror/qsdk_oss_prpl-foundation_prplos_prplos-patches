@@ -17,6 +17,11 @@ hostapd restarts for these operations. Defer MBSSID transmitter removal when
 unrelated MLDs depend on it. Radio-wide operations and genuine daemon
 failure recovery retain their existing scope.
 
+After repeater FH restore, reconcile links already recreated by ENABLE before
+issuing ADD_LINK. Verify the live AP link MAC, band and MLD interface, restore
+its WLD state, and complete the action without a duplicate ADD that would
+hold the radio FSM lock and prevent the remaining radios from restoring.
+
 Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
 ---
 
@@ -48,7 +53,15 @@ Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
  
  #include "wifiGen_fsm.h"
  
-@@ -462,6 +463,49 @@
+@@ -100,6 +101,7 @@
+ } chanspecInfo_t;
+ 
+ static void s_syncMultiApDepsOnBhAdd(T_AccessPoint* pAP, T_Radio* pRad);
++static bool s_hasMovedMloAnchor(T_AccessPoint* pAP);
+ 
+ /*
+  * List of actions that can be used to apply hostapd configuration,
+@@ -462,6 +464,49 @@
   * Using a counter (not a bool) handles multi-radio MLO re-adds correctly. */
  static int s_pendingAcsReAddCount = 0;
  
@@ -98,7 +111,7 @@ Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
  /**
   * @brief schedule next conf applying fsm action after setting a dynamic param
   * when no higher applying action (ie more global) is already scheduled
-@@ -475,6 +519,18 @@
+@@ -475,6 +520,18 @@
  static void s_schedNextAction(wld_secDmn_action_rc_ne action, T_AccessPoint* pAP, T_Radio* pRad) {
      ASSERTS_NOT_NULL(pRad, , ME, "NULL");
      wld_wpaCtrlInterface_t* pgIface = wld_secDmn_getGlobalCtrlIface(pRad->hostapd);
@@ -117,7 +130,7 @@ Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
  
      /** read current running fsm action for AP and Radio */
      int32_t radFsmBit = NO_ACTION_ID;
-@@ -574,6 +630,178 @@
+@@ -574,6 +631,178 @@
      }
  }
  
@@ -296,7 +309,7 @@ Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
  static bool s_doEnableAp(T_AccessPoint* pAP, T_Radio* pRad) {
      ASSERTI_TRUE(pRad->enable, true, ME, "%s: radio disabled", pRad->Name);
      ASSERTI_TRUE(wifiGen_hapd_isAlive(pRad), true, ME, "%s: hostapd stopped", pRad->Name);
-@@ -581,15 +809,58 @@
+@@ -581,15 +810,58 @@
      ASSERT_NOT_NULL(pMainAPCur, true, ME, "%s: no main vap iface for rad %s", pAP->alias, pRad->Name);
      bool enable = wld_ap_isEnabledWithRef(pAP);
      SAH_TRACEZ_INFO(ME, "%s: enable vap %d", pAP->alias, enable);
@@ -357,7 +370,7 @@ Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
              return true;
          }
  
-@@ -602,7 +873,8 @@
+@@ -602,7 +874,8 @@
              }
              return true;
          } else if(!enable) {
@@ -367,7 +380,46 @@ Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
                  SAH_TRACEZ_WARNING(ME, "%s: disabling non Tx BSS, scheduling re-add link of Tx bss %s", pAP->alias, pMainAPCur->alias);
                  s_clearApAcAction(pRad, GEN_FSM_ENABLE_AP);
                  s_schedNextAction(SECDMN_ACTION_OK_NEED_RE_ADD_LINK, pMainAPCur, pRad);
-@@ -665,9 +937,8 @@
+@@ -654,6 +927,38 @@
+     return true;
+ }
+ 
++/* ENABLE can recreate a link before a queued ADD_LINK runs. Check the
++ * kernel, not the cached WLD link ID (cleared during DISABLE), and require
++ * the requested MLD interface, link MAC and band to match. In particular,
++ * the BH anchor's interface name does not identify the link's radio. */
++static int32_t s_getExistingMloLinkId(T_AccessPoint* pAP) {
++    T_SSID* pSSID = pAP->pSSID;
++    if((pSSID == NULL) || (pSSID->pMldLink == NULL) ||
++       (pSSID->pMldLink->pMld == NULL) ||
++       (pSSID->mldUnit != pSSID->pMldLink->pMld->unit) ||
++       !wld_mld_isLinkUsable(pSSID->pMldLink) || s_hasMovedMloAnchor(pAP)) {
++        return NO_LINK_ID;
++    }
++    T_SSID* pPrimSSID = wifiGen_mld_selectPrimLinkSSID(pSSID);
++    if((pPrimSSID == NULL) || (pPrimSSID->AP_HOOK == NULL)) {
++        return NO_LINK_ID;
++    }
++    wld_nl80211_ifaceInfo_t ifaceInfo;
++    memset(&ifaceInfo, 0, sizeof(ifaceInfo));
++    if(!swl_rc_isOk(wld_ap_nl80211_getInterfaceInfo(pAP, &ifaceInfo)) ||
++       !ifaceInfo.isAp || !swl_str_matches(ifaceInfo.name, pPrimSSID->AP_HOOK->alias)) {
++        return NO_LINK_ID;
++    }
++    const wld_nl80211_ifaceMloLinkInfo_t* pLinkInfo =
++        wld_nl80211_fetchIfaceMloLinkByFreqBand(&ifaceInfo, pAP->pRadio->operatingFrequencyBand);
++    if((pLinkInfo == NULL) || (pLinkInfo->link.linkId < 0) ||
++       (pLinkInfo->chanSpec.ctrlFreq == 0) ||
++       !swl_typeMacBin_equals(pLinkInfo->link.linkMac, *wld_ssid_getLinkMac(pSSID))) {
++        return NO_LINK_ID;
++    }
++    return pLinkInfo->link.linkId;
++}
++
+ /**
+  * @brief FSM action to add a link or BSS to a running hostapd instance
+  *
+@@ -665,9 +970,8 @@
   *
   * @return true to continue FSM processing
   *
@@ -379,7 +431,7 @@ Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
   */
  static bool s_doAddLink(T_AccessPoint* pAP, T_Radio* pRad) {
      ASSERTS_NOT_NULL(pAP, true, ME, "NULL pAP");
-@@ -675,23 +946,32 @@
+@@ -675,47 +979,103 @@
      ASSERTS_TRUE(wifiGen_hapd_isRunning(pRad), true, ME, "%s: hostapd stopped", pRad->Name);
      ASSERTW_FALSE(wld_secDmn_isGrpRestarting(pRad->hostapd), true, ME, "%s: hostapd group is restarting: skip adding bss conf", pRad->Name);
  
@@ -388,15 +440,17 @@ Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
 +    }
 +    wld_mld_t* pMld = ((pAP->pSSID != NULL) && (pAP->pSSID->pMldLink != NULL)) ?
 +        pAP->pSSID->pMldLink->pMld : NULL;
++    int32_t existingLinkId = NO_LINK_ID;
 +    if(pMld != NULL) {
 +        if(pMld->hostapdRebuildPending) {
 +            pRad->fsmRad.timeout_msec = 500;
 +            return false;
 +        }
++        existingLinkId = s_getExistingMloLinkId(pAP);
 +        /* Radio FSMs run independently. Create a migrated MLD on its selected
 +         * primary before allowing the remaining links to join it. */
 +        T_SSID* pPrimSSID = wifiGen_mld_selectPrimLinkSSID(pAP->pSSID);
-+        if(pMld->hostapdRemoved && (pPrimSSID != NULL) &&
++        if((existingLinkId < 0) && pMld->hostapdRemoved && (pPrimSSID != NULL) &&
 +           (pPrimSSID != pAP->pSSID) && (pPrimSSID->AP_HOOK != NULL)) {
 +            pRad->fsmRad.timeout_msec = 100;
 +            return false;
@@ -420,27 +474,66 @@ Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
 -            return true;
 -        }
 -    }
+-
+-    /**
+-     * Adding an MLO BSS will fail if the primary BSS is non-MLO.
+-     * Ensure the radio configuration is updated (ieee80211be=1)
+-     * before attempting to add the new BSS.
+-     */
+-    wld_rad_hostapd_setMiscParams(pRad);
+-    wifiGen_hapd_restoreMainIface(pRad);
+-
+-    /* Refresh per-BSS config files so the channel matches the radio's current
+-     * operating channel (which may differ from the startup default when the EP
+-     * connected on a different channel before FH was enabled). */
+-    wld_hostapd_cfgFile_updatePerBssConfigs(pRad);
+-
+-    SAH_TRACEZ_INFO(ME, "%s: adding BSS config for AP %s", pRad->Name, pAP->alias);
+-    swl_rc_ne rc = wld_ap_hostapd_addBssConf(pAP);
+-    if(!swl_rc_isOk(rc)) {
+-        SAH_TRACEZ_ERROR(ME, "%s: failed to add BSS config for AP %s, scheduling RE_ADD", pRad->Name, pAP->alias);
+-        s_schedNextAction(SECDMN_ACTION_OK_NEED_RE_ADD, pAP, pRad);
+-        return true;
+-    }
+-
+-    SAH_TRACEZ_INFO(ME, "%s: BSS config for AP %s added successfully", pRad->Name, pAP->alias);
+-    s_syncMultiApDepsOnBhAdd(pAP, pRad);
 +        SAH_TRACEZ_WARNING(ME, "%s: wait for global control before BSS add", pAP->alias);
 +        pRad->fsmRad.timeout_msec = 500;
 +        return false;
 +    }
 +
- 
-     /**
-      * Adding an MLO BSS will fail if the primary BSS is non-MLO.
-@@ -709,12 +989,47 @@
-     SAH_TRACEZ_INFO(ME, "%s: adding BSS config for AP %s", pRad->Name, pAP->alias);
-     swl_rc_ne rc = wld_ap_hostapd_addBssConf(pAP);
-     if(!swl_rc_isOk(rc)) {
--        SAH_TRACEZ_ERROR(ME, "%s: failed to add BSS config for AP %s, scheduling RE_ADD", pRad->Name, pAP->alias);
--        s_schedNextAction(SECDMN_ACTION_OK_NEED_RE_ADD, pAP, pRad);
--        return true;
-+        SAH_TRACEZ_ERROR(ME, "%s: BSS add failed; retain only this ADD_LINK action", pAP->alias);
-+        pRad->fsmRad.timeout_msec = 1000;
-+        return false;
-     }
- 
-     SAH_TRACEZ_INFO(ME, "%s: BSS config for AP %s added successfully", pRad->Name, pAP->alias);
++    if(existingLinkId >= 0) {
++        /* Complete the existing link's action so this radio releases the FSM
++         * lock and the other radios can restore their missing links. */
++        SAH_TRACEZ_WARNING(ME, "%s: MLO link %d already restored; skip duplicate BSS add",
++                           pAP->alias, existingLinkId);
++        wld_ssid_setMLDLinkID(pAP->pSSID, existingLinkId);
++        wld_mld_saveLinkConfigured(pAP->pSSID->pMldLink, true);
++    } else {
++        /**
++         * Adding an MLO BSS will fail if the primary BSS is non-MLO.
++         * Ensure the radio configuration is updated (ieee80211be=1)
++         * before attempting to add the new BSS.
++         */
++        wld_rad_hostapd_setMiscParams(pRad);
++        wifiGen_hapd_restoreMainIface(pRad);
++
++        /* Refresh per-BSS config files so the channel matches the radio's current
++         * operating channel (which may differ from the startup default when the EP
++         * connected on a different channel before FH was enabled). */
++        wld_hostapd_cfgFile_updatePerBssConfigs(pRad);
++
++        SAH_TRACEZ_INFO(ME, "%s: adding BSS config for AP %s", pRad->Name, pAP->alias);
++        swl_rc_ne rc = wld_ap_hostapd_addBssConf(pAP);
++        if(!swl_rc_isOk(rc)) {
++            SAH_TRACEZ_ERROR(ME, "%s: BSS add failed; retain only this ADD_LINK action", pAP->alias);
++            pRad->fsmRad.timeout_msec = 1000;
++            return false;
++        }
++
++        SAH_TRACEZ_INFO(ME, "%s: BSS config for AP %s added successfully", pRad->Name, pAP->alias);
++    }
 +    if((pAP->pSSID != NULL) && (pAP->pSSID->pMldLink != NULL) &&
 +       (pAP->pSSID->pMldLink->pMld != NULL)) {
 +        wld_mld_t* pAddedMld = pAP->pSSID->pMldLink->pMld;
@@ -476,10 +569,13 @@ Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
 +            }
 +        }
 +    }
-     s_syncMultiApDepsOnBhAdd(pAP, pRad);
++    if(existingLinkId < 0) {
++        s_syncMultiApDepsOnBhAdd(pAP, pRad);
++    }
      wld_wpaCtrlMngr_checkAllIfaces(wld_secDmn_getWpaCtrlMgr(pRad->hostapd));
      setBitLongArray(pRad->fsmRad.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_SYNC_STATE);
-@@ -724,55 +1039,11 @@
+     wld_vap_updateState(pAP);
+@@ -724,55 +1084,11 @@
  }
  
  /**
@@ -536,7 +632,7 @@ Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
   *
   * @param pAP  Pointer to the access point (MLO link) to remove
   * @param pRad Pointer to the radio owning the access point
-@@ -780,23 +1051,17 @@
+@@ -780,23 +1096,17 @@
   * @return true  when link removal completes successfully or scheduling is done
   *         false when waiting for primary link removal to complete
   *
@@ -564,7 +660,7 @@ Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
      }
  
      SAH_TRACEZ_INFO(ME, "%s: MLO link remove command sent successfully", pAP->alias);
-@@ -875,6 +1140,219 @@
+@@ -875,6 +1185,219 @@
      return true;
  }
  
@@ -784,7 +880,7 @@ Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
  /**
   * @brief Removes an AP link or BSS from a running hostapd instance
   *
-@@ -895,16 +1373,59 @@
+@@ -895,16 +1418,59 @@
      ASSERTS_TRUE(wifiGen_hapd_isRunning(pRad), true, ME, "%s: hostapd stopped", pRad->Name);
      ASSERTW_FALSE(wld_secDmn_isGrpRestarting(pRad->hostapd), true, ME,
                    "%s: hostapd group is restarting, skipping link remove", pAP->alias);
@@ -847,7 +943,16 @@ Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
      }
  
      /** nLinks >=2 && LINK_REMOVE is not supported */
-@@ -1542,11 +2063,47 @@
+@@ -1402,6 +1968,8 @@
+      * configuration is re-applied via s_doAddLink().  Without this,
+      * the AP VAP comes up as a standalone interface (no MLD link) when
+      * wld_rad_resetApMldLinks() was called before ENABLE.
++     * ENABLE may already have restored some links; s_doAddLink() reconciles
++     * those with the kernel instead of issuing a duplicate ADD.
+      * Only schedule ADD_LINK when the global hostapd control interface
+      * is available (same guard used in s_doEnableAp).
+      */
+@@ -1542,11 +2110,47 @@
      return true;
  }
  
