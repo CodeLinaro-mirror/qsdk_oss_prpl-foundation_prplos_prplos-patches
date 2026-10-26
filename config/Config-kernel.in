@@ -110,6 +110,14 @@ config KERNEL_IPQ_MEM_PROFILE
 	  This option select memory profile to used, which defines
 	  the reserved memory configuration used in device tree
 
+config KERNEL_IPQ_PROFILE_MINENT
+        bool "Select minent build profile"
+        default n
+        select KERNEL_UBSAN if KERNEL_FTRACE
+        help
+        Enable/Disable MINENT kernel config. Used to enable specific minent
+        features for MINENT profile.
+
 config KERNEL_ARCH_IPQ256M
 	bool "Compile kernel for 256M profile"
 	default n
@@ -134,8 +142,13 @@ config KERNEL_SKB_RECYCLER_LOW_MEM
         bool "Enable medium mem for skb recycler"
 	default y if KERNEL_IPQ_MEM_PROFILE=512 && TARGET_ipq95xx
 	default y if KERNEL_IPQ_MEM_PROFILE=512 && TARGET_ipq53xx
+	default y if KERNEL_IPQ_MEM_PROFILE=512 && TARGET_ipq54xx
+	default y if KERNEL_IPQ_MEM_PROFILE=512 && TARGET_ipq96xx
+	default y if KERNEL_IPQ_MEM_PROFILE=512 && TARGET_ipq52xx
 	default y if KERNEL_IPQ_MEM_PROFILE=256 && TARGET_ipq95xx
         default y if KERNEL_IPQ_MEM_PROFILE=256 && TARGET_ipq53xx
+	default y if KERNEL_IPQ_MEM_PROFILE=256 && TARGET_ipq54xx
+	default y if KERNEL_IPQ_MEM_PROFILE=256 && TARGET_ipq52xx
 
 config KERNEL_SKB_RECYCLER
 	bool "Generic skb recycling"
@@ -149,7 +162,8 @@ config KERNEL_SKB_RECYCLER_MULTI_CPU
 config KERNEL_SKB_RECYCLE_SIZE
 	int "SKB recycler size"
 	depends on KERNEL_SKB_RECYCLER
-	default 1856 if KERNEL_SKB_RECYCLER_LOW_MEM
+	default 1664 if TARGET_ipq52xx && !KERNEL_IPQ_PROFILE_MINENT
+	default 1664 if TARGET_ipq96xx && !KERNEL_IPQ_PROFILE_MINENT
 	default 2304
 	help
 	SKB recycler default size
