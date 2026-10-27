@@ -1079,3 +1079,658 @@ index e88c395..24e1be5 100644
      return amxd_status_ok;
  }
 -
+diff --git a/src/ApMgt/wld_ap_qosmgmt.c b/src/ApMgt/wld_ap_qosmgmt.c
+new file mode 100644
+index 0000000..5d8e934
+--- /dev/null
++++ b/src/ApMgt/wld_ap_qosmgmt.c
+@@ -0,0 +1,649 @@
++/****************************************************************************
++**
++** SPDX-License-Identifier: BSD-2-Clause-Patent
++**
++** SPDX-FileCopyrightText: Copyright (c) 2022 SoftAtHome
++**
++** Redistribution and use in source and binary forms, with or
++** without modification, are permitted provided that the following
++** conditions are met:
++**
++** 1. Redistributions of source code must retain the above copyright
++** notice, this list of conditions and the following disclaimer.
++**
++** 2. Redistributions in binary form must reproduce the above
++** copyright notice, this list of conditions and the following
++** disclaimer in the documentation and/or other materials provided
++** with the distribution.
++**
++** Subject to the terms and conditions of this license, each
++** copyright holder and contributor hereby grants to those receiving
++** rights under this license a perpetual, worldwide, non-exclusive,
++** no-charge, royalty-free, irrevocable (except for failure to
++** satisfy the conditions of this license) patent license to make,
++** have made, use, offer to sell, sell, import, and otherwise
++** transfer this software, where such license applies only to those
++** patent claims, already acquired or hereafter acquired, licensable
++** by such copyright holder or contributor that are necessarily
++** infringed by:
++**
++** (a) their Contribution(s) (the licensed copyrights of copyright
++** holders and non-copyrightable additions of contributors, in
++** source or binary form) alone; or
++**
++** (b) combination of their Contribution(s) with the work of
++** authorship to which such Contribution(s) was added by such
++** copyright holder or contributor, if, at the time the Contribution
++** is added, such addition causes such combination to be necessarily
++** infringed. The patent license shall not apply to any other
++** combinations which include the Contribution.
++**
++** Except as expressly stated above, no rights or licenses from any
++** copyright holder or contributor is granted under this license,
++** whether expressly, by implication, estoppel or otherwise.
++**
++** DISCLAIMER
++**
++** THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND
++** CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES,
++** INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
++** MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
++** DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR
++** CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++** SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++** LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF
++** USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
++** AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++** LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
++** ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++** POSSIBILITY OF SUCH DAMAGE.
++**
++****************************************************************************/
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <debug/sahtrace.h>
++#include <assert.h>
++#include <ctype.h>
++
++#include "wld.h"
++#include "wld_util.h"
++#include "wld_accesspoint.h"
++#include "wld_ssid.h"
++#include "wld_radio.h"
++#include "wld_wpaCtrl_api.h"
++#include "wld_hostapd_cfgFile.h"
++#include "swl/swl_assert.h"
++#include "swl/swl_string.h"
++
++#define ME "apQosMgmt"
++
++static void s_updateHostapdCfgParam(T_AccessPoint* pAP, const char* key, bool enable) {
++    ASSERTS_NOT_NULL(pAP, , ME, "NULL");
++    ASSERTS_NOT_NULL(pAP->pRadio, , ME, "%s: no radio", pAP->alias);
++    ASSERTS_NOT_NULL(pAP->pRadio->hostapd, , ME, "%s: no hostapd", pAP->alias);
++    ASSERTS_STR(pAP->pRadio->hostapd->cfgFile, , ME, "%s: no hostapd cfg file", pAP->alias);
++    ASSERTS_STR(key, , ME, "%s: empty hostapd cfg key", pAP->alias);
++
++    const char* value = enable ? "1" : "0";
++    bool updated = wld_hostapd_cfgFile_update(pAP->pRadio->hostapd->cfgFile, pAP->alias, key, value);
++    ASSERTI_TRUE(updated, , ME, "%s: failed to update hostapd cfg %s=%s", pAP->alias, key, value);
++}
++
++/**
++ * @brief Synchronizes QoS descriptor changes from data model to internal state.
++ *
++ * Reads all QosMgmtDesc instances from the data model and updates the internal
++ * descriptor array. Validates that each MAC address has at most 4 descriptors.
++ * Returns whether any changes were detected.
++ *
++ * @param[in] qosMgmt Pointer to the QoSMgmt object in the data model
++ * @param[in,out] descriptors Array of wld_qosMgmtDescriptor_t structures to update
++ * @param[in,out] count Pointer to the total descriptor count
++ * @param[in] maxentries Maximum number of descriptor entries (MAXNROF_DESCENTRIES)
++ *
++ * @return bool Indicates whether changes were detected:
++ *         - true: Changes were found and applied to descriptors/count
++ *         - false: No changes detected or QosMgmtDesc not found
++ *
++ * @note Each MAC address is limited to a maximum of 4 descriptors
++ * @note Descriptors beyond the 4-per-MAC limit are skipped with an error log
++ * @note Only entries with priv != NULL are processed
++ * @note Changes include: qmid, MAC, or descriptor content modifications
++ */
++static bool s_syncDescriptorChanges(amxd_object_t* qosMgmt, wld_qosMgmtDescriptor_t descriptors[], size_t* count, size_t maxentries) {
++    size_t idx = 0;
++    size_t changes = 0;
++    amxd_object_t* templateObj = amxd_object_get(qosMgmt, "QosMgmtDesc");
++
++    if(!templateObj) {
++        SAH_TRACEZ_WARNING(ME, "QosMgmtDesc not found");
++        return false;
++    }
++
++    // Track number of descriptors per MAC
++    size_t mac_desc_count[maxentries];
++    char macs_seen[maxentries][ETHER_ADDR_STR_LEN];
++    memset(mac_desc_count, 0, sizeof(mac_desc_count));
++    memset(macs_seen, 0, sizeof(macs_seen));
++
++    amxd_object_for_each(instance, it, templateObj) {
++        if(idx >= maxentries) {
++            break;
++        }
++        amxd_object_t* entry = amxc_container_of(it, amxd_object_t, it);
++        if(entry->priv == NULL) {
++            continue;
++        }
++
++        const char* macstr = GET_CHAR(amxd_object_get_param_value(entry, "MACAddress"), NULL);
++        const char* descstr = GET_CHAR(amxd_object_get_param_value(entry, "Descriptor"), NULL);
++        uint32_t entryQmid = amxc_var_dyncast(uint32_t, amxd_object_get_param_value(entry, "qmid"));
++
++        if(macstr && descstr) {
++            // Count descriptors for this MAC
++            int found = -1;
++            for(size_t i = 0; i < idx; ++i) {
++                if(SWL_MAC_CHAR_MATCHES(macstr, macs_seen[i])) {
++                    found = i;
++                    break;
++                }
++            }
++            if(found == -1) {
++                // New MAC
++                swl_str_copy(macs_seen[idx], ETHER_ADDR_STR_LEN, macstr);
++                mac_desc_count[idx] = 1;
++            } else {
++                mac_desc_count[found]++;
++                if(mac_desc_count[found] > 4) {
++                    SAH_TRACEZ_ERROR(ME, "More than 4 descriptors for MAC %s, skipping", macstr);
++                    continue;
++                }
++            }
++
++            swl_macBin_t macBin;
++            if(!swl_typeMacBin_fromChar(&macBin, macstr)) {
++                SAH_TRACEZ_ERROR(ME, "Invalid MAC format: %s", macstr);
++                continue;
++            }
++
++            // If qmid and mac are same, only update descriptor if needed
++            if((entryQmid == descriptors[idx].qmid) && SWL_MAC_BIN_MATCHES(&macBin, &descriptors[idx].mac)) {
++                if(!swl_str_matches(descstr, descriptors[idx].descriptor)) {
++                    changes++;
++                    swl_str_copy(descriptors[idx].descriptor, WLD_QOSMGMT_DESCRIPTOR_MAX_LEN, descstr);
++                }
++            } else {
++                // If qmid or mac is different, update all fields
++                changes++;
++                memcpy(descriptors[idx].mac.bMac, macBin.bMac, ETHER_ADDR_LEN);
++                swl_str_copy(descriptors[idx].descriptor, WLD_QOSMGMT_DESCRIPTOR_MAX_LEN, descstr);
++                descriptors[idx].qmid = entryQmid;
++            }
++            idx++;
++        }
++    }
++
++    if(idx != *count) {
++        *count = idx;
++        changes++;
++    }
++    for(; idx < maxentries; idx++) {
++        memset(descriptors[idx].mac.bMac, 0, ETHER_ADDR_LEN);
++        memset(descriptors[idx].descriptor, 0, WLD_QOSMGMT_DESCRIPTOR_MAX_LEN);
++        descriptors[idx].qmid = 0;
++    }
++
++    return changes != 0;
++}
++
++/**
++ * This function syncs the QoS Management configuration for an access point.
++ * @param object The amxd_object_t pointer representing the access point object.
++ */
++static void s_syncQoSMgmt(amxd_object_t* object) {
++    SAH_TRACEZ_IN(ME);
++
++    T_AccessPoint* pAP = wld_ap_fromObj(object);
++    ASSERTS_NOT_NULL(pAP, , ME, "NULL");
++
++    amxd_object_t* qosMgmt = amxd_object_get(object, "QoSMgmt");
++    ASSERTS_NOT_NULL(qosMgmt, , ME, "QoSMgmt not found");
++
++    // Check MSCS Enable
++    bool mscsEnable = amxd_object_get_bool(qosMgmt, "MSCSEnable", NULL);
++    if(mscsEnable != pAP->qosMgmt.MSCSEnable) {
++        SAH_TRACEZ_INFO(ME, "%s: Update MSCS Enable from %u to %u", pAP->alias, pAP->qosMgmt.MSCSEnable, mscsEnable);
++        pAP->qosMgmt.MSCSEnable = mscsEnable;
++    }
++
++    // Check SCS Enable
++    bool scsEnable = amxd_object_get_bool(qosMgmt, "SCSEnable", NULL);
++    if(scsEnable != pAP->qosMgmt.SCSEnable) {
++        SAH_TRACEZ_INFO(ME, "%s: Update SCS Enable from %u to %u", pAP->alias, pAP->qosMgmt.SCSEnable, scsEnable);
++        pAP->qosMgmt.SCSEnable = scsEnable;
++    }
++
++    // Sync descriptors
++    s_syncDescriptorChanges(qosMgmt, pAP->qosMgmt.QosMgmtDescriptors, &pAP->qosMgmt.QosMgmtDescriptorCount, MAXNROF_DESCENTRIES);
++
++    SAH_TRACEZ_OUT(ME);
++}
++
++/**
++ * @brief Data model parameter write handler for QoS descriptor entries.
++ *
++ * Called when qmid or Descriptor parameters change in a QosMgmtDesc instance.
++ * Marks the object as synchronized and triggers s_syncQoSMgmt() to apply changes.
++ *
++ * @param[in] priv Private data (unused)
++ * @param[in] object Pointer to the QosMgmtDesc instance object
++ * @param[in] param Pointer to the parameter being modified
++ * @param[in] newValue New value being set
++ *
++ * @post object->priv is set to object (marks as synchronized)
++ * @post s_syncQoSMgmt() is called to propagate changes
++ *
++ * @note Registered via SWLA_DM_PARAM_HDLR for "qmid" and "Descriptor" parameters
++ */
++static void s_setQosDescEntry_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue _UNUSED) {
++    SAH_TRACEZ_IN(ME);
++
++    amxd_object_t* categFObj = amxd_object_get_parent(amxd_object_get_parent(object));
++    amxd_object_t* apObj = amxd_object_get_parent(categFObj);
++    object->priv = object;
++
++    s_syncQoSMgmt(apObj);
++
++    SAH_TRACEZ_OUT(ME);
++}
++
++SWLA_DM_HDLRS(sApQosDescEntryDmHdlrs, ARR(SWLA_DM_PARAM_HDLR("qmid", s_setQosDescEntry_pwf),
++                                          SWLA_DM_PARAM_HDLR("Descriptor", s_setQosDescEntry_pwf),));
++
++void _wld_apQosMgmtDescEntry_setConf_ocf(const char* const sig_name, const amxc_var_t* const data, void* const priv) {
++    swla_dm_procObjEvtOfLocalDm(&sApQosDescEntryDmHdlrs, sig_name, data, priv);
++}
++
++/**
++ * @brief Data model parameter write handler for MSCSEnable flag.
++ *
++ * Called when the MSCSEnable parameter changes in the QoSMgmt object.
++ * Updates the internal state and notifies the driver/hostapd to enable/disable
++ * the MSCS feature.
++ */
++static void s_setMSCSEnabled_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_AccessPoint* pAP = wld_ap_fromObj(amxd_object_get_parent(object));
++    ASSERTS_NOT_NULL(pAP, , ME, "pAP NULL");
++
++    bool newEnable = amxc_var_dyncast(bool, newValue);
++    if(newEnable != pAP->qosMgmt.MSCSEnable) {
++        pAP->qosMgmt.MSCSEnable = newEnable;
++        s_updateHostapdCfgParam(pAP, "enable_mscs", pAP->qosMgmt.MSCSEnable);
++        pAP->pFA->mfn_wvap_enable_mscs(pAP, pAP->qosMgmt.MSCSEnable);
++    }
++    SAH_TRACEZ_OUT(ME);
++}
++
++/**
++ * @brief Data model parameter write handler for SCSEnable flag.
++ *
++ * Called when the SCSEnable parameter changes in the QoSMgmt object.
++ * Updates the internal state and notifies the driver/hostapd to enable/disable
++ * the SCS feature.
++ */
++static void s_setSCSEnabled_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
++    SAH_TRACEZ_IN(ME);
++
++    T_AccessPoint* pAP = wld_ap_fromObj(amxd_object_get_parent(object));
++    ASSERTS_NOT_NULL(pAP, , ME, "pAP NULL");
++
++    bool newEnable = amxc_var_dyncast(bool, newValue);
++    if(newEnable != pAP->qosMgmt.SCSEnable) {
++        pAP->qosMgmt.SCSEnable = newEnable;
++        s_updateHostapdCfgParam(pAP, "enable_scs", pAP->qosMgmt.SCSEnable);
++        s_updateHostapdCfgParam(pAP, "deferred_scs", pAP->qosMgmt.SCSEnable);
++        pAP->pFA->mfn_wvap_enable_scs(pAP, pAP->qosMgmt.SCSEnable);
++    }
++    SAH_TRACEZ_OUT(ME);
++}
++
++SWLA_DM_HDLRS(sApQosDmHdlrs,
++              ARR(SWLA_DM_PARAM_HDLR("MSCSEnable", s_setMSCSEnabled_pwf),
++                  SWLA_DM_PARAM_HDLR("SCSEnable", s_setSCSEnabled_pwf),
++                  ));
++
++void _wld_apQosMgmt_setConf_ocf(const char* const sig_name, const amxc_var_t* const data, void* const priv) {
++    swla_dm_procObjEvtOfLocalDm(&sApQosDmHdlrs, sig_name, data, priv);
++}
++
++amxd_status_t _wld_ap_deleteQosMgmtDesc_odf(amxd_object_t* object, amxd_param_t* param _UNUSED, amxd_action_t reason _UNUSED, const amxc_var_t* const args _UNUSED, amxc_var_t* const retval _UNUSED, void* priv _UNUSED) {
++    amxd_status_t status = amxd_action_object_destroy(object, param, reason, args, retval, priv);
++    ASSERT_EQUALS(status, amxd_status_ok, status, ME, "Fail to destroy obj instance st:%d", status);
++    ASSERTS_EQUALS(amxd_object_get_type(object), amxd_object_instance, status, ME, "obj is not instance");
++
++    amxd_object_t* categFObj = amxd_object_get_parent(amxd_object_get_parent(object));
++    amxd_object_t* apObj = amxd_object_get_parent(categFObj);
++
++    object->priv = NULL;
++    s_syncQoSMgmt(apObj);
++
++    return status;
++}
++
++/**
++ * @brief Adds a QoS Management Descriptor for a specific client station.
++ *
++ * Creates a new QosMgmtDesc instance in the data model and instructs the
++ * driver/hostapd to apply the descriptor for traffic classification.
++ * Validates that no duplicate entry exists for the same MAC+QMID combination.
++ *
++ * @param[in] pAP Pointer to the T_AccessPoint structure
++ * @param[in] qmid QoS Management Identifier (0-255), must be unique per client
++ * @param[in] client_mac Client MAC address string (format: xx:xx:xx:xx:xx:xx)
++ * @param[in] descriptor Hex string containing the IEEE 802.11 QoS descriptor
++ *
++ * @return amxd_status_t Status code:
++ *         - amxd_status_ok: Successfully added descriptor
++ *         - amxd_status_unknown_error: Duplicate entry, driver error, or data model error
++ */
++static amxd_status_t s_addQosMgmtDescriptor(T_AccessPoint* pAP, size_t qmid, const char* client_mac, const char* descriptor) {
++    ASSERT_NOT_NULL(pAP, amxd_status_unknown_error, ME, "NULL");
++    ASSERT_NOT_NULL(client_mac, amxd_status_unknown_error, ME, "NULL");
++    ASSERT_NOT_NULL(descriptor, amxd_status_unknown_error, ME, "NULL");
++
++    amxd_object_t* QosObject = amxd_object_get(pAP->pBus, "QoSMgmt");
++    if(!QosObject) {
++        SAH_TRACEZ_ERROR(ME, "QoS object not found");
++        return amxd_status_unknown_error;
++    }
++
++    amxd_object_t* descList = amxd_object_get(QosObject, "QosMgmtDesc");
++    if(!descList) {
++        SAH_TRACEZ_ERROR(ME, "QosMgmtDesc list not found");
++        return amxd_status_unknown_error;
++    }
++
++    // Check if entry already exists
++    amxd_object_for_each(instance, it, descList) {
++        amxd_object_t* entry = amxc_container_of(it, amxd_object_t, it);
++        char* entryMac = amxd_object_get_cstring_t(entry, "MACAddress", NULL);
++        size_t entryQmid = amxd_object_get_uint32_t(entry, "qmid", 0);
++        if(entryMac && (swl_str_matches(entryMac, client_mac)) && (entryQmid == qmid)) {
++            free(entryMac);
++            SAH_TRACEZ_ERROR(ME, "Descriptor already exists for mac=%s qmid=%zu", client_mac, qmid);
++            return amxd_status_unknown_error;
++        }
++        free(entryMac);
++    }
++
++    swl_macBin_t macBin;
++    if(!swl_typeMacBin_fromChar(&macBin, client_mac)) {
++        SAH_TRACEZ_ERROR(ME, "Invalid MAC format: %s", client_mac);
++        return amxd_status_unknown_error;
++    }
++
++    swl_rc_ne ret = pAP->pFA->mfn_wvap_set_qosmgmt_descriptor(pAP, qmid, descriptor, macBin);
++    if(ret != SWL_RC_OK) {
++        SAH_TRACEZ_ERROR(ME, "Failed to set QoS management descriptor: %d", ret);
++        return amxd_status_unknown_error;
++    }
++
++    uint32_t index = 0;
++    amxd_object_t* instance = NULL;
++    amxd_status_t status = amxd_object_new_instance(&instance, descList, NULL, index, NULL);
++    if((status != amxd_status_ok) || !instance) {
++        SAH_TRACEZ_ERROR(ME, "Failed to create QosMgmtDesc instance: %d", status);
++        return status;
++    }
++
++    amxd_trans_t trans;
++    ASSERT_TRANSACTION_INIT(instance, &trans, amxd_status_unknown_error, ME, "trans init failure");
++    // Enable modification of read-only parameters
++    amxd_trans_set_attr(&trans, amxd_tattr_change_ro, true);
++
++    // Set all parameters
++    amxd_trans_set_value(uint32_t, &trans, "qmid", qmid);
++    amxd_trans_set_value(cstring_t, &trans, "MACAddress", client_mac);
++    amxd_trans_set_value(cstring_t, &trans, "Descriptor", descriptor);
++
++    ASSERT_TRANSACTION_LOCAL_DM_END(&trans, amxd_status_unknown_error, ME, "trans apply failure");
++
++    instance->priv = instance;
++
++    s_syncQoSMgmt(pAP->pBus);
++
++    return amxd_status_ok;
++}
++
++/**
++ * @brief Removes a QoS Management Descriptor for a specific client station.
++ *
++ * Deletes the QosMgmtDesc instance from the data model and instructs the
++ * driver/hostapd to stop enforcing the descriptor rules. Searches for the
++ * entry by MAC+QMID combination.
++ *
++ * @param[in] pAP Pointer to the T_AccessPoint structure
++ * @param[in] qmid QoS Management Identifier (0-255) of the descriptor to remove
++ * @param[in] client_mac Client MAC address string (format: xx:xx:xx:xx:xx:xx)
++ * @param[in] descriptor Hex string of the descriptor being removed (for driver notification)
++ *
++ * @return amxd_status_t Status code:
++ *         - amxd_status_ok: Successfully removed descriptor
++ *         - amxd_status_unknown_error: Entry not found, driver error, or deletion failed
++ */
++static amxd_status_t s_removeQosMgmtDescriptor(T_AccessPoint* pAP, size_t qmid, const char* client_mac, const char* descriptor) {
++    ASSERT_NOT_NULL(pAP, amxd_status_unknown_error, ME, "NULL");
++    ASSERT_NOT_NULL(client_mac, amxd_status_unknown_error, ME, "NULL");
++
++    amxd_object_t* QosObject = amxd_object_get(pAP->pBus, "QoSMgmt");
++    if(!QosObject) {
++        SAH_TRACEZ_ERROR(ME, "QoS object not found");
++        return amxd_status_unknown_error;
++    }
++
++    amxd_object_t* descList = amxd_object_get(QosObject, "QosMgmtDesc");
++    if(!descList) {
++        SAH_TRACEZ_ERROR(ME, "QosMgmtDesc list not found");
++        return amxd_status_unknown_error;
++    }
++
++    amxd_object_t* found = NULL;
++    amxd_object_for_each(instance, it, descList) {
++        amxd_object_t* entry = amxc_container_of(it, amxd_object_t, it);
++        char* entryMac = amxd_object_get_cstring_t(entry, "MACAddress", NULL);
++        size_t entryQmid = amxd_object_get_uint32_t(entry, "qmid", 0);
++        if(entryMac && (swl_str_matches(entryMac, client_mac)) && (entryQmid == qmid)) {
++            found = entry;
++            swl_macBin_t macBin;
++            if(!swl_typeMacBin_fromChar(&macBin, client_mac)) {
++                SAH_TRACEZ_ERROR(ME, "Invalid MAC format: %s", client_mac);
++                free(entryMac);
++                return amxd_status_unknown_error;
++            }
++            swl_rc_ne status = pAP->pFA->mfn_wvap_set_qosmgmt_descriptor(pAP, qmid, descriptor, macBin);
++            if(status != SWL_RC_OK) {
++                SAH_TRACEZ_ERROR(ME, "Failed to remove QoS management descriptor: %d", status);
++                free(entryMac);
++                return amxd_status_unknown_error;
++            }
++            free(entryMac);
++            break;
++        }
++        free(entryMac);
++    }
++
++    if(!found) {
++        SAH_TRACEZ_ERROR(ME, "Descriptor not found for mac=%s qmid=%zu", client_mac, qmid);
++        return amxd_status_unknown_error;
++    }
++
++    if(swl_object_delInstWithTransOnLocalDm(found) != amxd_status_ok) {
++        SAH_TRACEZ_ERROR(ME, "Failed to delete QosMgmtDesc instance");
++        return amxd_status_unknown_error;
++    }
++    found = NULL;
++
++    return amxd_status_ok;
++}
++
++amxd_status_t _handleQosMgmtDesc(amxd_object_t* obj, amxd_function_t* func _UNUSED, amxc_var_t* args, amxc_var_t* ret _UNUSED) {
++    SAH_TRACEZ_IN(ME);
++
++    amxd_status_t state = amxd_status_unknown_error;
++    T_AccessPoint* pAP = wld_ap_fromObj(amxd_object_get_parent(obj));
++    ASSERT_NOT_NULL(pAP, state, ME, "NULL");
++
++    const uint16_t qmid = GET_UINT32(args, "qmid");
++    const char* client_mac = GET_CHAR(args, "MACAddress");
++    const char* descriptor = GET_CHAR(args, "Descriptor");
++
++    if((client_mac == NULL) || (descriptor == NULL)) {
++        SAH_TRACEZ_ERROR(ME, "client_mac or Descriptor is NULL");
++        return state;
++    }
++
++    if(!swl_mac_charIsValidStaMac((swl_macChar_t*) client_mac)) {
++        SAH_TRACEZ_ERROR(ME, "Invalid STA MAC address for SCS_CONFIGURE: %s", client_mac);
++        return state;
++    }
++
++    size_t len = strlen(descriptor);
++
++    if((len < 8) || (len % 2 != 0)) {
++        SAH_TRACEZ_ERROR(ME, "Invalid descriptor length");
++        return state;
++    }
++
++    for(size_t i = 0; i < len; i++) {
++        if(!isxdigit((unsigned char) descriptor[i])) {
++            SAH_TRACEZ_ERROR(ME, "Descriptor contains non-hex characters");
++            return state;
++        }
++    }
++
++    /* Extract Element ID */
++    uint8_t elem_id;
++    char tmp_elem[3] = { descriptor[0], descriptor[1], '\0' };
++    elem_id = (uint8_t) strtoul(tmp_elem, NULL, 16);
++
++    /* Extract Ext ID*/
++    uint8_t ext_id;
++    char tmp_ext[3] = { descriptor[4], descriptor[5], '\0' };
++    ext_id = (uint8_t) strtoul(tmp_ext, NULL, 16);
++
++    char desc_type[5] = {0}; // Enough for "MSCS", "SCS", and null terminator
++    if(elem_id == 255) {
++        if(ext_id != 88) {
++            SAH_TRACEZ_ERROR(ME, "Invalid Ext ID for MSCS: %u", ext_id);
++            return state;
++        }
++        swl_str_copy(desc_type, sizeof(desc_type), "MSCS");
++    } else if((elem_id == 185) && (ext_id > 0)) {
++        swl_str_copy(desc_type, sizeof(desc_type), "SCS");
++    } else {
++        SAH_TRACEZ_ERROR(ME, "Invalid Elem ID: %u", elem_id);
++        return state;
++    }
++
++    /* Extract Request Type (byte 3) */
++    uint8_t req_type;
++    char tmp[3] = { descriptor[6], descriptor[7], '\0' };
++    req_type = (uint8_t) strtoul(tmp, NULL, 16);
++
++    // Check if the corresponding feature is enabled before proceeding
++    if(((swl_str_matches(desc_type, "MSCS")) && !pAP->qosMgmt.MSCSEnable) ||
++       ((swl_str_matches(desc_type, "SCS")) && !pAP->qosMgmt.SCSEnable)) {
++        SAH_TRACEZ_ERROR(ME, "%s is disabled, cannot handle descriptor for mac=%s", desc_type, client_mac);
++        return state;
++    }
++
++    swl_macBin_t clientMacBin;
++    if(!swl_typeMacBin_fromChar(&clientMacBin, client_mac)) {
++        SAH_TRACEZ_ERROR(ME, "Invalid MAC format: %s", client_mac);
++        return state;
++    }
++    if((pAP->pSSID != NULL) && SWL_MAC_BIN_MATCHES(&clientMacBin, (swl_macBin_t*) pAP->pSSID->BSSID)) {
++        SAH_TRACEZ_ERROR(ME, "%s: handleQosMgmtDesc MACAddress must be STA MAC, not AP BSSID %s",
++                         pAP->alias, client_mac);
++        return state;
++    }
++
++    switch(req_type) {
++    case 0:
++        state = s_addQosMgmtDescriptor(pAP, qmid, client_mac, descriptor);
++        break;
++    case 1:
++        state = s_removeQosMgmtDescriptor(pAP, qmid, client_mac, descriptor);
++        break;
++    case 2: {
++        /* For modify, set req_type to 1 before remove */
++        char mod_desc[WLD_QOSMGMT_DESCRIPTOR_MAX_LEN];
++        swl_str_copy(mod_desc, sizeof(mod_desc), descriptor);
++        if(strlen(mod_desc) >= 8) {
++            mod_desc[6] = '0';
++            mod_desc[7] = '1';
++        }
++        /* set req_type to 0 before add*/
++        state = s_removeQosMgmtDescriptor(pAP, qmid, client_mac, mod_desc);
++        if(strlen(mod_desc) >= 8) {
++            mod_desc[6] = '0';
++            mod_desc[7] = '0';
++        }
++        state = s_addQosMgmtDescriptor(pAP, qmid, client_mac, mod_desc);
++        break;
++    }
++    default:
++        SAH_TRACEZ_ERROR(ME, "Unknown Request Type: %u", req_type);
++        break;
++    }
++    return state;
++}
++
++amxd_status_t _GetSCSParams(amxd_object_t* obj, amxd_function_t* func _UNUSED, amxc_var_t* args, amxc_var_t* ret) {
++    T_AccessPoint* pAP = wld_ap_fromObj(amxd_object_get_parent(obj));
++    ASSERT_NOT_NULL(pAP, amxd_status_unknown_error, ME, "NULL");
++    ASSERT_NOT_NULL(pAP->wpaCtrlInterface, amxd_status_unknown_error, ME, "%s: no hostapd ctrl iface", pAP->alias);
++
++    const char* clientMac = GET_CHAR(args, "MACAddress");
++    ASSERTS_TRUE(swl_mac_charIsValidStaMac((swl_macChar_t*) clientMac), amxd_status_invalid_arg,
++                 ME, "Invalid client MAC address: %s", clientMac);
++
++    const char* infoType = GET_CHAR(args, "InfoType");
++    if(swl_str_len(infoType) == 0) {
++        infoType = "scs_list";
++    }
++    amxc_var_t* idArg = amxc_var_get_key(args, "ID", AMXC_VAR_FLAG_DEFAULT);
++    uint32_t id = (idArg != NULL) ? amxc_var_dyncast(uint32_t, idArg) : 0;
++
++    char reply[4096] = {0};
++    swl_rc_ne rc = SWL_RC_ERROR;
++    if(swl_str_matches(infoType, "scs_list")) {
++        rc = wld_wpaCtrl_sendCmdFmtGetResponse(pAP->wpaCtrlInterface, reply, sizeof(reply),
++                                                "DUMP_SCS_LIST %s", clientMac);
++    } else if(swl_str_matches(infoType, "scs_info")) {
++        ASSERTS_NOT_NULL(idArg, amxd_status_invalid_arg, ME, "%s: missing ID for DUMP_SCS_INFO %s",
++                         pAP->alias, clientMac);
++        rc = wld_wpaCtrl_sendCmdFmtGetResponse(pAP->wpaCtrlInterface, reply, sizeof(reply),
++                                                "DUMP_SCS_INFO %s %u", clientMac, id);
++    } else if(swl_str_matches(infoType, "qm_info")) {
++        ASSERTS_NOT_NULL(idArg, amxd_status_invalid_arg, ME, "%s: missing ID for DUMP_SCS_QM_INFO %s",
++                         pAP->alias, clientMac);
++        rc = wld_wpaCtrl_sendCmdFmtGetResponse(pAP->wpaCtrlInterface, reply, sizeof(reply),
++                                                "DUMP_SCS_QM_INFO %s %u", clientMac, id);
++    } else {
++        SAH_TRACEZ_ERROR(ME, "%s: invalid DUMP_SCS InfoType %s", pAP->alias, infoType);
++        return amxd_status_invalid_arg;
++    }
++    ASSERT_TRUE(swl_rc_isOk(rc), amxd_status_unknown_error, ME, "%s: DUMP_SCS %s %s failed rc=%d reply=%s",
++                pAP->alias, clientMac, infoType, rc, reply);
++
++    amxc_var_set(cstring_t, ret, reply);
++    return amxd_status_ok;
++}
++
++amxd_status_t _QoSMgmt_GetSCSParams(amxd_object_t* obj, amxd_function_t* func, amxc_var_t* args, amxc_var_t* ret) {
++    return _GetSCSParams(obj, func, args, ret);
++}
