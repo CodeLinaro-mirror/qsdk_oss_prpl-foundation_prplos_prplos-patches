@@ -1,0 +1,418 @@
+From: Deepak Kumar <deepaku@qti.qualcomm.com>
+Subject: [PATCH] pwhm: defer WiFi.Reset() and chain per-radio teardown across ticks
+
+_Reset() already decouples the RPC call from the actual reset work via
+a zero-delay timer, so the ubus caller never blocks on s_doReset()
+itself. That is not enough on its own: s_doReset() still reset every
+radio back-to-back, synchronously, inside that single timer callback.
+
+Each radio's reset (wld_rad_doRadioReset() -> forced FSM resync) can
+issue several synchronous hostapd control-socket round trips while
+tearing down/re-adding MLO links, each with an effective minimum
+~1s wait. With multiple radios, those blocking calls stacked up
+back-to-back inside one event-loop callback, which stalled the whole
+event loop (and every other pending ubus request) for the sum of all
+radios' teardown time -- observed as wifi.reset timing out and, once
+that happens, every other ubus-cli command timing out as well until
+the callback finally returned.
+
+Chain the per-radio reset work across separate zero-delay timer
+ticks (one radio per tick) instead of looping over all radios inline.
+This lets the event loop service pending ubus requests between radios
+rather than queuing them behind the whole multi-radio reset. The
+remaining data-model/ODL-reload work, which only needs to run once
+after every radio has been reset, now runs from s_doResetFinish()
+once the per-radio chain completes.
+
+Signed-off-by: Deepak Kumar <deepaku@qti.qualcomm.com>
+---
+
+--- a/src/wld.c
++++ b/src/wld.c
+@@ -1046,12 +1046,186 @@
+     amxd_trans_clean(&trans);
+ }
+
+-amxd_status_t _Reset(amxd_object_t* obj _UNUSED,
+-                     amxd_function_t* func _UNUSED,
+-                     amxc_var_t* args _UNUSED,
+-                     amxc_var_t* retval _UNUSED) {
++/*
++ * Each radio's reset (wld_rad_doRadioReset -> FSM resync) can block the
++ * single event-loop thread for a noticeable time, since FSM processing of
++ * MLO link teardown/re-add issues synchronous hostapd control-socket round
++ * trips. Resetting every radio back-to-back inside one call therefore stalls
++ * every other ubus request for the sum of all radios' teardown time. The
++ * per-radio work below is instead chained one radio per zero-delay timer
++ * tick, so the event loop gets a chance to service pending ubus requests
++ * between radios instead of queuing them behind the whole multi-radio reset.
++ */
++#define WLD_RESET_MAX_RADIOS 16
++static T_Radio* s_resetRadios[WLD_RESET_MAX_RADIOS];
++static uint32_t s_resetRadioCount = 0;
++static uint32_t s_resetRadioIdx = 0;
++static bool s_resetInProgress = false;
++
++static void s_doResetFinish(void) {
++    /*
++     * Delete EndPoint DM instances before reloading defaults. The defaults
++     * ODL uses "instance add (alias)" which triggers _wld_ep_addInstance_oaf
++     * (an add-inst action callback). This callback only supports fresh
++     * creation -- it fails with "Fail to create instance" when the instance
++     * already exists, even with populate-behavior.duplicate-instance=update.
++     * Deleting first lets the defaults ODL re-create them cleanly.
++     *
++     * The EP-linked SSID instances (ep2g0/ep5g0/ep6g0) are NOT deleted: they
++     * are standalone SSID objects that _wld_ep_addInstance_oaf links to after
++     * creation, and they are not re-created by the static ODL parser.
++     *
++     * Zero pEP->index on every EP before deleting DM instances. On the 2nd+
++     * reset the EP iface is the main radio interface (same name and ifIndex
++     * as pRad->Name / pRad->index). wld_endpoint_destroy() -> s_deinitEP()
++     * calls mfn_wrad_delendpointif(pR, pEP->Name) when pEP->index > 0.
++     * wifiGen_rad_delendpointif() asserts pRad->index != ifIndex, which fails
++     * because the EP iface IS the main radio iface. The radio FSM teardown
++     * has already handled interface state, so clearing pEP->index here
++     * suppresses the redundant and incorrect kernel-interface deletion.
++     */
++    T_Radio* tmpRad = NULL;
++    wld_for_eachRad(tmpRad) {
++        T_EndPoint* pEP = NULL;
++        wld_rad_forEachEp(pEP, tmpRad) {
++            pEP->index = 0;
++        }
++    }
++    amxd_object_t* epTmpl = amxd_object_findf(get_wld_object(), "EndPoint");
++    s_deleteAllInstances(epTmpl);
++    /* Reset the template's last_index to 0. amxd uses last_index as a
++     * high-water mark and never decrements it on deletion. Auto-assigned
++     * indices (index arg == 0) are computed as last_index+1, so without
++     * this reset the re-created EndPoints land at 4,5,6 instead of 1,2,3. */
++    if(epTmpl != NULL) {
++        epTmpl->last_index = 0;
++    }
+
+     /*
++     * Walk the entire WiFi object tree and remove all registered action
++     * callbacks before re-parsing the definition ODL.
++     *
++     * amxd_object_add_action_cb() returns amxd_status_unknown_error when the
++     * exact same (fn, priv=NULL) pair is already registered: it finds the
++     * existing entry, sees cb->priv == NULL == priv, jumps to exit without
++     * ever setting status = amxd_status_ok, and returns an error. The ODL
++     * parser treats any non-ok return from set_object_action as fatal, logs
++     * "Invalid object (action id = N)", and aborts the include mid-file.
++     *
++     * Every object in every included ODL (wld_definitions.odl,
++     * wld_radio.odl, wld_accesspoint.odl, wld_ssid.odl, wld_endpoint.odl,
++     * wld_mld.odl) registers callbacks this way. Clearing the entire tree
++     * before re-parsing lets every registration succeed cleanly.
++     */
++    s_clearObjectActionCbs(get_wld_object());
++
++    /*
++     * Delete the persisted ODL file so the next startup also gets factory
++     * defaults. Without this, wld_persist_onStart() would find the saved
++     * file on disk and reload the pre-reset state, making the reset
++     * non-durable across reboots.
++     */
++    wld_persist_deleteSavedConf();
++
++    amxd_object_t* rootObj = amxd_dm_get_root(get_wld_plugin_dm());
++    amxo_parser_t* parser = get_wld_plugin_parser();
++    amxo_parser_parse_string(parser, "include '${definition_file}';", rootObj);
++    amxo_parser_parse_string(parser, "include '${odl.dm-defaults}';", rootObj);
++    /*
++     * Drain pending signals emitted during the ODL re-parse.
++     * Limit iterations to avoid an infinite loop: loading defaults triggers
++     * "on event" handlers which may emit more signals. A bounded drain
++     * ensures all queued signals are dispatched without risking a hang if
++     * handlers keep emitting new ones.
++     */
++    int drain_count = 0;
++    while((drain_count < 1000) && (amxp_signal_read() == 0)) {
++        drain_count++;
++    }
++    wld_vendorModuleMgr_loadDefaultsAll();
++
++    wld_for_eachRad(tmpRad) {
++        tmpRad->fsmRad.FSM_SyncAll = TRUE;
++        wld_autoCommitMgr_notifyRadEdit(tmpRad);
++    }
++
++    s_resetInProgress = false;
++}
++
++static void s_resetRadioStep(T_Radio* tmpRad) {
++    SAH_TRACEZ_WARNING(ME, "%s: stop radio for reset", tmpRad->Name);
++    wld_rad_doRadioReset(tmpRad);
++
++    /*
++     * force reset local enabling flag of APs/EPs/SSIDs
++     * to allow handling loaded values and mirroring them when needed
++     */
++    T_EndPoint* pEP = NULL;
++    wld_rad_forEachEp(pEP, tmpRad) {
++        pEP->enable = 0;
++        if(pEP->pSSID) {
++            pEP->pSSID->enable = 0;
++        }
++        /*
++         * Also zero the DM Enable parameters directly so SSIDs linked to
++         * endpoints (SSID.2/4/6) are disabled in the data model. The C-level
++         * flags above affect FSM behaviour but not the DM values seen over
++         * ubus. Without this, if the ODL re-parse partially fails, the DM
++         * still reflects the pre-reset enabled state.
++         */
++        if(pEP->pBus != NULL) {
++            amxd_trans_t ep_trans;
++            amxd_trans_init(&ep_trans);
++            amxd_trans_select_object(&ep_trans, pEP->pBus);
++            amxd_trans_set_bool(&ep_trans, "Enable", false);
++            if(pEP->pSSID && pEP->pSSID->pBus) {
++                amxd_trans_select_object(&ep_trans, pEP->pSSID->pBus);
++                amxd_trans_set_bool(&ep_trans, "Enable", false);
++            }
++            amxd_trans_apply(&ep_trans, get_wld_plugin_dm());
++            amxd_trans_clean(&ep_trans);
++        }
++    }
++    T_AccessPoint* pAP = NULL;
++    wld_rad_forEachAp(pAP, tmpRad) {
++        pAP->enable = 0;
++        if(pAP->pSSID) {
++            pAP->pSSID->enable = 0;
++        }
++    }
++
++    /*
++     * Remove EventCounter instances so the ODL parser can re-create
++     * them cleanly. Leaving them causes duplicate-key transaction
++     * failures in wld_rad_init_counters() after the ODL reload.
++     */
++    s_deleteAllInstances(amxd_object_findf(tmpRad->pBus, "EventCounter"));
++}
++
++static void s_resetRadioChainTimer_cb(amxp_timer_t* timer, void* priv _UNUSED) {
++    amxp_timer_delete(&timer);
++    if(s_resetRadioIdx < s_resetRadioCount) {
++        s_resetRadioStep(s_resetRadios[s_resetRadioIdx++]);
++    }
++    if(s_resetRadioIdx >= s_resetRadioCount) {
++        s_doResetFinish();
++        return;
++    }
++
++    amxp_timer_t* nextTimer = NULL;
++    if((amxp_timer_new(&nextTimer, s_resetRadioChainTimer_cb, NULL) != 0) || (nextTimer == NULL)) {
++        SAH_TRACEZ_ERROR(ME, "Fail to create radio-reset chain timer: resetting remaining radios inline");
++        while(s_resetRadioIdx < s_resetRadioCount) {
++            s_resetRadioStep(s_resetRadios[s_resetRadioIdx++]);
++        }
++        s_doResetFinish();
++        return;
++    }
++    amxp_timer_start(nextTimer, 0);
++}
++
++static void s_doReset(void) {
++    /*
+      * Delete the persisted ODL file FIRST, before any radio stop.
+      * Stopping radios causes wld to restart (procd watchdog), so the
+      * wld_persist_deleteSavedConf() call at the bottom of this function
+@@ -1134,139 +1308,73 @@
+         }
+     }
+
++    s_resetRadioCount = 0;
++    s_resetRadioIdx = 0;
+     wld_for_eachRad(tmpRad) {
+-        SAH_TRACEZ_WARNING(ME, "%s: stop radio for reset", tmpRad->Name);
+-        wld_rad_doRadioReset(tmpRad);
+-
+-        /*
+-         * force reset local enabling flag of APs/EPs/SSIDs
+-         * to allow handling loaded values and mirroring them when needed
+-         */
+-        T_EndPoint* pEP = NULL;
+-        wld_rad_forEachEp(pEP, tmpRad) {
+-            pEP->enable = 0;
+-            if(pEP->pSSID) {
+-                pEP->pSSID->enable = 0;
+-            }
+-            /*
+-             * Also zero the DM Enable parameters directly so SSIDs linked to
+-             * endpoints (SSID.2/4/6) are disabled in the data model. The C-level
+-             * flags above affect FSM behaviour but not the DM values seen over
+-             * ubus. Without this, if the ODL re-parse partially fails, the DM
+-             * still reflects the pre-reset enabled state.
+-             */
+-            if(pEP->pBus != NULL) {
+-                amxd_trans_t ep_trans;
+-                amxd_trans_init(&ep_trans);
+-                amxd_trans_select_object(&ep_trans, pEP->pBus);
+-                amxd_trans_set_bool(&ep_trans, "Enable", false);
+-                if(pEP->pSSID && pEP->pSSID->pBus) {
+-                    amxd_trans_select_object(&ep_trans, pEP->pSSID->pBus);
+-                    amxd_trans_set_bool(&ep_trans, "Enable", false);
+-                }
+-                amxd_trans_apply(&ep_trans, get_wld_plugin_dm());
+-                amxd_trans_clean(&ep_trans);
+-            }
+-        }
+-        T_AccessPoint* pAP = NULL;
+-        wld_rad_forEachAp(pAP, tmpRad) {
+-            pAP->enable = 0;
+-            if(pAP->pSSID) {
+-                pAP->pSSID->enable = 0;
+-            }
++        if(s_resetRadioCount >= WLD_RESET_MAX_RADIOS) {
++            SAH_TRACEZ_ERROR(ME, "%s: too many radios for reset chain, skipping", tmpRad->Name);
++            continue;
+         }
++        s_resetRadios[s_resetRadioCount++] = tmpRad;
++    }
+
+-        /*
+-         * Remove EventCounter instances so the ODL parser can re-create
+-         * them cleanly. Leaving them causes duplicate-key transaction
+-         * failures in wld_rad_init_counters() after the ODL reload.
+-         */
+-        s_deleteAllInstances(amxd_object_findf(tmpRad->pBus, "EventCounter"));
++    if(s_resetRadioCount == 0) {
++        s_doResetFinish();
++        return;
+     }
+
+-    /*
+-     * Delete EndPoint DM instances before reloading defaults. The defaults
+-     * ODL uses "instance add (alias)" which triggers _wld_ep_addInstance_oaf
+-     * (an add-inst action callback). This callback only supports fresh
+-     * creation -- it fails with "Fail to create instance" when the instance
+-     * already exists, even with populate-behavior.duplicate-instance=update.
+-     * Deleting first lets the defaults ODL re-create them cleanly.
+-     *
+-     * The EP-linked SSID instances (ep2g0/ep5g0/ep6g0) are NOT deleted: they
+-     * are standalone SSID objects that _wld_ep_addInstance_oaf links to after
+-     * creation, and they are not re-created by the static ODL parser.
+-     *
+-     * Zero pEP->index on every EP before deleting DM instances. On the 2nd+
+-     * reset the EP iface is the main radio interface (same name and ifIndex
+-     * as pRad->Name / pRad->index). wld_endpoint_destroy() -> s_deinitEP()
+-     * calls mfn_wrad_delendpointif(pR, pEP->Name) when pEP->index > 0.
+-     * wifiGen_rad_delendpointif() asserts pRad->index != ifIndex, which fails
+-     * because the EP iface IS the main radio iface. The radio FSM teardown
+-     * has already handled interface state, so clearing pEP->index here
+-     * suppresses the redundant and incorrect kernel-interface deletion.
+-     */
+-    wld_for_eachRad(tmpRad) {
+-        T_EndPoint* pEP = NULL;
+-        wld_rad_forEachEp(pEP, tmpRad) {
+-            pEP->index = 0;
++    amxp_timer_t* radioTimer = NULL;
++    if((amxp_timer_new(&radioTimer, s_resetRadioChainTimer_cb, NULL) != 0) || (radioTimer == NULL)) {
++        SAH_TRACEZ_ERROR(ME, "Fail to create radio-reset chain timer: resetting radios inline");
++        while(s_resetRadioIdx < s_resetRadioCount) {
++            s_resetRadioStep(s_resetRadios[s_resetRadioIdx++]);
+         }
++        s_doResetFinish();
++        return;
+     }
+-    amxd_object_t* epTmpl = amxd_object_findf(get_wld_object(), "EndPoint");
+-    s_deleteAllInstances(epTmpl);
+-    /* Reset the template's last_index to 0. amxd uses last_index as a
+-     * high-water mark and never decrements it on deletion. Auto-assigned
+-     * indices (index arg == 0) are computed as last_index+1, so without
+-     * this reset the re-created EndPoints land at 4,5,6 instead of 1,2,3. */
+-    if(epTmpl != NULL) {
+-        epTmpl->last_index = 0;
+-    }
++    amxp_timer_start(radioTimer, 0);
++}
+
+-    /*
+-     * Walk the entire WiFi object tree and remove all registered action
+-     * callbacks before re-parsing the definition ODL.
+-     *
+-     * amxd_object_add_action_cb() returns amxd_status_unknown_error when the
+-     * exact same (fn, priv=NULL) pair is already registered: it finds the
+-     * existing entry, sees cb->priv == NULL == priv, jumps to exit without
+-     * ever setting status = amxd_status_ok, and returns an error. The ODL
+-     * parser treats any non-ok return from set_object_action as fatal, logs
+-     * "Invalid object (action id = N)", and aborts the include mid-file.
+-     *
+-     * Every object in every included ODL (wld_definitions.odl,
+-     * wld_radio.odl, wld_accesspoint.odl, wld_ssid.odl, wld_endpoint.odl,
+-     * wld_mld.odl) registers callbacks this way. Clearing the entire tree
+-     * before re-parsing lets every registration succeed cleanly.
+-     */
+-    s_clearObjectActionCbs(get_wld_object());
++/*
++ * s_doReset() stops/reconfigures every radio and can legitimately take
++ * longer than ubus's client-side call timeout, especially on EP/repeater
++ * radios where it races the driver's own async vdev/MLO-peer teardown and
++ * recreate (ath12k) -- seen as repeated "Failed to set wiphy params" while
++ * the forced full FSM resync retries. Running it inline in _Reset() made the
++ * RPC caller (ubus-cli) hit a hard timeout (status 27) even though pwhm was
++ * still working correctly.
++ *
++ * Fix: _Reset() only *accepts* the request and replies immediately; the
++ * actual work runs afterwards, decoupled from the RPC, via a zero-delay
++ * timer. No caller ever waits on s_doReset() to finish, so its duration can
++ * no longer surface as a client-side ubus timeout.
++ */
++static void s_resetTimer_cb(amxp_timer_t* timer, void* priv _UNUSED) {
++    amxp_timer_delete(&timer);
++    s_doReset();
++}
+
+-    /*
+-     * Delete the persisted ODL file so the next startup also gets factory
+-     * defaults. Without this, wld_persist_onStart() would find the saved
+-     * file on disk and reload the pre-reset state, making the reset
+-     * non-durable across reboots.
+-     */
+-    wld_persist_deleteSavedConf();
++amxd_status_t _Reset(amxd_object_t* obj _UNUSED,
++                     amxd_function_t* func _UNUSED,
++                     amxc_var_t* args _UNUSED,
++                     amxc_var_t* retval _UNUSED) {
++    if(s_resetInProgress) {
++        SAH_TRACEZ_WARNING(ME, "Reset already in progress: ignoring overlapping WiFi.Reset() call");
++        return amxd_status_invalid_action;
++    }
+
+-    amxd_object_t* rootObj = amxd_dm_get_root(get_wld_plugin_dm());
+-    amxo_parser_t* parser = get_wld_plugin_parser();
+-    amxo_parser_parse_string(parser, "include '${definition_file}';", rootObj);
+-    amxo_parser_parse_string(parser, "include '${odl.dm-defaults}';", rootObj);
+-    /*
+-     * Drain pending signals emitted during the ODL re-parse.
+-     * Limit iterations to avoid an infinite loop: loading defaults triggers
+-     * "on event" handlers which may emit more signals. A bounded drain
+-     * ensures all queued signals are dispatched without risking a hang if
+-     * handlers keep emitting new ones.
+-     */
+-    int drain_count = 0;
+-    while((drain_count < 1000) && (amxp_signal_read() == 0)) {
+-        drain_count++;
++    amxp_timer_t* timer = NULL;
++    if((amxp_timer_new(&timer, s_resetTimer_cb, NULL) != 0) || (timer == NULL)) {
++        SAH_TRACEZ_ERROR(ME, "Fail to create reset timer");
++        return amxd_status_unknown_error;
+     }
+-    wld_vendorModuleMgr_loadDefaultsAll();
+
+-    wld_for_eachRad(tmpRad) {
+-        tmpRad->fsmRad.FSM_SyncAll = TRUE;
+-        wld_autoCommitMgr_notifyRadEdit(tmpRad);
++    s_resetInProgress = true;
++    if(amxp_timer_start(timer, 0) != 0) {
++        SAH_TRACEZ_ERROR(ME, "Fail to start reset timer");
++        amxp_timer_delete(&timer);
++        s_resetInProgress = false;
++        return amxd_status_unknown_error;
+     }
+
+     return amxd_status_ok;
+ }
