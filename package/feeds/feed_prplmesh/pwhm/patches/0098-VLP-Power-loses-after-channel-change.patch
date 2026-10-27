@@ -1,0 +1,45 @@
+From da5d891010138aea240f8f99493a336325d1cde5 Mon Sep 17 00:00:00 2001
+From: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+Date: Mon, 26 Oct 2026 23:14:33 +0530
+Subject: [PATCH] pwhm: VLP power mode loses after channel switch
+
+Change-Id: Ic72c3c9fdd72a27cb0d4284e0dcddac54008abf3
+Signed-off-by: VedhaLoganathan <vedhaval@qti.qualcomm.com>
+---
+
+diff --git a/src/Plugin/wifiGen_eventHandlers.c b/src/Plugin/wifiGen_eventHandlers.c
+index 5dbdddb..1e25c91 100644
+--- a/src/Plugin/wifiGen_eventHandlers.c
++++ b/src/Plugin/wifiGen_eventHandlers.c
+@@ -536,6 +536,9 @@ static void s_saveChanChanged(T_Radio* pRad, swl_chanspec_t* pChanSpec, wld_chan
+     }
+     swl_rc_ne rc = wld_chanmgt_reportCurrentChanspec(pRad, *pChanSpec, reason);
+     ASSERTS_FALSE(rc < SWL_RC_OK, , ME, "no changes to be reported");
++    if(wld_rad_is_6ghz(pRad)) {
++        wld_rad_hostapd_set6GHzPowerMode(pRad);
++    }
+     wld_rad_updateOperatingClass(pRad);
+     swl_chanspec_t savedChSpec = wld_rad_hostapd_getCfgChanspec(pRad);
+     if(!swl_typeChanspecExt_equals(pRad->targetChanspec.chanspec, savedChSpec)) {
+diff --git a/src/nl80211/wld_rad_hostapd_api.c b/src/nl80211/wld_rad_hostapd_api.c
+index 24e7e2c..d8f8f7a 100644
+--- a/src/nl80211/wld_rad_hostapd_api.c
++++ b/src/nl80211/wld_rad_hostapd_api.c
+@@ -791,6 +791,17 @@ void wld_rad_hostapd_set6GHzPowerMode(T_Radio* pRad) {
+     if(!wld_rad_is_6ghz(pRad)) {
+         return;
+     }
++    if(pRad->pBus != NULL) {
++        char* powerType = amxd_object_get_cstring_t(pRad->pBus, "PowerType", NULL);
++        if(powerType != NULL) {
++            pRad->PowerType =
++                swl_conv_charToEnum(powerType,
++                                    swl_radpwr_str,
++                                    SWL_RADPWR_MAX,
++                                    SWL_RADPWR_INDOOR_AP);
++            free(powerType);
++        }
++    }
+     snprintf(pwrCmd, sizeof(pwrCmd), "SET_6GHZ_PWR_MODE %d", (int) pRad->PowerType);
+     amxc_llist_for_each(it, &pRad->llAP) {
+         T_AccessPoint* pAP = amxc_llist_it_get_data(it, T_AccessPoint, it);
