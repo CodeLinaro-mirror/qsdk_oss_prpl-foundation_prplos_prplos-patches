@@ -1,0 +1,148 @@
+From 06ff7beb00ffa77040f37a8fbe75eedd410126db Mon Sep 17 00:00:00 2001
+From: Srajana <srajana@qti.qualcomm.com>
+Date: Tue, 27 Oct 2026 23:28:29 +0530
+Subject: [PATCH] pwhm: expose Wi-Fi 8 AP SMD capability
+
+Populate SMD support and SMD downlink forwarding from the nl80211
+extended-feature bitmap, and report the platform-specific SMD PTK and
+MAC SAP capabilities.
+
+Signed-off-by: Srajana <srajana@qti.qualcomm.com>
+---
+ include/wld/wld.h                |  3 +++
+ include/wld/wld_nl80211_compat.h |  2 ++
+ include/wld/wld_nl80211_types.h  |  2 ++
+ odl/wld_radio.odl                | 26 ++++++++++++++++++++++++++
+ src/Plugin/wifiGen_rad.c         |  7 +++++++
+ src/nl80211/wld_nl80211_parser.c |  2 ++
+ src/wld_radio.c                  |  6 ++++++
+ 7 files changed, 48 insertions(+)
+
+diff --git a/include/wld/wld.h b/include/wld/wld.h
+index f335e96..2805d98 100644
+--- a/include/wld/wld.h
++++ b/include/wld/wld.h
+@@ -1327,6 +1327,9 @@ typedef struct wld_radioWiFi7Cap {
+ 
+ typedef struct wld_radioWiFi8Cap {
+     bool npcaConfigurationSupport; bool elrRxSupport; bool elrTxSupport; bool druSupport;
++    bool smdCapable; bool smdDlForwarding;
++    bool perSmdPtkSupport; bool perApPtkSupport;
++    bool perApMacSapSupport; bool perSmdMacSapSupport;
+     bool coordinatedBfSupport; bool coordinatedSrSupport; bool coordinatedTdmaSupport;
+     /* TODO: Populate RTWT/CR when driver/kernel capability bits are defined. */
+     bool coordinatedRtwtSupport; bool coordinatedCrSupport;
+diff --git a/include/wld/wld_nl80211_compat.h b/include/wld/wld_nl80211_compat.h
+index c007a0f..6b5d89a 100644
+--- a/include/wld/wld_nl80211_compat.h
++++ b/include/wld/wld_nl80211_compat.h
+@@ -314,6 +314,8 @@
+ #define NL80211_ATTR_MLO_SUPPORT NL80211_ATTR(315)
+ #define NL80211_ATTR_EML_CAPABILITY NL80211_ATTR(317)
+ #define NL80211_ATTR_MLD_CAPA_AND_OPS NL80211_ATTR(318)
++#define NL80211_EXT_FEATURE_SMD_SUPPORT_AP 80
++#define NL80211_EXT_FEATURE_SMD_SUPPORT_DL_PKT_FRWRD 81
+ 
+ //defined since kernel >= 6.3
+ #define NL80211_ATTR_PUNCT_BITMAP NL80211_ATTR(322)
+diff --git a/include/wld/wld_nl80211_types.h b/include/wld/wld_nl80211_types.h
+index 826fc4e..a1c9baa 100644
+--- a/include/wld/wld_nl80211_types.h
++++ b/include/wld/wld_nl80211_types.h
+@@ -230,6 +230,8 @@ typedef struct {
+ 
+ typedef struct {
+     bool mloSupport[WLD_WIPHY_IFTYPE_MAX];                 // support MLO (depends on EML_CAPABILITY / MLD_CAPA_AND_OPS)
++    bool smdCapable;                                       // support Seamless Mobility Domain as AP
++    bool smdDlForwarding;                                  // support SMD downlink forwarding
+     bool emlsrSupport[WLD_WIPHY_IFTYPE_MAX];               // support EMLSR mlo mode
+     bool emlmrSupport[WLD_WIPHY_IFTYPE_MAX];               // support EMLMR mlo mode
+     bool strSupport[WLD_WIPHY_IFTYPE_MAX];                 // support STR mlo mode (along with MLMR or EMLMR)
+diff --git a/odl/wld_radio.odl b/odl/wld_radio.odl
+index 463f005..08f5794 100644
+--- a/odl/wld_radio.odl
++++ b/odl/wld_radio.odl
+@@ -4079,6 +4079,32 @@ define probelist_t{
+ 			}
+ 
+ 			%read-only object WiFi8APRole{
++				/**
++				 * Indicates whether the AP supports Seamless Mobility Domain (SMD).
++				 * Source: NL80211_EXT_FEATURE_SMD_SUPPORT_AP.
++				 */
++				%read-only bool SMDCapable;
++				/**
++				 * Indicates whether the AP supports downlink forwarding for SMD.
++				 * Source: NL80211_EXT_FEATURE_SMD_SUPPORT_DL_PKT_FRWRD.
++				 */
++				%read-only bool SMDDLForwarding;
++				/**
++				 * Indicates support for Per-SMD PTK mode.
++				 */
++				%read-only bool PerSMDPTKSupport;
++				/**
++				 * Indicates support for Per-AP PTK mode.
++				 */
++				%read-only bool PerAPPTKSupport;
++				/**
++				 * Indicates support for Per-AP MAC SAP.
++				 */
++				%read-only bool PerAPMACSAPSupport;
++				/**
++				 * Indicates support for Per-SMD MAC SAP.
++				 */
++				%read-only bool PerSMDMacSapSupport;
+ 				%read-only bool NPCAConfigurationSupport;
+ 				%read-only bool ELRRxSupport;
+ 				%read-only bool ELRTxSupport;
+diff --git a/src/Plugin/wifiGen_rad.c b/src/Plugin/wifiGen_rad.c
+index cee5bdb..5fefee8 100644
+--- a/src/Plugin/wifiGen_rad.c
++++ b/src/Plugin/wifiGen_rad.c
+@@ -881,6 +881,13 @@ int wifiGen_rad_supports(T_Radio* pRad, char* buf _UNUSED, int bufsize _UNUSED)
+         }
+     }
+ 
++    pRad->cap.apCap8.smdCapable = wiphyInfo.extCapas.smdCapable;
++    pRad->cap.apCap8.smdDlForwarding = wiphyInfo.extCapas.smdDlForwarding;
++    pRad->cap.apCap8.perSmdPtkSupport = false;
++    pRad->cap.apCap8.perApPtkSupport = false;
++    pRad->cap.apCap8.perApMacSapSupport = false;
++    pRad->cap.apCap8.perSmdMacSapSupport = false;
++
+     SAH_TRACEZ_OUT(ME);
+     return SWL_RC_OK;
+ }
+diff --git a/src/nl80211/wld_nl80211_parser.c b/src/nl80211/wld_nl80211_parser.c
+index 6ba7244..44ec5b9 100644
+--- a/src/nl80211/wld_nl80211_parser.c
++++ b/src/nl80211/wld_nl80211_parser.c
+@@ -1065,6 +1065,8 @@ static swl_rc_ne s_parseSuppFeatures(struct nlattr* tb[], wld_nl80211_wiphyInfo_
+             pWiphy->suppFeatures.dfsOffload = s_extFeatureIsSet(extFeat, extFeatLen, NL80211_EXT_FEATURE_DFS_OFFLOAD);
+         }
+         pWiphy->suppFeatures.scanDwell = s_extFeatureIsSet(extFeat, extFeatLen, NL80211_EXT_FEATURE_SET_SCAN_DWELL);
++        pWiphy->extCapas.smdCapable = s_extFeatureIsSet(extFeat, extFeatLen, NL80211_EXT_FEATURE_SMD_SUPPORT_AP);
++        pWiphy->extCapas.smdDlForwarding = s_extFeatureIsSet(extFeat, extFeatLen, NL80211_EXT_FEATURE_SMD_SUPPORT_DL_PKT_FRWRD);
+         if(s_extFeatureIsSet(extFeat, extFeatLen, NL80211_EXT_FEATURE_RADAR_BACKGROUND) &&
+            NL80211_CMD_IS_SPECIFIED(NL80211_CMD_RADAR_DETECT) &&
+            NL80211_ATTR_IS_SPECIFIED(NL80211_ATTR_RADAR_BACKGROUND)) {
+diff --git a/src/wld_radio.c b/src/wld_radio.c
+index 24e1be5..78e0922 100644
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -2070,6 +2070,12 @@ static void s_writeCapabilities(T_Radio* pR, amxd_trans_t* trans) {
+     amxd_trans_set_bool(trans, "ELRRxSupport", pR->cap.apCap8.elrRxSupport);
+     amxd_trans_set_bool(trans, "ELRTxSupport", pR->cap.apCap8.elrTxSupport);
+     amxd_trans_set_bool(trans, "DRUSupport", pR->cap.apCap8.druSupport);
++    amxd_trans_set_bool(trans, "SMDCapable", pR->cap.apCap8.smdCapable);
++    amxd_trans_set_bool(trans, "SMDDLForwarding", pR->cap.apCap8.smdDlForwarding);
++    amxd_trans_set_bool(trans, "PerSMDPTKSupport", pR->cap.apCap8.perSmdPtkSupport);
++    amxd_trans_set_bool(trans, "PerAPPTKSupport", pR->cap.apCap8.perApPtkSupport);
++    amxd_trans_set_bool(trans, "PerAPMACSAPSupport", pR->cap.apCap8.perApMacSapSupport);
++    amxd_trans_set_bool(trans, "PerSMDMacSapSupport", pR->cap.apCap8.perSmdMacSapSupport);
+     amxd_object_t* ap8MapcObj = amxd_object_findf(ap8Obj, "MAPC");
+     amxd_trans_select_object(trans, ap8MapcObj);
+     amxd_trans_set_bool(trans, "CoordinatedBFSupport", pR->cap.apCap8.coordinatedBfSupport);
+-- 
+2.34.1
+
