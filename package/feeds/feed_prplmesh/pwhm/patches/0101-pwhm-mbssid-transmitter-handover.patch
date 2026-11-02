@@ -1,0 +1,452 @@
+From: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
+Subject: [PATCH] pwhm: hand over MBSSID transmitters before MLO link removal
+
+Read the live MBSSID group and promote an enabled, verified replacement
+before removing a transmitter used by other profiles. Confirm group
+membership and link recovery before proceeding with graceful removal.
+Allow a sole profile on a band to leave without stopping its other MLD
+links. Prepare dependencies on every affected band before anchor migration.
+Bound preflight retries so a failed handover does not block later commits.
+
+Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
+
+--- a/include/wld/wld_hostapd_ap_api.h
++++ b/include/wld/wld_hostapd_ap_api.h
+@@ -103,6 +103,10 @@
+ wld_secDmn_action_rc_ne wld_ap_hostapd_setMldParams(T_AccessPoint* pAP);
+ wld_secDmn_action_rc_ne wld_ap_hostapd_setEnableVap(T_AccessPoint* pAP, bool enable);
+ wld_secDmn_action_rc_ne wld_ap_hostapd_enableVap(T_AccessPoint* pAP, bool enable);
++/* Check the live MBSSID group; unknown membership is unsafe to remove. */
++swl_rc_ne wld_ap_hostapd_checkMbssidRemoval(T_AccessPoint* pAP);
++/* Hand over a dependent MBSSID transmitter before removing an MLO link. */
++swl_rc_ne wld_ap_hostapd_prepareMloRemoval(T_AccessPoint* pAP);
+ 
+ /**
+  * @brief reload hostapd bss config from memory
+--- a/src/Plugin/wifiGen_fsm.c
++++ b/src/Plugin/wifiGen_fsm.c
+@@ -487,8 +487,27 @@
+     if(!wld_rad_hasMbssidAds(pRad) || !s_hasForeignMldOnRadio(pAP, pRad)) {
+         return false;
+     }
+-    T_AccessPoint* pTxAP = wld_rad_hostapd_getRunMainVap(pRad);
+-    return (pTxAP == NULL) || (pTxAP == pAP);
++    /* bss[0] need not be the transmitter after a multi-MBSSID handover. */
++    return !swl_rc_isOk(wld_ap_hostapd_checkMbssidRemoval(pAP));
++}
++
++/* A permanent handover failure must not retain the shared FSM lock forever.
++ * Only cancel this AP's active link actions. Pending edits and other APs keep
++ * their actions; a subsequent request gets a fresh retry budget. */
++static bool s_retryMbssidRemoval(T_AccessPoint* pAP, T_Radio* pRad) {
++    if(++pAP->fsm.retryCount < 5) {
++        pRad->fsmRad.timeout_msec = 1000;
++        return false;
++    }
++    SAH_TRACEZ_ERROR(ME, "%s: MBSSID removal failed after 5 attempts; retaining BSS and releasing commit",
++                     pAP->alias);
++    pAP->fsm.retryCount = 0;
++    pAP->fsm.FSM_Error = 1;
++    clearBitLongArray(pAP->fsm.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_ENABLE_AP);
++    clearBitLongArray(pAP->fsm.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_REMOVE_LINK);
++    clearBitLongArray(pAP->fsm.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_ADD_LINK);
++    setBitLongArray(pRad->fsmRad.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_SYNC_STATE);
++    return true;
+ }
+ 
+ static bool s_hasForeignMldInDaemon(T_AccessPoint* pAP, T_Radio* pRad) {
+@@ -807,14 +826,29 @@
+     ASSERTI_TRUE(pRad->enable, true, ME, "%s: radio disabled", pRad->Name);
+     ASSERTI_TRUE(wifiGen_hapd_isAlive(pRad), true, ME, "%s: hostapd stopped", pRad->Name);
+     T_AccessPoint* pMainAPCur = wld_rad_hostapd_getRunMainVap(pRad);
+-    ASSERT_NOT_NULL(pMainAPCur, true, ME, "%s: no main vap iface for rad %s", pAP->alias, pRad->Name);
+     bool enable = wld_ap_isEnabledWithRef(pAP);
+     SAH_TRACEZ_INFO(ME, "%s: enable vap %d", pAP->alias, enable);
++    if(!enable && wld_rad_hasMbssidAds(pRad) && s_isLinkRemoveSupported(pRad) &&
++       (pAP->pSSID != NULL) && (pAP->pSSID->pMldLink != NULL) &&
++       (wld_mld_countNeighLinks(pAP->pSSID->pMldLink) > 1)) {
++        if(!swl_rc_isOk(wld_ap_hostapd_prepareMloRemoval(pAP))) {
++            return s_retryMbssidRemoval(pAP, pRad);
++        }
++        pAP->fsm.retryCount = 0;
++        pAP->fsm.FSM_Error = 0;
++        /* This includes a sole VAP on this band: keep its other MLD links.
++         * Do not STOP_AP or deauthenticate before graceful LINK_REMOVE. */
++        s_cacheMloAnchor(pAP->pSSID);
++        setBitLongArray(pAP->fsm.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_REMOVE_LINK);
++        setBitLongArray(pRad->fsmRad.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_REMOVE_LINK);
++        return true;
++    }
+     if(!enable && s_isUnsafeMbssidRemoval(pAP, pRad)) {
+-        SAH_TRACEZ_ERROR(ME, "%s: refuse disable of MBSSID transmitter used by other MLDs", pAP->alias);
+-        pRad->fsmRad.timeout_msec = 1000;
+-        return false;
+-    }
++        return s_retryMbssidRemoval(pAP, pRad);
++    }
++    pAP->fsm.retryCount = 0;
++    pAP->fsm.FSM_Error = 0;
++    ASSERT_NOT_NULL(pMainAPCur, true, ME, "%s: no main vap iface for rad %s", pAP->alias, pRad->Name);
+     if(!enable && s_isLinkRemoveSupported(pRad) &&
+        (pAP->pSSID != NULL) && (pAP->pSSID->pMldLink != NULL) &&
+        (wld_mld_countNeighLinks(pAP->pSSID->pMldLink) > 1)) {
+@@ -1301,7 +1335,10 @@
+      * the first callback may be for a link that remains in the larger WLD
+      * group.  Rebuild that larger group; otherwise recovery restores only
+      * the one link that moved out and leaves the retained links standalone. */
+-    if((pMarkedSource == NULL) && (pTarget != NULL) && (targetCount > sourceCount)) {
++    /* A retry may have removed every source member's control socket.
++     * Keep the source recorded by the rebuild barrier in that case. */
++    if((pMarkedSource == NULL) && !pSource->hostapdRebuildPending &&
++       (pTarget != NULL) && (targetCount > sourceCount)) {
+         SAH_TRACEZ_INFO(ME, "%s: select retained MLD unit %d for runtime rebuild (%zu links vs %zu)",
+                         pAP->alias, pTarget->unit, targetCount, sourceCount);
+         pSource = pTarget;
+@@ -1317,17 +1354,61 @@
+         return SWL_RC_INVALID_STATE;
+     }
+     for(size_t i = 0; i < count; i++) {
+-        if(s_isUnsafeMbssidRemoval(members[i].ap, members[i].ap->pRadio)) {
+-            SAH_TRACEZ_ERROR(ME, "%s: MLD migration requires MBSSID transmitter handover; preserve other MLDs",
+-                             members[i].ap->alias);
+-            return SWL_RC_INVALID_STATE;
+-        }
+         for(size_t j = i + 1; j < count; j++) {
+             if(members[i].linkId == members[j].linkId) {
+                 return SWL_RC_INVALID_STATE;
+             }
+         }
+     }
++    /* An anchor move removes every remaining link in its runtime MLD,
++     * including transmitters on other bands. Prepare those dependencies
++     * before the first REMOVE, just as the ordinary VAP disable path does.
++     * A lost handover reply may have changed the role already: on retry,
++     * also verify recovery of groups whose transmitter now looks safe. */
++    bool retryHandover = (pAP->fsm.retryCount > 0);
++    bool preparedHandover = false;
++    for(size_t i = 0; i < count; i++) {
++        T_AccessPoint* pMember = members[i].ap;
++        T_Radio* pMemberRad = pMember->pRadio;
++        if(!s_isUnsafeMbssidRemoval(pMember, pMemberRad) &&
++           !(retryHandover && wld_rad_hasMbssidAds(pMemberRad) &&
++             s_hasForeignMldOnRadio(pMember, pMemberRad))) {
++            continue;
++        }
++        if(!swl_rc_isOk(wld_ap_hostapd_prepareMloRemoval(pMember)) ||
++           s_isUnsafeMbssidRemoval(pMember, pMemberRad)) {
++            SAH_TRACEZ_ERROR(ME, "%s: cannot prepare MBSSID member %s for MLD migration",
++                             pAP->alias, pMember->alias);
++            /* Once removal has begun, keep the existing rebuild barrier
++             * and recovery path. Preflight failure can safely end this
++             * request without leaving a shared FSM lock held forever. */
++            if(pSource->hostapdRebuildPending) {
++                return SWL_RC_INVALID_STATE;
++            }
++            return s_retryMbssidRemoval(pAP, pRad) ? SWL_RC_OK : SWL_RC_ERROR;
++        }
++        preparedHandover = true;
++    }
++    if(preparedHandover) {
++        /* The saved REMOVE targets must still identify the same links
++         * after hostapd has stopped/started an MBSSID group. */
++        for(size_t i = 0; i < count; i++) {
++            char runIface[128] = {0};
++            int32_t linkId = NO_LINK_ID;
++            T_AccessPoint* pMember = members[i].ap;
++            if(!swl_rc_isOk(wld_ap_hostapd_getRunIface(pMember, runIface, sizeof(runIface))) ||
++               !swl_str_matches(runIface, pAP->alias) ||
++               !swl_rc_isOk(wld_ap_hostapd_getMldLinkId(pMember, &linkId)) ||
++               (linkId != members[i].linkId)) {
++                if(pSource->hostapdRebuildPending) {
++                    return SWL_RC_INVALID_STATE;
++                }
++                return s_retryMbssidRemoval(pAP, pRad) ? SWL_RC_OK : SWL_RC_ERROR;
++            }
++        }
++    }
++    pAP->fsm.retryCount = 0;
++    pAP->fsm.FSM_Error = 0;
+     pSource->hostapdRebuildPending = true;
+     swl_str_copy(pSource->hostapdAnchorIface, sizeof(pSource->hostapdAnchorIface), pAP->alias);
+ 
+@@ -1433,12 +1514,6 @@
+     ASSERTS_TRUE(wld_wpaCtrlInterface_isReady(pAP->wpaCtrlInterface), true, ME,
+                  "%s: wpaCtrl disconnected", pAP->alias);
+ 
+-    if(s_isUnsafeMbssidRemoval(pAP, pRad)) {
+-        SAH_TRACEZ_ERROR(ME, "%s: refuse removal of MBSSID transmitter used by other MLDs", pAP->alias);
+-        pRad->fsmRad.timeout_msec = 1000;
+-        return false;
+-    }
+-
+     uint32_t nLinks = 0;
+     bool isRemoveLinkSupported = s_isLinkRemoveSupported(pRad);
+     if(!swl_rc_isOk(wld_ap_hostapd_getNumMldLinks(pAP, &nLinks))) {
+@@ -1446,6 +1521,21 @@
+         return false;
+     }
+     bool isMultiLink = (nLinks >= 2);
++    if(wld_rad_hasMbssidAds(pRad) && s_isLinkRemoveSupported(pRad) &&
++       (pAP->pSSID != NULL) && (pAP->pSSID->pMldLink != NULL) &&
++       (isMultiLink || (wld_mld_countNeighLinks(pAP->pSSID->pMldLink) > 1))) {
++        /* Recheck even when bss[0] names another AP: it may have been demoted. */
++        /* MLDUnit may already name a one-link destination while this BSS
++         * remains a transmitter in the old runtime MLD. */
++        if(!swl_rc_isOk(wld_ap_hostapd_prepareMloRemoval(pAP))) {
++            return s_retryMbssidRemoval(pAP, pRad);
++        }
++    } else if(s_isUnsafeMbssidRemoval(pAP, pRad)) {
++        return s_retryMbssidRemoval(pAP, pRad);
++    }
++    pAP->fsm.retryCount = 0;
++    pAP->fsm.FSM_Error = 0;
++
+     /* Runtime membership wins over the destination WLD group's link count. */
+     if(isRemoveLinkSupported && isMultiLink) {
+         return s_removeMloLink(pAP, pRad);
+--- a/src/nl80211/wld_hostapd_ap_api.c
++++ b/src/nl80211/wld_hostapd_ap_api.c
+@@ -74,6 +74,7 @@
+ #include "swl/swl_hex.h"
+ #include "swl/swl_common_mac.h"
+ #include "wld_rad_nl80211.h"
++#include "wld_ap_nl80211.h"
+ 
+ #define ME "hapdAP"
+ 
+@@ -1735,6 +1736,235 @@
+     return rc;
+ }
+ 
++static bool s_isLiveMbssidMloLink(T_AccessPoint* pAP) {
++    if((pAP->pSSID == NULL) || (pAP->pSSID->pMldLink == NULL) ||
++       !wld_wpaCtrlInterface_isReady(pAP->wpaCtrlInterface)) {
++        return false;
++    }
++    wld_nl80211_ifaceInfo_t info;
++    memset(&info, 0, sizeof(info));
++    char runIface[128] = {0};
++    int32_t linkId = NO_LINK_ID;
++    if(!swl_rc_isOk(wld_ap_nl80211_getInterfaceInfo(pAP, &info)) || !info.isAp ||
++       !swl_rc_isOk(wld_ap_hostapd_getRunIface(pAP, runIface, sizeof(runIface))) ||
++       !swl_str_matches(info.name, runIface) ||
++       !swl_rc_isOk(wld_ap_hostapd_getMldLinkId(pAP, &linkId))) {
++        return false;
++    }
++    const wld_nl80211_ifaceMloLinkInfo_t* link =
++        wld_nl80211_fetchIfaceMloLinkByFreqBand(&info, pAP->pRadio->operatingFrequencyBand);
++    return (link != NULL) && (linkId >= 0) && (link->link.linkId == linkId) &&
++           (link->chanSpec.ctrlFreq != 0) &&
++           swl_typeMacBin_equals(link->link.linkMac, *wld_ssid_getLinkMac(pAP->pSSID));
++}
++
++/* GET mbssid_attributes identifies the transmitting profile of each group.
++ * STATUS bssid[0] identifies the first radio BSS and need not be that profile
++ * after SET_MBSSID_TX rotates a multi-MBSSID group's list. Match link MACs,
++ * since the displayed interface names are MLD anchors shared across bands. */
++static swl_rc_ne s_getMbssidGroup(T_AccessPoint* pAP, T_AccessPoint** members,
++                                 size_t capacity, size_t* count, T_AccessPoint** tx) {
++    char reply[4096] = {0};
++    struct {
++        T_AccessPoint* ap;
++        char iface[128];
++        unsigned index;
++        unsigned group;
++        bool transmitting;
++    } rows[32];
++    size_t nRows = 0;
++    int target = -1;
++    *count = 0;
++    *tx = NULL;
++    swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtGetResponse(pAP->wpaCtrlInterface, reply, sizeof(reply),
++                                                    "GET mbssid_attributes");
++    /* The configured mode may differ from the running radio during an edit.
++     * Only this explicit hostapd reply proves that no shared group exists. */
++    if(swl_rc_isOk(rc) && (swl_str_matches(reply, "MBSSID is disabled") ||
++                          swl_str_matches(reply, "MBSSID is disabled\n"))) {
++        return SWL_RC_OK;
++    }
++    ASSERT_TRUE(swl_rc_isOk(rc) && (strlen(reply) < sizeof(reply) - 2) &&
++                (strstr(reply, "BSSID_INDEX") != NULL), SWL_RC_ERROR, ME,
++                "%s: cannot read complete MBSSID membership", pAP->alias);
++    bool multiGroup = (strstr(reply, "GRP_ID") != NULL);
++    ASSERT_TRUE(strstr(reply, multiGroup ? "mbssid_group_size =" : "mbssid_idx_bmap =") != NULL,
++                SWL_RC_ERROR, ME, "%s: incomplete MBSSID table", pAP->alias);
++    unsigned groupMask = 0, reportedGroups = 0;
++    size_t completeGroups = 0;
++    bool complete = true, hasGroupCount = false;
++    char* save = NULL;
++    for(char* line = strtok_r(reply, "\n", &save); line != NULL; line = strtok_r(NULL, "\n", &save)) {
++        if(multiGroup && (strncmp(line, "mbssid_idx_bmap =", 16) == 0)) {
++            unsigned mask = 0;
++            char extra;
++            complete &= (sscanf(line, "mbssid_idx_bmap = %x %c", &mask, &extra) == 1) &&
++                        (mask == groupMask) && ((groupMask & 1) != 0);
++            groupMask = 0;
++            completeGroups++;
++            continue;
++        }
++        if(multiGroup && (strncmp(line, "current_active_ngroups =", 23) == 0)) {
++            char extra;
++            complete &= !hasGroupCount;
++            hasGroupCount = (sscanf(line, "current_active_ngroups = %u %c", &reportedGroups, &extra) == 1);
++            continue;
++        }
++        if((strncmp(line, "IFACE ", 6) == 0) || (strncmp(line, "==", 2) == 0) ||
++           (strncmp(line, "mbssid_idx_bmap =", 16) == 0) ||
++           (strncmp(line, "current_active_ngroups =", 23) == 0) ||
++           (strncmp(line, "max_ngroups =", 13) == 0) ||
++           (strncmp(line, "mbssid_group_size =", 19) == 0)) {
++            continue;
++        }
++        char iface[128], macStr[18];
++        int offset = 0;
++        ASSERT_TRUE(sscanf(line, "%127s %17s %n", iface, macStr, &offset) == 2,
++                    SWL_RC_ERROR, ME, "%s: malformed MBSSID row", pAP->alias);
++        swl_macBin_t mac;
++        ASSERT_TRUE(swl_typeMacBin_fromChar(&mac, macStr), SWL_RC_ERROR, ME, "Invalid MBSSID MAC");
++        char* rest = line + offset;
++        bool transmitting = (*rest == '*');
++        if(transmitting) {
++            rest++;
++        }
++        unsigned index = 0, group = 0;
++        char extra;
++        int fields = sscanf(rest, "%u %u %c", &index, &group, &extra);
++        ASSERT_TRUE((fields == (multiGroup ? 2 : 1)) && (index < 32) &&
++                    (transmitting == (index == 0)) && (nRows < SWL_ARRAY_SIZE(rows)),
++                    SWL_RC_ERROR, ME, "%s: invalid MBSSID row", pAP->alias);
++        T_AccessPoint* mapped = NULL;
++        T_AccessPoint* other = NULL;
++        wld_rad_forEachAp(other, pAP->pRadio) {
++            if((other->pSSID != NULL) &&
++               swl_typeMacBin_equals(mac, *wld_ssid_getLinkMac(other->pSSID))) {
++                ASSERT_TRUE(mapped == NULL, SWL_RC_ERROR, ME, "Ambiguous MBSSID MAC");
++                mapped = other;
++            }
++        }
++        for(size_t i = 0; i < nRows; i++) {
++            ASSERT_TRUE((mapped == NULL) || (rows[i].ap != mapped), SWL_RC_ERROR, ME, "Duplicate MBSSID row");
++            ASSERT_TRUE((rows[i].group != group) || (rows[i].index != index), SWL_RC_ERROR, ME, "Duplicate MBSSID index");
++        }
++        rows[nRows].ap = mapped;
++        swl_str_copy(rows[nRows].iface, sizeof(rows[nRows].iface), iface);
++        rows[nRows].index = index;
++        rows[nRows].group = group;
++        rows[nRows].transmitting = transmitting;
++        groupMask |= 1U << index;
++        if(mapped == pAP) {
++            target = (int) nRows;
++        }
++        nRows++;
++    }
++    if(target < 0) {
++        /* A dynamically added BSS can predate multi-MBSSID group setup.
++         * Hostapd omits such an ungrouped BSS from this table and its removal
++         * has no group cascade. Require complete group bitmaps/counts and a
++         * verified live target; an incomplete or wrong-radio reply is unsafe. */
++        ASSERT_TRUE(multiGroup && complete && hasGroupCount && (groupMask == 0) &&
++                    (reportedGroups == completeGroups) && s_isLiveMbssidMloLink(pAP),
++                    SWL_RC_ERROR, ME, "%s: link missing from unverified MBSSID table", pAP->alias);
++        for(size_t i = 0; i < nRows; i++) {
++            char runIface[128] = {0};
++            ASSERT_TRUE((rows[i].ap != NULL) &&
++                        swl_rc_isOk(wld_ap_hostapd_getRunIface(rows[i].ap, runIface, sizeof(runIface))) &&
++                        swl_str_matches(runIface, rows[i].iface), SWL_RC_ERROR, ME,
++                        "%s: unverified MBSSID table member", pAP->alias);
++        }
++        SAH_TRACEZ_WARNING(ME, "%s: live BSS has no multi-MBSSID group; no handover needed", pAP->alias);
++        return SWL_RC_OK;
++    }
++    for(size_t i = 0; i < nRows; i++) {
++        if(rows[i].group != rows[target].group) {
++            continue;
++        }
++        ASSERT_TRUE((rows[i].ap != NULL) && (*count < capacity), SWL_RC_ERROR, ME,
++                    "%s: unmapped MBSSID group member", pAP->alias);
++        char runIface[128] = {0};
++        ASSERT_TRUE(swl_rc_isOk(wld_ap_hostapd_getRunIface(rows[i].ap, runIface, sizeof(runIface))) &&
++                    swl_str_matches(runIface, rows[i].iface), SWL_RC_ERROR, ME, "MBSSID interface mismatch");
++        members[(*count)++] = rows[i].ap;
++        if(rows[i].transmitting) {
++            ASSERT_TRUE(*tx == NULL, SWL_RC_ERROR, ME, "Ambiguous MBSSID transmitter");
++            *tx = rows[i].ap;
++        }
++    }
++    ASSERT_NOT_NULL(*tx, SWL_RC_ERROR, ME, "Missing MBSSID transmitter");
++    return SWL_RC_OK;
++}
++
++swl_rc_ne wld_ap_hostapd_checkMbssidRemoval(T_AccessPoint* pAP) {
++    ASSERT_NOT_NULL(pAP, SWL_RC_INVALID_PARAM, ME, "NULL AP");
++    ASSERT_NOT_NULL(pAP->pRadio, SWL_RC_INVALID_PARAM, ME, "NULL radio");
++    T_AccessPoint* members[32];
++    size_t count = 0;
++    T_AccessPoint* tx = NULL;
++    swl_rc_ne rc = s_getMbssidGroup(pAP, members, SWL_ARRAY_SIZE(members), &count, &tx);
++    if(!swl_rc_isOk(rc)) {
++        return rc;
++    }
++    return ((tx != pAP) || (count == 1)) ? SWL_RC_OK : SWL_RC_INVALID_STATE;
++}
++
++
++/* Transfer the MBSSID transmitter before removing it, so hostapd's removal
++ * cascade cannot remove another MLD. The supported hostapd handover briefly
++ * stops/starts this band's group; it does not restart the radio or daemon.
++ * Only use auto_start when every other profile is enabled and live, since
++ * hostapd otherwise also starts administratively disabled profiles. */
++swl_rc_ne wld_ap_hostapd_prepareMloRemoval(T_AccessPoint* pAP) {
++    ASSERT_NOT_NULL(pAP, SWL_RC_INVALID_PARAM, ME, "NULL AP");
++    ASSERT_NOT_NULL(pAP->pRadio, SWL_RC_INVALID_PARAM, ME, "NULL radio");
++    ASSERT_TRUE(s_isLiveMbssidMloLink(pAP), SWL_RC_ERROR, ME, "%s: unverified MLO link", pAP->alias);
++    T_AccessPoint* members[32];
++    size_t count = 0;
++    T_AccessPoint* tx = NULL;
++    swl_rc_ne rc = s_getMbssidGroup(pAP, members, SWL_ARRAY_SIZE(members), &count, &tx);
++    ASSERT_TRUE(swl_rc_isOk(rc), rc, ME, "%s: unknown MBSSID membership", pAP->alias);
++    bool needsHandover = ((tx == pAP) && (count > 1));
++    T_AccessPoint* replacement = NULL;
++    for(size_t i = 0; i < count; i++) {
++        T_AccessPoint* peer = members[i];
++        ASSERT_TRUE(s_isLiveMbssidMloLink(peer), SWL_RC_ERROR, ME, "%s: MBSSID member not live", peer->alias);
++        if((peer == pAP) || !needsHandover) {
++            continue;
++        }
++        ASSERT_TRUE(wld_ap_isEnabledWithRef(peer), SWL_RC_ERROR, ME,
++                    "%s: do not restart a disabled MBSSID profile", peer->alias);
++        if(replacement == NULL) {
++            replacement = peer;
++        }
++    }
++    if(!needsHandover) {
++        /* Other ready WLD sockets can belong to different MBSSID groups
++         * or to an MLD whose link on this radio has already disappeared. */
++        return SWL_RC_OK;
++    }
++    ASSERT_NOT_NULL(replacement, SWL_RC_ERROR, ME, "%s: no replacement MBSSID transmitter", pAP->alias);
++    SAH_TRACEZ_WARNING(ME, "%s: hand over MBSSID transmitter to %s before link removal",
++                       pAP->alias, replacement->alias);
++    rc = wld_wpaCtrl_sendCmdFmtCheckResponseExt(replacement->wpaCtrlInterface, 10000, "OK",
++                                               "SET_MBSSID_TX auto_stop auto_start");
++    ASSERT_TRUE(swl_rc_isOk(rc), rc, ME, "%s: MBSSID handover failed", pAP->alias);
++    T_AccessPoint* after[32];
++    size_t afterCount = 0;
++    rc = s_getMbssidGroup(replacement, after, SWL_ARRAY_SIZE(after), &afterCount, &tx);
++    ASSERT_TRUE(swl_rc_isOk(rc) && (tx == replacement) && (afterCount == count),
++                SWL_RC_ERROR, ME, "%s: MBSSID handover not confirmed", pAP->alias);
++    for(size_t i = 0; i < count; i++) {
++        bool found = false;
++        for(size_t j = 0; j < afterCount; j++) {
++            found |= (after[j] == members[i]);
++        }
++        ASSERT_TRUE(found && s_isLiveMbssidMloLink(members[i]), SWL_RC_ERROR, ME,
++                    "%s: waiting for MBSSID member recovery", members[i]->alias);
++    }
++    return SWL_RC_OK;
++}
++
++
+ swl_rc_ne wld_ap_hostapd_removeBss(T_AccessPoint* pAP) {
+     ASSERT_NOT_NULL(pAP, SWL_RC_INVALID_PARAM, ME, "NULL");
+     T_Radio* pRad = pAP->pRadio;
