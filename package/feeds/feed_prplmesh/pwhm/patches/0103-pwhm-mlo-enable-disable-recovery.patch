@@ -1,0 +1,343 @@
+From: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
+Subject: [PATCH] pwhm: restore MLO links on retained anchors after re-enable
+
+Keep the verified kernel MLD anchor when a radio rejoins surviving links.
+Queue per-BSS additions instead of removing the retained MLD through a
+control socket now serving another band. Preserve normal migration and
+cold-start handling.
+
+Reconcile stale hostapdRemoved state after a complete shutdown/start while
+retaining the obligation to restore missing sibling links. This fixes
+partial re-enable after a full disable/enable cycle without losing links
+or moving them to an incorrect anchor.
+
+Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
+
+--- a/include_priv/Plugin/wifiGen_mld.h
++++ b/include_priv/Plugin/wifiGen_mld.h
+@@ -65,9 +65,11 @@
+ 
+ #include "wld/wld_types.h"
+ #include "wld/wld_wpaCtrl_types.h"
++#include "wld/wld_nl80211_types.h"
+ 
+ T_SSID* wifiGen_mld_fetchSockLinkSSID(wld_wpaCtrlMngr_t* pMgr, const char* sockName);
+ T_SSID* wifiGen_mld_selectPrimLinkSSID(T_SSID* pSSID);
++bool wifiGen_mld_getRunningApMldInfo(T_SSID* pSSID, wld_nl80211_ifaceInfo_t* pInfo);
+ swl_rc_ne wifiGen_mld_reconfigureNeighLinkSSIDs(T_SSID* pSSID);
+ 
+ #endif /* INCLUDE_PRIV_PLUGIN_WIFIGEN_MLD_H_ */
+--- a/src/Plugin/wifiGen_fsm.c
++++ b/src/Plugin/wifiGen_fsm.c
+@@ -811,23 +811,88 @@
+     T_SSID* pSSID = pAP->pSSID;
+     if((pSSID == NULL) || (pSSID->pMldLink == NULL) ||
+        !wld_mld_isLinkEnabled(pSSID->pMldLink) ||
+-       wld_mld_isLinkActive(pSSID->pMldLink) ||
+        !s_isLinkRemoveSupported(pRad)) {
+         return false;
+     }
++    /* A retained group socket can cache a surviving sibling's link ID.
++     * Verified kernel membership takes precedence over that cached ID. */
++    wld_nl80211_ifaceInfo_t info;
++    if(wifiGen_mld_getRunningApMldInfo(pSSID, &info)) {
++        const wld_nl80211_ifaceMloLinkInfo_t* link =
++            wld_nl80211_fetchIfaceMloLinkByFreqBand(&info, pRad->operatingFrequencyBand);
++        return (link == NULL) ||
++               !swl_typeMacBin_equals(link->link.linkMac, *wld_ssid_getLinkMac(pSSID));
++    }
++    if(wld_mld_isLinkActive(pSSID->pMldLink)) {
++        return false;
++    }
+     if(wld_mld_countNeighActiveLinks(pSSID->pMldLink) > 0) {
+         return true;
+     }
+     return (pSSID->pMldLink->pMld != NULL) &&
+            pSSID->pMldLink->pMld->hostapdRemoved;
++}
++
++/* A missing WLD control client does not mean that hostapd removed the link.
++ * Reconnect only the kernel-verified BSS before applying an MLO disable. */
++static swl_rc_ne s_reconnectMloApForDisable(T_AccessPoint* pAP) {
++    wld_nl80211_ifaceInfo_t info;
++    swl_rc_ne rc = wld_ap_nl80211_getInterfaceInfo(pAP, &info);
++    if(!swl_rc_isOk(rc)) {
++        return rc;
++    }
++    const wld_nl80211_ifaceMloLinkInfo_t* link =
++        wld_nl80211_fetchIfaceMloLinkByFreqBand(&info, pAP->pRadio->operatingFrequencyBand);
++    ASSERT_TRUE(info.isAp && (link != NULL) && (link->link.linkId >= 0) &&
++                (link->chanSpec.ctrlFreq != 0) &&
++                swl_typeMacBin_equals(link->link.linkMac, *wld_ssid_getLinkMac(pAP->pSSID)),
++                SWL_RC_INVALID_STATE, ME, "%s: cannot verify MLO link for disable", pAP->alias);
++    char sockName[128];
++    snprintf(sockName, sizeof(sockName), "%s_link%d", info.name, link->link.linkId);
++    wld_wpaCtrlInterface_t* ctrl = pAP->wpaCtrlInterface;
++    bool enabled = wld_wpaCtrlInterface_isEnabled(ctrl);
++    if(!wld_wpaCtrlInterface_setConnectionInfo(ctrl, pAP->pRadio->hostapd->ctrlIfaceDir, sockName)) {
++        return SWL_RC_ERROR;
++    }
++    wld_wpaCtrlInterface_setEnable(ctrl, true);
++    bool ready = wld_wpaCtrlInterface_open(ctrl);
++    wld_wpaCtrlInterface_setEnable(ctrl, enabled);
++    char runIface[128] = {0};
++    int32_t linkId = NO_LINK_ID;
++    if(!ready || !swl_rc_isOk(wld_ap_hostapd_getRunIface(pAP, runIface, sizeof(runIface))) ||
++       !swl_str_matches(runIface, info.name) ||
++       !swl_rc_isOk(wld_ap_hostapd_getMldLinkId(pAP, &linkId)) || (linkId != link->link.linkId)) {
++        wld_wpaCtrlInterface_close(ctrl);
++        return SWL_RC_ERROR;
++    }
++    SAH_TRACEZ_WARNING(ME, "%s: recovered %s for pending disable", pAP->alias, sockName);
++    return SWL_RC_OK;
+ }
+ 
+ static bool s_doEnableAp(T_AccessPoint* pAP, T_Radio* pRad) {
+     ASSERTI_TRUE(pRad->enable, true, ME, "%s: radio disabled", pRad->Name);
+     ASSERTI_TRUE(wifiGen_hapd_isAlive(pRad), true, ME, "%s: hostapd stopped", pRad->Name);
+-    T_AccessPoint* pMainAPCur = wld_rad_hostapd_getRunMainVap(pRad);
+     bool enable = wld_ap_isEnabledWithRef(pAP);
+     SAH_TRACEZ_INFO(ME, "%s: enable vap %d", pAP->alias, enable);
++    if(!enable && s_isLinkRemoveSupported(pRad) &&
++       (pAP->pSSID != NULL) && (pAP->pSSID->pMldLink != NULL) &&
++       !wld_wpaCtrlInterface_isReady(pAP->wpaCtrlInterface)) {
++        swl_rc_ne reconnect = s_reconnectMloApForDisable(pAP);
++        if(reconnect == SWL_RC_NOT_AVAILABLE) {
++            return true;
++        }
++        if(!swl_rc_isOk(reconnect)) {
++            if(++pAP->fsm.retryCount < 5) {
++                pRad->fsmRad.timeout_msec = 1000;
++                return false;
++            }
++            SAH_TRACEZ_ERROR(ME, "%s: cannot recover control for disable; releasing commit", pAP->alias);
++            pAP->fsm.retryCount = 0;
++            pAP->fsm.FSM_Error = 1;
++            return true;
++        }
++    }
++    T_AccessPoint* pMainAPCur = wld_rad_hostapd_getRunMainVap(pRad);
+     if(!enable && wld_rad_hasMbssidAds(pRad) && s_isLinkRemoveSupported(pRad) &&
+        (pAP->pSSID != NULL) && (pAP->pSSID->pMldLink != NULL) &&
+        (wld_mld_countNeighLinks(pAP->pSSID->pMldLink) > 1)) {
+@@ -1018,6 +1083,9 @@
+     }
+     wld_mld_t* pMld = ((pAP->pSSID != NULL) && (pAP->pSSID->pMldLink != NULL)) ?
+         pAP->pSSID->pMldLink->pMld : NULL;
++    /* Anchor selection may reconcile a radio-restored MLD below. Preserve
++     * the obligation to queue its other missing links after this ADD. */
++    bool wasHostapdRemoved = (pMld != NULL) && pMld->hostapdRemoved;
+     int32_t existingLinkId = NO_LINK_ID;
+     if(pMld != NULL) {
+         if(pMld->hostapdRebuildPending) {
+@@ -1075,7 +1143,7 @@
+     if((pAP->pSSID != NULL) && (pAP->pSSID->pMldLink != NULL) &&
+        (pAP->pSSID->pMldLink->pMld != NULL)) {
+         wld_mld_t* pAddedMld = pAP->pSSID->pMldLink->pMld;
+-        bool wasHostapdRemoved = pAddedMld->hostapdRemoved;
++        wasHostapdRemoved |= pAddedMld->hostapdRemoved;
+         pAddedMld->hostapdRemoved = false;
+         /* Keep the marker until the replacement primary is back. */
+         if(pAddedMld->pPendingMovedLink != NULL) {
+@@ -1899,6 +1967,52 @@
+ }
+ 
+ static void s_refreshBkhChspec(T_Radio* pRad);
++/* The returning radio is stopped, but its MLD can still run on another
++ * band under the original primary's alias. Never reconfigure that sibling
++ * through the returning AP's retained group control socket. */
++static bool s_isStoppedMloLinkRejoining(T_AccessPoint* pAP) {
++    T_SSID* pSSID = pAP->pSSID;
++    if((pSSID == NULL) || (pSSID->pMldLink == NULL) ||
++       !wld_ap_isEnabledWithRef(pAP) || wifiGen_hapd_isStarted(pAP->pRadio) ||
++       !wld_mld_isLinkUsable(pSSID->pMldLink) || s_hasMovedMloAnchor(pAP)) {
++        return false;
++    }
++    wld_nl80211_ifaceInfo_t info;
++    return wifiGen_mld_getRunningApMldInfo(pSSID, &info) &&
++           (wld_nl80211_fetchIfaceMloLinkByFreqBand(&info, pAP->pRadio->operatingFrequencyBand) == NULL);
++}
++
++static bool s_isStoppedMloRadioRejoining(T_Radio* pRad) {
++    if(wifiGen_hapd_isStarted(pRad) || !s_isLinkRemoveSupported(pRad)) {
++        return false;
++    }
++    bool hasRetainedMld = false;
++    bool hasMissingLink = false;
++    T_AccessPoint* pAP = NULL;
++    wld_rad_forEachAp(pAP, pRad) {
++        if(!wld_ap_isEnabledWithRef(pAP)) {
++            continue;
++        }
++        T_SSID* pSSID = pAP->pSSID;
++        wld_mld_t* pMld = ((pSSID != NULL) && (pSSID->pMldLink != NULL)) ? pSSID->pMldLink->pMld : NULL;
++        if((pMld == NULL) || (pSSID->mldUnit != pMld->unit) ||
++           !wld_mld_isLinkUsable(pSSID->pMldLink) ||
++           pMld->hostapdRebuildPending ||
++           (pMld->pPendingMovedLink != NULL) || s_hasMovedMloAnchor(pAP)) {
++            return false;
++        }
++        wld_nl80211_ifaceInfo_t info;
++        bool hasRunningMld = wifiGen_mld_getRunningApMldInfo(pSSID, &info);
++        hasRetainedMld |= hasRunningMld;
++        hasMissingLink |= !hasRunningMld ||
++                          (wld_nl80211_fetchIfaceMloLinkByFreqBand(&info, pRad->operatingFrequencyBand) == NULL);
++    }
++    /* Mixed existing/missing MLD BSSs must also use per-BSS ADD: the existing
++     * ADD_LINK identity check skips live links without a duplicate ADD.
++     * Cold startup, all-present reconfiguration and migration stay unchanged. */
++    return hasRetainedMld && hasMissingLink;
++}
++
+ static bool s_doStartHostapd(T_Radio* pRad) {
+     wld_secDmn_setRestartNeeded(pRad->hostapd, false);
+     ASSERTI_TRUE(wifiGen_hapd_isStartable(pRad), true, ME, "%s: missing enabling conds", pRad->Name);
+@@ -1910,6 +2024,7 @@
+         SAH_TRACEZ_INFO(ME, "%s: hostapd already started", pRad->Name);
+         return true;
+     }
++    bool rejoiningMld = s_isStoppedMloRadioRejoining(pRad);
+     SAH_TRACEZ_INFO(ME, "%s: start hostapd", pRad->Name);
+     swl_rc_ne rc = wifiGen_hapd_startDaemon(pRad);
+     SAH_TRACEZ_INFO(ME, "%s: start hostapd returns rc : %d", pRad->Name, rc);
+@@ -1925,7 +2040,16 @@
+         }
+         chanmgt_rad_state detState = CM_RAD_UNKNOWN;
+         if(wld_secDmn_hasGlobalCtrlIface(pRad->hostapd)) {
+-            if(wld_secDmn_hasAvailableCtrlIface(pRad->hostapd)) {
++            if(rejoiningMld) {
++                SAH_TRACEZ_WARNING(ME, "%s: rejoin retained MLDs without removing active links", pRad->Name);
++                T_AccessPoint* pAP = NULL;
++                wld_rad_forEachAp(pAP, pRad) {
++                    if(wld_ap_isEnabledWithRef(pAP)) {
++                        setBitLongArray(pAP->fsm.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_ADD_LINK);
++                    }
++                }
++                setBitLongArray(pRad->fsmRad.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_ADD_LINK);
++            } else if(wld_secDmn_hasAvailableCtrlIface(pRad->hostapd)) {
+                 SAH_TRACEZ_WARNING(ME, "%s: need to remove old conf and add new one", pRad->Name);
+                 s_schedNextAction(SECDMN_ACTION_OK_NEED_RE_ADD, NULL, pRad);
+             } else {
+@@ -2280,6 +2404,13 @@
+     ASSERTI_TRUE(wifiGen_hapd_isRunning(pRad), true, ME, "%s: hostapd stopped", pRad->Name);
+     ASSERTI_TRUE(wld_secDmn_hasGlobalCtrlIface(pRad->hostapd), true, ME, "%s: hapd has no available global socket", pRad->Name);
+     ASSERTI_TRUE(wld_rad_isMloCapable(pRad), true, ME, "%s: not mlo capable", pRad->Name);
++    if(isBitSetLongArray(pRad->fsmRad.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_START_HOSTAPD) &&
++       s_isStoppedMloRadioRejoining(pRad) && s_isStoppedMloLinkRejoining(pAP)) {
++        /* START/ADD applies this link's config. STATUS on its retained
++         * socket could instead cause REMOVE of the last surviving link. */
++        SAH_TRACEZ_WARNING(ME, "%s: missing link will rejoin at hostapd start; preserve its MLD", pAP->alias);
++        return true;
++    }
+     /* Numeric MLDUnit is not a hostapd configuration key. For a moving
+      * anchor, interface/mld_ap/address can all compare equal even though
+      * other runtime links now belong to a different WLD MLD. */
+--- a/src/Plugin/wifiGen_mld.c
++++ b/src/Plugin/wifiGen_mld.c
+@@ -68,9 +68,11 @@
+ #include "wld/wld_wpaCtrl_api.h"
+ #include "wld/wld_wpaCtrlMngr.h"
+ #include "wld/wld_nl80211_api.h"
++#include "wld/wld_ap_nl80211.h"
+ #include "wld/wld_hostapd_ap_api.h"
+ #include "wld/Utils/wld_autoCommitMgr.h"
+ #include "wifiGen_hapd.h"
++#include "wifiGen_mld.h"
+ 
+ #define ME "genMld"
+ 
+@@ -254,9 +256,69 @@
+     return pPrimLink;
+ }
+ 
++/* A removed primary can still name the kernel MLD netdev while a sibling
++ * carries its remaining link. Identify that netdev by a live enabled link,
++ * not by cached link IDs or a control socket that may now serve the sibling.
++ * A migration must continue through its own teardown/rebuild path. */
++bool wifiGen_mld_getRunningApMldInfo(T_SSID* pSSID, wld_nl80211_ifaceInfo_t* pInfo) {
++    ASSERTS_NOT_NULL(pSSID, false, ME, "NULL");
++    ASSERTS_NOT_NULL(pSSID->pMldLink, false, ME, "NULL");
++    ASSERTS_NOT_NULL(pInfo, false, ME, "NULL");
++    wld_mld_t* pMld = pSSID->pMldLink->pMld;
++    if((pMld == NULL) || (pSSID->mldUnit != pMld->unit) ||
++       pMld->hostapdRebuildPending ||
++       (pMld->pPendingMovedLink != NULL)) {
++        return false;
++    }
++    wld_mldLink_t* pLink = NULL;
++    wld_for_eachNeighMldLink(pLink, pSSID->pMldLink) {
++        T_SSID* pPeerSSID = wld_mld_getLinkSsid(pLink);
++        T_AccessPoint* pPeer = (pPeerSSID != NULL) ? pPeerSSID->AP_HOOK : NULL;
++        if((pPeer == NULL) || (pPeer->pRadio == NULL) ||
++           (pPeerSSID->mldUnit != pMld->unit) || !wld_ap_isEnabledWithRef(pPeer)) {
++            continue;
++        }
++        wld_nl80211_ifaceInfo_t info;
++        memset(&info, 0, sizeof(info));
++        if(!swl_rc_isOk(wld_ap_nl80211_getInterfaceInfo(pPeer, &info)) || !info.isAp) {
++            continue;
++        }
++        T_SSID* pAnchor = wld_ssid_getSsidByIfName(info.name);
++        if((pAnchor == NULL) || (pAnchor->AP_HOOK == NULL) ||
++           (pAnchor->pMldLink == NULL) || (pAnchor->pMldLink->pMld != pMld) ||
++           (pAnchor->mldUnit != pMld->unit)) {
++            continue;
++        }
++        const wld_nl80211_ifaceMloLinkInfo_t* pPeerInfo =
++            wld_nl80211_fetchIfaceMloLinkByFreqBand(&info, pPeer->pRadio->operatingFrequencyBand);
++        if((pPeerInfo == NULL) || (pPeerInfo->link.linkId < 0) ||
++           (pPeerInfo->chanSpec.ctrlFreq == 0) ||
++           !swl_typeMacBin_equals(pPeerInfo->link.linkMac, *wld_ssid_getLinkMac(pPeerSSID))) {
++            continue;
++        }
++        /* A full process/radio-config start can recreate this MLD without
++         * ADD_LINK, which used to be the only path clearing hostapdRemoved.
++         * A matching live kernel link supersedes that historical marker.
++         * Do not clear it on lookup failure or during a pending migration. */
++        if(pMld->hostapdRemoved) {
++            SAH_TRACEZ_WARNING(ME, "%s: MLD unit %d is live on %s; clear stale removal state",
++                               pSSID->Name, pMld->unit, info.name);
++            pMld->hostapdRemoved = false;
++        }
++        *pInfo = info;
++        return true;
++    }
++    return false;
++}
++
+ static T_SSID* s_getRunningMldAnchorSSID(T_SSID* pSSID) {
+     ASSERTS_NOT_NULL(pSSID, NULL, ME, "NULL");
+     ASSERTS_NOT_NULL(pSSID->pMldLink, NULL, ME, "NULL");
++
++    wld_nl80211_ifaceInfo_t info;
++    if(wifiGen_mld_getRunningApMldInfo(pSSID, &info)) {
++        return wld_ssid_getSsidByIfName(info.name);
++    }
+ 
+     wld_mldLink_t* pLink = NULL;
+     wld_for_eachNeighMldLink(pLink, pSSID->pMldLink) {
+--- a/src/Plugin/wifiGen_vap.c
++++ b/src/Plugin/wifiGen_vap.c
+@@ -150,15 +150,15 @@
+         SAH_TRACEZ_INFO(ME, "VAP:%s State:%d-->%d - Set:%d", pAP->alias, pAP->enable, enable, set);
+         if(set & DIRECT) {
+             /*
+-             * we need to disable passive bss net ifaces (except the radio interface),
+-             * that were implicitly enabled by hostapd startup
+-             * (although not broadcasting)
++             * Disable passive BSS netdevs after hostapd has removed their
++             * links. A secondary VAP can own the shared MLD netdev too:
++             * lowering it during state sync would stop every sibling before
++             * the FSM sends LINK_REMOVE. Keep it up while links are enabled
++             * or still active, including a pending last-link removal.
+              */
+             if((enable) ||
+-               (pAP->index != pAP->pRadio->index) ||
+-               (pAP->pRadio->isSTA && pAP->pRadio->isSTASup) ||
+-               (!pAP->pRadio->enable) ||
+-               (wld_mld_countNeighEnabledLinks(pAP->pSSID->pMldLink) == 0)) {
++               ((wld_mld_countNeighEnabledLinks(pAP->pSSID->pMldLink) == 0) &&
++                (wld_mld_countNeighActiveLinks(pAP->pSSID->pMldLink) == 0))) {
+                 wld_linuxIfUtils_setState(wld_rad_getSocket(pAP->pRadio), pAP->alias, enable);
+             }
+             return s_getVapEnable(pAP);
