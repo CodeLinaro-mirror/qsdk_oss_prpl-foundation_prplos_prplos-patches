@@ -1,0 +1,129 @@
+From: Kartheek E <karte@qti.qualcomm.com>
+Subject: [PATCH] pwhm: fix MLD link not rejoining after Disable11ax/Disable11be/Disable11bn restore
+
+Restoring a link (Disable11ax=0 / Disable11be=0) after it had
+been disabled never brought the link back into its AP MLD at the driver
+level, even though the datamodel (SSID.MLDUnit) and the generated hostapd
+config were both correctly restored.
+
+Signed-off-by: Kartheek E <karte@qti.qualcomm.com>
+---
+ include/wld/wld.h                |  4 ++
+ src/Plugin/wifiGen_fsm.c         | 13 +++++++++--
+ src/Plugin/wifiGen_mld.c         | 16 ++++++++++++
+ src/nl80211/wld_hostapd_ap_api.c | 14 +++++++++++--
+ src/wld_accesspoint.c            |  6 +++++
+ 5 files changed, 48 insertions(+), 5 deletions(-)
+
+--- a/include/wld/wld.h
++++ b/include/wld/wld.h
+@@ -2079,6 +2079,10 @@
+     int32_t savedMldUnit; /* Saved SSID.mldUnit before LegacyMode=true; -1 means no saved value */
+     int32_t savedMldUnit11be; /* Saved SSID.mldUnit before Disable11be=true; -1 means no saved value */
+     int32_t savedMldUnit11ax; /* Saved SSID.mldUnit before Disable11ax=true; -1 means no saved value */
++    bool reclaimMldPrimaryOnRestore; /* set when a link that IS the current MLD primary is
++                                       disabled (Disable11ax/Disable11be/Disable11bn); consumed
++                                       by s_promotePrimaryLinkForReconfig() to hand the primary
++                                       role back when the link rejoins */
+     bool disable11ax;  /* disable_11ax=1 in hostapd BSS config */
+     bool disable11bn;  /* disable_11bn=1 in hostapd BSS config */
+     bool disable11be;  /* disable_11be=1 in hostapd BSS config */
+--- a/src/Plugin/wifiGen_fsm.c
++++ b/src/Plugin/wifiGen_fsm.c
+@@ -1396,9 +1396,16 @@
+ 
+     uint32_t nLinks = 0;
+     bool isRemoveLinkSupported = s_isLinkRemoveSupported(pRad);
+-    if(!swl_rc_isOk(wld_ap_hostapd_getNumMldLinks(pAP, &nLinks))) {
+-        pRad->fsmRad.timeout_msec = 500;
+-        return false;
++    /* wpaCtrl readiness is already asserted above: a failed/absent "num_links"
++     * STATUS reply here means this BSS is not currently running as a live
++     * multi-link group (hostapd only reports num_links for an active MLD),
++     * not a transient communication error. Treat it as 0 links instead of
++     * retrying forever on a condition that will never change on its own. */
++    swl_rc_ne nLinksRc = wld_ap_hostapd_getNumMldLinks(pAP, &nLinks);
++    if(!swl_rc_isOk(nLinksRc)) {
++        SAH_TRACEZ_WARNING(ME, "%s: getNumMldLinks unavailable (rc=%d), assuming not multi-link",
++                           pAP->alias, nLinksRc);
++        nLinks = 0;
+     }
+     bool isMultiLink = (nLinks >= 2);
+     /* Runtime membership wins over the destination WLD group's link count. */
+--- a/src/Plugin/wifiGen_mld.c
++++ b/src/Plugin/wifiGen_mld.c
+@@ -343,6 +343,22 @@
+     wld_mld_t* pMld = pLink->pMld;
+     ASSERTS_NOT_NULL(pMld, , ME, "NULL MLD");
+     wld_mldLink_t* pCurPrimLink = wld_mld_getPrimaryLink(pLink);
++
++    /* A link that is rejoining after having itself been the MLD primary
++     * before its own LegacyMode/Disable11ax/Disable11be toggle should
++     * reclaim that role, instead of permanently ceding it to whichever
++     * sibling got promoted while it was out. */
++    T_AccessPoint* pReconfigAP = pSSID->AP_HOOK;
++    if((pReconfigAP != NULL) && pReconfigAP->reclaimMldPrimaryOnRestore) {
++        pReconfigAP->reclaimMldPrimaryOnRestore = false;
++        if((pLink != pCurPrimLink) && s_isRemainingActiveLink(pLink, pMld) &&
++           swl_rc_isOk(wld_mld_setPrimaryLink(pLink))) {
++            SAH_TRACEZ_INFO(ME, "SSID %s reclaims MLD primary link on restore",
++                            pSSID->Name);
++        }
++        return;
++    }
++
+     /* MLDUnit is updated before the old group's UPDATE event. The moving
+      * link can still be enabled and active here; it is no longer a candidate
+      * for the old group's primary, regardless of its runtime link ID. */
+--- a/src/nl80211/wld_hostapd_ap_api.c
++++ b/src/nl80211/wld_hostapd_ap_api.c
+@@ -1753,8 +1753,18 @@
+         ASSERT_TRUE(swl_rc_isOk(rc) && !swl_str_isEmpty(runIface), SWL_RC_ERROR,
+                     ME, "%s: cannot identify runtime BSS for removal", pAP->alias);
+         rc = wld_ap_hostapd_getMldLinkId(pAP, &linkId);
+-        ASSERT_TRUE(swl_rc_isOk(rc) || (pAP->pSSID == NULL) || (pAP->pSSID->pMldLink == NULL),
+-                    SWL_RC_ERROR, ME, "%s: cannot identify runtime MLD link for removal", pAP->alias);
++        if(!swl_rc_isOk(rc)) {
++            /* STATUS has no "link_id" because the runtime BSS is no longer a
++             * live multi-link group (hostapd only reports link_id for an
++             * active MLD member), even though WLD may still model this AP's
++             * SSID as part of an MLD while the link is being detached/
++             * rejoined. getMldLinkId() already defaulted linkId to
++             * NO_LINK_ID in that case: remove the plain standalone BSS
++             * instead of failing forever on a condition that never changes. */
++            SAH_TRACEZ_WARNING(ME, "%s: no runtime MLD link_id (rc=%d), removing as standalone BSS",
++                               pAP->alias, rc);
++            linkId = NO_LINK_ID;
++        }
+     }
+     if(linkId >= 0) {
+         rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pgIface, "OK", "REMOVE %s %d", runIface, linkId);
+--- a/src/wld_accesspoint.c
++++ b/src/wld_accesspoint.c
+@@ -1522,6 +1522,8 @@
+             return;
+         }
+         pAP->savedMldUnit = pAP->pSSID->mldUnit;
++        pAP->reclaimMldPrimaryOnRestore = (pAP->pSSID->pMldLink != NULL) &&
++            (wld_mld_getPrimaryLink(pAP->pSSID->pMldLink) == pAP->pSSID->pMldLink);
+         SAH_TRACEZ_INFO(ME, "%s: LegacyMode=1 saving mldUnit=%d, setting SSID.MLDUnit=-1",
+                         pAP->alias, pAP->savedMldUnit);
+         newMldUnit = -1;
+@@ -1599,6 +1601,8 @@
+         /* First-time disable: save current mldUnit (including -1 for SLO). */
+         int32_t curMldUnit = pAP->pSSID->mldUnit;
+         pAP->savedMldUnit11be = curMldUnit;
++        pAP->reclaimMldPrimaryOnRestore = (pAP->pSSID->pMldLink != NULL) &&
++            (wld_mld_getPrimaryLink(pAP->pSSID->pMldLink) == pAP->pSSID->pMldLink);
+         SAH_TRACEZ_INFO(ME, "%s: Disable11be=1 saving mldUnit=%d to SavedMLDUnit11be",
+                         pAP->alias, curMldUnit);
+         amxd_trans_t apTrans;
+@@ -1699,6 +1703,8 @@
+         }
+         int32_t curMldUnit = pAP->pSSID->mldUnit;
+         pAP->savedMldUnit11ax = curMldUnit;
++        pAP->reclaimMldPrimaryOnRestore = (pAP->pSSID->pMldLink != NULL) &&
++            (wld_mld_getPrimaryLink(pAP->pSSID->pMldLink) == pAP->pSSID->pMldLink);
+         SAH_TRACEZ_INFO(ME, "%s: Disable11ax=1 saving mldUnit=%d to SavedMLDUnit11ax",
+                         pAP->alias, curMldUnit);
+         amxd_trans_t apTrans;
