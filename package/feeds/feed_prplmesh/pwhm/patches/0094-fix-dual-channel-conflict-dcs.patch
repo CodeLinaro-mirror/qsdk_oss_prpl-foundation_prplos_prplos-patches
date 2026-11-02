@@ -1,0 +1,80 @@
+From 0a8b4207176dd83b4600ff43878e255f48bd542f Mon Sep 17 00:00:00 2001
+From: Atchaya R <ratchaya@qti.qualcomm.com>
+Date: Wed, 21 Oct 2026 21:47:36 +0530
+Subject: [PATCH] pwhm: add support for dual channel conflict issue when dcs is
+ enabled on both FH and BH
+
+Signed-off-by: Atchaya R <ratchaya@qti.qualcomm.com>
+---
+ src/Plugin/wifiGen_eventHandlers.c | 15 +++++++++++++++
+ src/nl80211/wld_hostapd_cfgFile.c  | 20 ++++++++++++--------
+ 2 files changed, 27 insertions(+), 8 deletions(-)
+
+diff --git a/src/Plugin/wifiGen_eventHandlers.c b/src/Plugin/wifiGen_eventHandlers.c
+index 0833307..e51d952 100644
+--- a/src/Plugin/wifiGen_eventHandlers.c
++++ b/src/Plugin/wifiGen_eventHandlers.c
+@@ -596,6 +596,21 @@ static void s_chanSwitchStartedCb(void* userData, char* ifName _UNUSED, swl_chan
+                        swl_freqBandExt_str[chanSpec->band]);
+ 
+     if(!wld_rad_hasRunningEndpoint(pRad)) {
++        /*
++         * DCS-triggered ACS: when DCS triggers a channel change on one VAP (e.g. wlan1.2 BH AP),
++         * mac80211 requires ALL interfaces on the same radio to participate in the CSA
++         * simultaneously. If hostapd is running on this radio (multiple FH/BH AP VAPs),
++         * issue CHAN_SWITCH to all VAPs so they all participate, preventing
++         * DUAL_HOME_CHANNEL_CONFLICT when the switching VAP tries to restart on the new channel.
++         */
++        if(wld_secDmn_isEnabled(pRad->hostapd)) {
++            SAH_TRACEZ_WARNING(ME, "%s: DCS-triggered CSA (no EP): issuing CHAN_SWITCH to co-radio VAPs (ch=%d bw=%s)",
++                               pRad->Name, chanSpec->channel, swl_bandwidth_str[chanSpec->bandwidth]);
++            pRad->targetChanspec.chanspec = *chanSpec;
++            pRad->targetChanspec.reason = CHAN_REASON_EP_MOVE;
++            wld_rad_hostapd_switchChannel(pRad);
++            return;
++        }
+         /*
+          * Defer to s_chanSwitchCb so the QCA vendor event (e.g. AWGN reason)
+          * can set targetChanspec.reason before the chanspec is committed.
+diff --git a/src/nl80211/wld_hostapd_cfgFile.c b/src/nl80211/wld_hostapd_cfgFile.c
+index cf2c0a3..c597a65 100644
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -2493,22 +2493,26 @@ static void s_createPerBssCfgFiles(T_Radio* pRad, wld_hostapd_config_t* config)
+     ASSERTS_NOT_NULL(config, , ME, "NULL");
+     ASSERTS_FALSE(amxc_llist_is_empty(&pRad->llAP), , ME, "No vaps");
+ 
+-    /* ACS (channel=acs_survey) is a radio-level parameter for the first BSS startup.
++    /* ACS (channel=acs_survey) and DCS-triggered channel changes are radio-level events.
+      * Per-BSS config files are used when adding secondary BSSes to an already-running
+-     * radio. Writing channel=acs_survey to per-BSS files causes each secondary BSS to
+-     * trigger ACS independently, resulting in a dual home channel conflict.
+-     * Replace acs_survey with the actual running channel so all BSSes share the same
+-     * channel that was selected by ACS. */
++     * radio. Writing a stale channel value (acs_survey or an old fixed channel after
++     * DCS-triggered ACS) to per-BSS files causes each secondary BSS to start on the
++     * wrong channel, resulting in a dual home channel conflict.
++     * Replace any stale channel value with the actual running channel so all BSSes
++     * share the same channel. */
+     if(pRad->channel > 0) {
+         swl_mapChar_t* pAcsFixMap = wld_hostapd_getConfigMap(config, NULL);
+         if(pAcsFixMap != NULL) {
+             const char* chanVal = swl_mapChar_get(pAcsFixMap, "channel");
+-            if(!swl_str_isEmpty(chanVal) && swl_str_matches(chanVal, "acs_survey")) {
++            bool isAcsSurvey = !swl_str_isEmpty(chanVal) && swl_str_matches(chanVal, "acs_survey");
++            uint32_t cfgChan = (!swl_str_isEmpty(chanVal) && !isAcsSurvey) ?
++                               (uint32_t) strtoul(chanVal, NULL, 10) : 0;
++            if(isAcsSurvey || ((cfgChan > 0) && (cfgChan != pRad->channel))) {
+                 char chanStr[16] = {0};
+                 snprintf(chanStr, sizeof(chanStr), "%u", pRad->channel);
+                 swl_mapChar_addOrSet(pAcsFixMap, "channel", chanStr);
+-                SAH_TRACEZ_INFO(ME, "%s: per-BSS config: replaced acs_survey with actual channel %u",
+-                                pRad->Name, pRad->channel);
++                SAH_TRACEZ_INFO(ME, "%s: per-BSS config: replaced '%s' with actual channel %u (DCS/ACS channel change)",
++                                pRad->Name, chanVal, pRad->channel);
+             }
+         }
+     }
+-- 
+2.34.1
+

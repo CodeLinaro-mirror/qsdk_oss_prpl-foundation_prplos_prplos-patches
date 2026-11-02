@@ -1,0 +1,170 @@
+From: Anjitha Nattayikkal <anattayi@qti.qualcomm.com>
+Subject: [PATCH] pwhm: add per-SSID SMD policy configuration
+
+Expose the SMD Policy Config TLV fields directly on
+Device.WiFi.SSID.{i}. Map each SSID's SMD policy fields to its BSS
+hostapd configuration and apply changes immediately on active radios.
+
+Signed-off-by: Anjitha Nattayikkal <anattayi@qti.qualcomm.com>
+---
+ odl/wld_ssid.odl                         | 38 +++++++++++++++++++++++
+ src/nl80211/wld_hostapd_cfgFile.c        | 35 ++++++++++++++++++++
+ src/wld_ssid.c                           | 30 +++++++++++++++++
+ 3 files changed, 103 insertions(+)
+
+diff --git a/odl/wld_ssid.odl b/odl/wld_ssid.odl
+--- a/odl/wld_ssid.odl
++++ b/odl/wld_ssid.odl
+@@ -258,6 +258,48 @@
+ 		%persistent string MACAddress{
+ 			on action validate call is_valid_macaddr;
+ 		}
++		/**
++		 * Unique MAC address identifying the SMD.
++		 */
++		%persistent string SMDMACAddress{
++			on action validate call is_valid_macaddr;
++		}
++
++		/**
++		 * The maximum number of prepared target AP MLDs.
++		 */
++		%persistent uint32 MaxPreparedAPMLDs{
++			on action validate call check_range { min = 0, max = 7 };
++		}
++
++		/**
++		 * Forward buffered downlink data during an SMD transition.
++		 */
++		%persistent bool DLDataForwarding;
++
++		/**
++		 * 0: per-SMD PTK, 1: per-AP MLD PTK.
++		 */
++		%persistent bool PtkMode;
++
++		/**
++		 * 0: per-AP MLD MAC-SAPs, 1: one MAC-SAP for the SMD.
++		 */
++		%persistent bool SMDType;
++
++		/**
++		 * Timeout between preparation response and execution request in TU.
++		 */
++		%persistent uint32 ExecutionTimeout{
++			on action validate call check_range { min = 0, max = 255 };
++		}
++
++		/**
++		 * Downlink drain time in TU.
++		 */
++		%persistent uint32 DownLinkDrainTime{
++			on action validate call check_range { min = 0, max = 65535 };
++		}
+		/**
+ 		 *  <p> The current service set identifier in use by the
+ 		 *  connection. The SSID is an identifier that is attached to
+diff --git a/src/nl80211/wld_hostapd_cfgFile.c b/src/nl80211/wld_hostapd_cfgFile.c
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -2270,5 +2270,42 @@ static void s_saveVapConfigId(T_AccessPoint* pAP, swl_mapChar_t* vapConfigMap) {
+     free(newValue);
+ }
+ 
++/* Add the SMD policy configured on this SSID to its BSS hostapd config. */
++static void s_setSmdConfig(T_AccessPoint* pAP, swl_mapChar_t* vapConfigMap) {
++    if((pAP == NULL) || (pAP->pSSID == NULL) || (pAP->pSSID->pBus == NULL)) {
++        return;
++    }
++
++    amxd_object_t* ssidObject = pAP->pSSID->pBus;
++    char* smdIdentifier =
++        amxd_object_get_cstring_t(ssidObject, "SMDMACAddress", NULL);
++    if(swl_str_isEmpty(smdIdentifier)) {
++        free(smdIdentifier);
++        return;
++    }
++
++    swl_mapCharFmt_addValInt32(vapConfigMap, "smd_ap", 1);
++    swl_mapChar_add(vapConfigMap, "smd_identifier", smdIdentifier);
++    swl_mapCharFmt_addValInt32(
++        vapConfigMap, "smd_max_peer_apmlds",
++        (int32_t) amxd_object_get_uint32_t(ssidObject, "MaxPreparedAPMLDs", NULL));
++    swl_mapCharFmt_addValInt32(
++        vapConfigMap, "smd_dl_data_fwd",
++        amxd_object_get_bool(ssidObject, "DLDataForwarding", NULL) ? 1 : 0);
++    swl_mapCharFmt_addValInt32(
++        vapConfigMap, "smd_ptk_mode",
++        amxd_object_get_bool(ssidObject, "PtkMode", NULL) ? 1 : 0);
++    swl_mapCharFmt_addValInt32(
++        vapConfigMap, "smd_type",
++        amxd_object_get_bool(ssidObject, "SMDType", NULL) ? 1 : 0);
++    swl_mapCharFmt_addValInt32(
++        vapConfigMap, "smd_timeout",
++        (int32_t) amxd_object_get_uint32_t(ssidObject, "ExecutionTimeout", NULL));
++    swl_mapCharFmt_addValInt32(
++        vapConfigMap, "smd_dl_drain_time",
++        (int32_t) amxd_object_get_uint32_t(ssidObject, "DownLinkDrainTime", NULL));
++
++    free(smdIdentifier);
++}
+ /**
+  * @brief set a vap parameters. A vap configuration could be either an interface or a bss
+@@ -2277,5 +2312,6 @@ void wld_hostapd_cfgFile_setVapConfig(T_AccessPoint* pAP, swl_mapChar_t* vapConfigMap, swl_mapChar_t* multiAPConfig) {
+     ASSERT_NOT_NULL(vapConfigMap, , ME, "NULL");
+ 
+     ASSERTS_TRUE(s_setVapCommonConfig(pAP, vapConfigMap), , ME, "%s: skipped", pAP->alias);
++    s_setSmdConfig(pAP, vapConfigMap);
+     s_setVapWpsConfig(pAP, vapConfigMap);
+     s_setVapMultiApConf(pAP, vapConfigMap, multiAPConfig);
+diff --git a/src/wld_ssid.c b/src/wld_ssid.c
+--- a/src/wld_ssid.c
++++ b/src/wld_ssid.c
+@@ -72,6 +72,8 @@
+ #include "wld_dm_trans.h"
+ #include "swl/swl_string.h"
+ #include "swl/swl_common.h"
++#include "wld_hostapd_cfgFile.h"
++#include "wld_rad_hostapd_api.h"
+ #include "swl/swl_assert.h"
+ #include "wld_apMld.h"
+ #include "Utils/wld_autoCommitMgr.h"
+@@ -1152,6 +1152,22 @@ static void s_setSSID_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_t* param _UNUSED, const amxc_var_t* const newValue) {
+     SAH_TRACEZ_OUT(ME);
+ }
+ 
++/* SMD policy changes require an immediate hostapd configuration update. */
++static void s_setSmdConfig_pwf(void* priv _UNUSED, amxd_object_t* object,
++                               amxd_param_t* param _UNUSED,
++                               const amxc_var_t* const newValue _UNUSED) {
++    T_SSID* pSSID = wld_ssid_fromObj(object);
++    ASSERT_NOT_NULL(pSSID, , ME, "INVALID");
++
++    T_AccessPoint* pAP = pSSID->AP_HOOK;
++    if((pAP != NULL) && (pAP->pRadio != NULL) && wld_rad_isActive(pAP->pRadio)) {
++        SAH_TRACEZ_INFO(ME, "%s: SMD policy changed, reload hostapd config", pSSID->Name);
++        wld_hostapd_cfgFile_createExt(pAP->pRadio);
++        if(wld_rad_hostapd_reconfigure(pAP->pRadio) < SWL_RC_OK) {
++            SAH_TRACEZ_WARNING(ME, "%s: failed to reload hostapd after SMD policy change", pSSID->Name);
++        }
++    }
++}
+ /**
+  * Write handler for MAC address settings.
+  */
+@@ -1215,5 +1241,12 @@
+ SWLA_DM_HDLRS(sSsidDmHdlrs,
+-              ARR(SWLA_DM_PARAM_HDLR("SSID", s_setSSID_pwf),
++              ARR(SWLA_DM_PARAM_HDLR("SMDMACAddress", s_setSmdConfig_pwf),
++                  SWLA_DM_PARAM_HDLR("MaxPreparedAPMLDs", s_setSmdConfig_pwf),
++                  SWLA_DM_PARAM_HDLR("DLDataForwarding", s_setSmdConfig_pwf),
++                  SWLA_DM_PARAM_HDLR("PtkMode", s_setSmdConfig_pwf),
++                  SWLA_DM_PARAM_HDLR("SMDType", s_setSmdConfig_pwf),
++                  SWLA_DM_PARAM_HDLR("ExecutionTimeout", s_setSmdConfig_pwf),
++                  SWLA_DM_PARAM_HDLR("DownLinkDrainTime", s_setSmdConfig_pwf),
++                  SWLA_DM_PARAM_HDLR("SSID", s_setSSID_pwf),
+                   SWLA_DM_PARAM_HDLR("CustomNetDevName", s_setCustomNetDevName_pwf),
+                   SWLA_DM_PARAM_HDLR("MACAddress", s_setMacAddress_pwf),
+                   SWLA_DM_PARAM_HDLR("Enable", s_setEnable_pwf)),
+--
+2.34.1
