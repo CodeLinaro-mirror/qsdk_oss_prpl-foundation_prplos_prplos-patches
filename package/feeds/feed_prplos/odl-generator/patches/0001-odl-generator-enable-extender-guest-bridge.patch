@@ -1,0 +1,49 @@
+Author: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
+Subject: [PATCH] odl-generator: add guest bridge support to the extender layout
+
+Define br-guest so the extender layout includes Bridges.Guest and the
+bridging and Wi-Fi templates can configure it. Keep the extender-specific
+wireless mapper and route interfaces configured for the guest network to
+Guest. All other interfaces retain their existing LAN mapping.
+
+Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
+
+---
+--- a/files/ap.netlayout_from_uci.sh
++++ b/files/ap.netlayout_from_uci.sh
+@@ -10,6 +10,7 @@
+ 
+ # Bridges Naming
+ brLan="br-lan"
++brGuest="br-guest"
+ 
+ netlayout_add_wan_bridged_itf()
+ {
+@@ -26,7 +27,7 @@
+ {
+ 	local itf_name=$1
+ 	local linux_itf=$2
+-	# local network=$3 only 'lan' network is supported for the extender
++	local network=$3
+ 	local operFreq=$4
+ 	local ssid=$5
+ 	local itf_alias=$(itf_name_to_alias "$itf_name")
+@@ -34,10 +35,14 @@
+ 	#first add wireless interface description
+ 	netlayout_add_itf_description "${itf_alias}" "${linux_itf}" "wireless" "${operFreq}" "${ssid}"
+ 
+-	#then if interface is part of lan or guest network add it to corresponding bridge
+-	#Currently, only lan (br-lan) bridge is supported for extender
+-	netlayout_add_itf_to_bridge "Lan" "${itf_name}" "${linux_itf}"
+-	wlan_port_idx=$((wlan_port_idx+1))
++	# Add guest interfaces to their bridge; keep all other interfaces on LAN.
++	if [ "${network}" = "guest" ]; then
++		netlayout_add_itf_to_bridge "Guest" "${itf_name}" "${linux_itf}"
++		guest_wl_idx=$((guest_wl_idx+1))
++	else
++		netlayout_add_itf_to_bridge "Lan" "${itf_name}" "${linux_itf}"
++		wlan_port_idx=$((wlan_port_idx+1))
++	fi
+ 
+ 	# if new radio add the corresponding endpoint entry
+ 	if ! echo "${op_rad_list}" | grep -q "${operFreq}"; then
