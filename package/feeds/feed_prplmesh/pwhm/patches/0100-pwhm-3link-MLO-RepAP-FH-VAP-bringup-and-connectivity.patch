@@ -1,0 +1,220 @@
+From: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+Date: Mon, 03 Nov 2026 00:00:00 +0530
+Subject: [PATCH] pwhm: fix 3-link MLO RepAP FH VAP bringup and connectivity
+
+Signed-off-by: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+---
+--- a/src/Plugin/wifiGen_fsm.c
++++ b/src/Plugin/wifiGen_fsm.c
+@@ -1735,7 +1735,27 @@
+         T_EndPoint* pEnabledEP = wld_rad_getEnabledEndpoint(pRad);
+         wld_wpaSupp_ep_getConnState(pEnabledEP, &connState);
+         if((connState == EPCS_IDLE) || (connState == EPCS_DISABLED) ||
+-           (connState == EPCS_PASSIVE)) {
++           (connState == EPCS_PASSIVE) || (connState == EPCS_DISCOVERING)) {
++            /* Also skip if any MLO neighbour EP is already CONNECTED: bSTA
++             * is still establishing remaining MLO links (link-discovery scan
++             * is active).  FH restore now would trigger AP MLD rebuild while
++             * that scan is running, causing "Match found -> deauthenticate". */
++            T_SSID* pSSID = (pEnabledEP != NULL) ? pEnabledEP->pSSID : NULL;
++            if(pSSID && pSSID->pMldLink) {
++                wld_for_eachNeighMldLink_safe(pNgLink, pSSID->pMldLink) {
++                    T_SSID* pNgSSID = wld_mld_getLinkSsid(pNgLink);
++                    if(!pNgSSID || (pNgSSID == pSSID)) {
++                        continue;
++                    }
++                    T_EndPoint* pNgEP = pNgSSID->ENDP_HOOK;
++                    if(pNgEP && (pNgEP->connectionStatus == EPCS_CONNECTED)) {
++                        SAH_TRACEZ_WARNING(ME, "%s: MLO neighbour EP %s connected; "
++                                               "skip FH restore (link-discovery scan active)",
++                                               pRad->Name, pNgEP->Name);
++                        return;
++                    }
++                }
++            }
+             SAH_TRACEZ_INFO(ME, "%s: restore fronthaul chanspec conf", pRad->Name);
+             swl_chanspec_t tgt = wld_chanmgt_getTgtChspec(pRad);
+             if(!wld_channel_is_band_usable(tgt) && (pEnabledEP != NULL)) {
+@@ -1945,19 +1965,11 @@
+     if(wld_rad_hasMloSupport(pRad) && s_checkHapdDown(pRad)) {
+         SAH_TRACEZ_WARNING(ME, "%s: MLO radio FH down before ENABLE: flushing stale MLD link state",
+                            pRad->Name);
+-        /* Send DISABLE to every AP BSS interface so all AP vdevs on this radio
+-         * release their channel contexts before ENABLE re-adds the MLD links.
+-         * Sending DISABLE to only the first interface leaves other AP BSS vdevs
+-         * (e.g. wlan2.2) active on their old channel, causing DUAL HOME
+-         * CHANNEL CONFLICT when the bSTA or the newly enabled AP tries to
+-         * use a different channel on the same radio. */
+-        T_AccessPoint* pDisableAP = NULL;
+-        wld_rad_forEachAp(pDisableAP, pRad) {
+-            if(pDisableAP && wld_wpaCtrlInterface_isReady(pDisableAP->wpaCtrlInterface)) {
+-                wld_wpaCtrl_sendCmdCheckResponseExt(pDisableAP->wpaCtrlInterface,
+-                                                    "DISABLE", "OK", 5000);
+-            }
+-        }
++        /* AP vdevs are already down (s_checkHapdDown==true guarantees CM_RAD_DOWN),
++         * so their channel contexts are already released — no DISABLE needed.
++         * Sending DISABLE to already-disabled interfaces causes ath12k to process
++         * a firmware-level vdev teardown on the same radio, which implicitly
++         * deauthenticates a connected bSTA (locally-generated reason=3 disconnect). */
+         wld_rad_resetApMldLinks(pRad);
+     }
+     wld_rad_hostapd_enable(pRad);
+@@ -1977,7 +1989,7 @@
+        wld_secDmn_isGrpMember(pRad->hostapd)) {
+         T_AccessPoint* pAP = NULL;
+         wld_rad_forEachAp(pAP, pRad) {
+-            if(pAP) {
++            if(pAP && !wld_wpaCtrlInterface_isReady(pAP->wpaCtrlInterface)) {
+                 SAH_TRACEZ_WARNING(ME, "%s: scheduling ADD_LINK for %s after FH restore ENABLE",
+                                    pRad->Name, pAP->alias);
+                 setBitLongArray(pAP->fsm.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_ADD_LINK);
+@@ -2581,6 +2593,37 @@
+      * (e.g. 5_36/80) and issue a CHAN_SWITCH while the bSTA vdev already holds
+      * ch 64 causing DUAL_HOME_CHANNEL_CONFLICT and bSTA disconnect (reason=34).
+      */
++    /*
++     * Defer FH restore until ALL MLO link EPs are connected.
++     *
++     * When bSTA connects on the first MLO link, wpa_supplicant immediately
++     * starts a link-discovery scan for the remaining links.  If we trigger
++     * FH restore at this point, s_doEnableHostapd reconstructs the AP MLD
++     * group (via wld_rad_resetApMldLinks + hostapd ENABLE), changing the
++     * MLD beacon parameters.  The concurrent scan picks up the changed
++     * parameters and wpa_supplicant issues "Match found -> deauthenticate",
++     * disconnecting the bSTA.  This loops 8+ times, causing 2-3 min delay.
++     *
++     * When all links are connected, wpa_supplicant is not scanning for
++     * additional links, so the FH restore is safe.
++     */
++    bool allMloLinksConnected = true;
++    if(pSSID->pMldLink) {
++        wld_for_eachNeighMldLink_safe(pCheckLink, pSSID->pMldLink) {
++            T_SSID* pCheckSSID = wld_mld_getLinkSsid(pCheckLink);
++            if(!pCheckSSID || (pCheckSSID == pSSID)) {
++                continue;
++            }
++            T_EndPoint* pCheckEP = pCheckSSID->ENDP_HOOK;
++            if(pCheckEP && (pCheckEP->connectionStatus != EPCS_CONNECTED)) {
++                SAH_TRACEZ_WARNING(ME, "%s: MLO link EP %s not yet connected; "
++                                       "deferring FH restore until all links up",
++                                       pRad->Name, pCheckEP->Name);
++                allMloLinksConnected = false;
++                break;
++            }
++        }
++    }
+     {
+         swl_chanspec_t epCurChspec = SWL_CHANSPEC_EMPTY;
+         wld_nl80211_chanSpecNlToSwl(&epCurChspec, &epIfInfo.chanSpec);
+@@ -2588,9 +2631,11 @@
+         swl_chanspec_t tgtChspec = wld_chanmgt_getTgtChspec(pRad);
+         if((s_checkHapdDown(pRad) || (pRad->status == RST_DORMANT)) &&
+            ((curChspec.channel == 0) || swl_typeChanspec_equals(curChspec, tgtChspec))) {
+-            SAH_TRACEZ_WARNING(ME, "%s: FH down/dormant and chanspec matches or unconfigured: triggering FH restore",
+-                               pRad->Name);
+-            pRad->pFA->mfn_wrad_setChanspec(pRad, true);
++            if(allMloLinksConnected) {
++                SAH_TRACEZ_WARNING(ME, "%s: FH down/dormant and chanspec matches or unconfigured: triggering FH restore",
++                                   pRad->Name);
++                pRad->pFA->mfn_wrad_setChanspec(pRad, true);
++            }
+         } else if((curChspec.channel != 0) &&
+                   !swl_typeChanspec_equals(curChspec, tgtChspec)) {
+             SAH_TRACEZ_WARNING(ME, "%s: bSTA connected on %s; align FH tgt chanspec from %s to avoid CSA conflict",
+@@ -2611,9 +2656,11 @@
+             swl_chanspec_t ngTgt = wld_chanmgt_getTgtChspec(pNgRad);
+             if((s_checkHapdDown(pNgRad) || (pNgRad->status == RST_DORMANT)) &&
+                ((ngCur.channel == 0) || swl_typeChanspec_equals(ngCur, ngTgt))) {
+-                SAH_TRACEZ_WARNING(ME, "%s: MLO neighbour %s FH down/dormant and chanspec matches: triggering FH restore",
+-                                   pRad->Name, pNgRad->Name);
+-                pNgRad->pFA->mfn_wrad_setChanspec(pNgRad, true);
++                if(allMloLinksConnected) {
++                    SAH_TRACEZ_WARNING(ME, "%s: MLO neighbour %s FH down/dormant and chanspec matches: triggering FH restore",
++                                       pRad->Name, pNgRad->Name);
++                    pNgRad->pFA->mfn_wrad_setChanspec(pNgRad, true);
++                }
+                 continue;
+             }
+             if((ngCur.channel != 0) &&
+--- a/src/Plugin/wifiGen_eventHandlers.c
++++ b/src/Plugin/wifiGen_eventHandlers.c
+@@ -2710,34 +2710,58 @@
+     if((pEP->connectionStatus != EPCS_CONNECTED) && (pEP->connectionStatus != EPCS_WPS_PAIRING)) {
+         T_Radio* pRad = pEP->pRadio;
+         ASSERT_NOT_NULL(pRad, , ME, "NULL");
+-        chanmgt_rad_state radState = CM_RAD_UNKNOWN;
+-        if(wifiGen_hapd_isAlive(pRad) &&
+-           (wifiGen_hapd_getRadState(pRad, &radState) == SWL_RC_OK) &&
+-           (radState != CM_RAD_DOWN) && (radState != CM_RAD_UNKNOWN)) {
+-            SAH_TRACEZ_WARNING(ME, "%s: pre-disabling own FH on scan start to free channel for MLD link add",
+-                               pEP->Name);
+-            wld_rad_hostapd_disable(pRad);
+-            wld_rad_resetApMldLinks(pRad);
+-        }
+         T_SSID* pSSID = pEP->pSSID;
++        /* Skip FH pre-disable if any MLO neighbour EP is already CONNECTED.
++         * In that case bSTA has an active backhaul link and this scan is an
++         * MLD link-discovery scan (looking for remaining link BSSes), not a
++         * fresh connection attempt.  s_syncOnEpStartConn disables FH at the
++         * right time when the actual MLD association starts on this link. */
++        bool anyNgConnected = false;
+         if(pSSID && pSSID->pMldLink) {
+             wld_for_eachNeighMldLink_safe(pNgLink, pSSID->pMldLink) {
+                 T_SSID* pNgSSID = wld_mld_getLinkSsid(pNgLink);
+                 if(!pNgSSID || (pNgSSID == pSSID)) {
+                     continue;
+                 }
+-                T_Radio* pNgRad = pNgSSID->RADIO_PARENT;
+-                if(!pNgRad || (pNgRad == pRad)) {
+-                    continue;
++                T_EndPoint* pNgEP = pNgSSID->ENDP_HOOK;
++                if(pNgEP && (pNgEP->connectionStatus == EPCS_CONNECTED)) {
++                    SAH_TRACEZ_WARNING(ME, "%s: MLO neighbour EP %s already connected; "
++                                           "skip FH pre-disable (MLD link-discovery scan)",
++                                           pEP->Name, pNgEP->Name);
++                    anyNgConnected = true;
++                    break;
+                 }
+-                chanmgt_rad_state ngRadState = CM_RAD_UNKNOWN;
+-                if(wifiGen_hapd_isAlive(pNgRad) &&
+-                   (wifiGen_hapd_getRadState(pNgRad, &ngRadState) == SWL_RC_OK) &&
+-                   (ngRadState != CM_RAD_DOWN) && (ngRadState != CM_RAD_UNKNOWN)) {
+-                    SAH_TRACEZ_WARNING(ME, "%s: pre-disabling MLO neighbour FH %s on scan start",
+-                                       pEP->Name, pNgRad->Name);
+-                    wld_rad_hostapd_disable(pNgRad);
+-                    wld_rad_resetApMldLinks(pNgRad);
++            }
++        }
++        if(!anyNgConnected) {
++            chanmgt_rad_state radState = CM_RAD_UNKNOWN;
++            if(wifiGen_hapd_isAlive(pRad) &&
++               (wifiGen_hapd_getRadState(pRad, &radState) == SWL_RC_OK) &&
++               (radState != CM_RAD_DOWN) && (radState != CM_RAD_UNKNOWN)) {
++                SAH_TRACEZ_WARNING(ME, "%s: pre-disabling own FH on scan start to free channel for MLD link add",
++                                   pEP->Name);
++                wld_rad_hostapd_disable(pRad);
++                wld_rad_resetApMldLinks(pRad);
++            }
++            if(pSSID && pSSID->pMldLink) {
++                wld_for_eachNeighMldLink_safe(pNgLink, pSSID->pMldLink) {
++                    T_SSID* pNgSSID = wld_mld_getLinkSsid(pNgLink);
++                    if(!pNgSSID || (pNgSSID == pSSID)) {
++                        continue;
++                    }
++                    T_Radio* pNgRad = pNgSSID->RADIO_PARENT;
++                    if(!pNgRad || (pNgRad == pRad)) {
++                        continue;
++                    }
++                    chanmgt_rad_state ngRadState = CM_RAD_UNKNOWN;
++                    if(wifiGen_hapd_isAlive(pNgRad) &&
++                       (wifiGen_hapd_getRadState(pNgRad, &ngRadState) == SWL_RC_OK) &&
++                       (ngRadState != CM_RAD_DOWN) && (ngRadState != CM_RAD_UNKNOWN)) {
++                        SAH_TRACEZ_WARNING(ME, "%s: pre-disabling MLO neighbour FH %s on scan start",
++                                           pEP->Name, pNgRad->Name);
++                        wld_rad_hostapd_disable(pNgRad);
++                        wld_rad_resetApMldLinks(pNgRad);
++                    }
+                 }
+             }
+         }
