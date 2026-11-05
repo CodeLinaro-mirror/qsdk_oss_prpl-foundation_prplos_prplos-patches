@@ -1,0 +1,40 @@
+From: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
+Subject: [PATCH] pwhm: reset 6 GHz secondary offset before channel re-enable
+
+After repeater onboarding moves 6 GHz from channel 37 to channel 1,
+DISABLE/ENABLE reuses hostapd's secondary_channel=-1. The channel SET
+does not clear it, and hostapd derives a new 6 GHz offset only when the
+existing value is zero. ENABLE consequently rejects secondary frequency
+5935 MHz and the FH/BH AP links fail to return.
+
+Before enabling a disabled 6 GHz radio, send an empty ht_capab SET on
+the same control interface to clear the retained offset. Hostapd then derives it
+from the updated channel and operating class on ENABLE. 6 GHz does not
+use HT capabilities; HE/EHT bandwidth settings remain unchanged.
+
+Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
+
+--- a/src/nl80211/wld_rad_hostapd_api.c
++++ b/src/nl80211/wld_rad_hostapd_api.c
+@@ -455,6 +455,21 @@
+     wld_wpaCtrlMngr_t* pMgr = wld_secDmn_getWpaCtrlMgr(pR->hostapd);
+     wld_wpaCtrlInterface_t* pIface = wld_wpaCtrlMngr_getDefaultInterface(pMgr);
+     ASSERT_NOT_NULL(pIface, SWL_RC_ERROR, ME, "%s: hostapd has no wpactrl iface ready", pR->Name);
++    if(wld_rad_is_6ghz(pR)) {
++        char state[32] = {0};
++        if(swl_rc_isOk(wld_wpaCtrl_getSyncCmdParamVal(pIface, "STATUS", "state", state, sizeof(state))) &&
++           swl_str_matches(state, "DISABLED")) {
++            /* DISABLE retains the old secondary offset (e.g. -1 on channel 37).
++             * 6 GHz omits HT capabilities, so SET channel alone cannot reset it.
++             * An empty ht_capab lets ENABLE derive the offset from the new
++             * channel/op_class without changing HE/EHT width or requiring a
++             * restart. The trailing space encodes the empty SET value.
++             * Do not clear the offset of an already active/starting interface. */
++            bool reset = wld_wpaCtrl_sendCmdCheckResponseExt(pIface, "SET ht_capab ", "OK", 5000);
++            ASSERTS_TRUE(reset, SWL_RC_ERROR, ME, "%s: resetting 6GHz secondary channel failed",
++                         wld_wpaCtrlInterface_getName(pIface));
++        }
++    }
+     bool ret = wld_wpaCtrl_sendCmdCheckResponseExt(pIface, "ENABLE", "OK", 5000);
+     ASSERTS_TRUE(ret, SWL_RC_ERROR, ME, "%s: enabling failed", wld_wpaCtrlInterface_getName(pIface));
+     return SWL_RC_OK;
