@@ -1,0 +1,367 @@
+From: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
+Subject: [PATCH] pwhm: apply MLDUnit changes using verified runtime links
+
+Resolve links by MAC, band and interface type instead of trusting cached
+primary interfaces or reused link IDs. Continue past AP/VLAN mirrors when
+finding the running AP. Track unapplied numeric membership changes even
+when the corresponding hostapd configuration fields compare equal.
+
+Suppress startup broadcast deauthentication when ADD joins a live source
+or destination MLD, then restore the original per-BSS policy after verifying
+the added link. Bound restore retries without tearing down a working link.
+
+Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
+
+--- a/include/wld/wld.h
++++ b/include/wld/wld.h
+@@ -2085,6 +2085,8 @@
+     bool qbssEnable;                /* QBSS Load feature enable flag */
+     uint32_t bssLoadUpdatePeriod;   /* BSS Load Update Period in TUs (only used when qbssEnable=true) */
+     uint32_t chanUtilAvgPeriod;     /* Channel Utilization Averaging Period in TUs (only used when qbssEnable=true) */
++    bool mloAddDeauthPending;       /* Restore temporary broadcast_deauth override after BSS ADD */
++    bool mloAddDeauthValue;         /* Original broadcast_deauth policy (hostapd defaults to true) */
+ };
+ 
+ typedef struct SWL_PACKED {
+--- a/include/wld/wld_hostapd_ap_api.h
++++ b/include/wld/wld_hostapd_ap_api.h
+@@ -213,6 +213,7 @@
+  * @note Uses the ADD bss_config=<phy>:<config_file> hostapd command
+  */
+ swl_rc_ne wld_ap_hostapd_addBssConf(T_AccessPoint* pAP);
++swl_rc_ne wld_ap_hostapd_restoreMloAddDeauth(T_AccessPoint* pAP);
+ 
+ /**
+  * @brief Remove a BSS from a running hostapd instance
+--- a/src/Plugin/wifiGen_fsm.c
++++ b/src/Plugin/wifiGen_fsm.c
+@@ -1107,12 +1107,39 @@
+             }
+         }
+     }
++    /* Consume the old owner's numeric-unit marker after the link was
++     * applied. An anchor rebuild keeps its marker until its own primary
++     * is restored; that recovery ordering remains authoritative. */
++    T_Radio* pOldRad = NULL;
++    wld_for_eachRad(pOldRad) {
++        T_AccessPoint* pOldAP = NULL;
++        wld_rad_forEachAp(pOldAP, pOldRad) {
++            wld_mld_t* pOldMld = ((pOldAP->pSSID != NULL) && (pOldAP->pSSID->pMldLink != NULL)) ?
++                pOldAP->pSSID->pMldLink->pMld : NULL;
++            if((pOldMld != NULL) && (pOldMld->pPendingMovedLink == pAP->pSSID) &&
++               !pOldMld->hostapdRebuildPending && !pOldMld->hostapdRemoved) {
++                pOldMld->pPendingMovedLink = NULL;
++            }
++        }
++    }
+     if(existingLinkId < 0) {
+         s_syncMultiApDepsOnBhAdd(pAP, pRad);
+     }
+     wld_wpaCtrlMngr_checkAllIfaces(wld_secDmn_getWpaCtrlMgr(pRad->hostapd));
+     setBitLongArray(pRad->fsmRad.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_SYNC_STATE);
+     wld_vap_updateState(pAP);
++    if(!swl_rc_isOk(wld_ap_hostapd_restoreMloAddDeauth(pAP))) {
++        if(++pAP->fsm.retryCount < 5) {
++            pRad->fsmRad.timeout_msec = 500;
++            return false;
++        }
++        /* The link is already up. A failed policy SET must not hold the
++         * shared FSM lock indefinitely or tear down a working MLD. Keep
++         * the pending flag for a later ADD attempt and report the failure. */
++        SAH_TRACEZ_ERROR(ME, "%s: ADD completed but deauth policy restore failed; releasing commit", pAP->alias);
++        pAP->fsm.FSM_Error = 1;
++    }
++    pAP->fsm.retryCount = 0;
+     pRad->fsmRad.timeout_msec = 100;
+     return true;
+ }
+@@ -2229,6 +2256,25 @@
+     return false;
+ }
+ 
++static bool s_hasPendingMldUnitChange(T_AccessPoint* pAP) {
++    if((pAP->pSSID == NULL) || !wld_wpaCtrlInterface_isReady(pAP->wpaCtrlInterface)) {
++        return false;
++    }
++    T_Radio* pRad = NULL;
++    wld_for_eachRad(pRad) {
++        T_AccessPoint* pOther = NULL;
++        wld_rad_forEachAp(pOther, pRad) {
++            wld_mld_t* pMld = ((pOther->pSSID != NULL) && (pOther->pSSID->pMldLink != NULL)) ?
++                pOther->pSSID->pMldLink->pMld : NULL;
++            if((pMld != NULL) && (pMld->pPendingMovedLink == pAP->pSSID) &&
++               (pMld->unit != pAP->pSSID->mldUnit)) {
++                return true;
++            }
++        }
++    }
++    return false;
++}
++
+ static bool s_doSetApMld(T_AccessPoint* pAP, T_Radio* pRad) {
+     ASSERTS_NOT_NULL(pAP, true, ME, "NULL");
+     ASSERTI_TRUE(wifiGen_hapd_isRunning(pRad), true, ME, "%s: hostapd stopped", pRad->Name);
+@@ -2237,7 +2283,10 @@
+     /* Numeric MLDUnit is not a hostapd configuration key. For a moving
+      * anchor, interface/mld_ap/address can all compare equal even though
+      * other runtime links now belong to a different WLD MLD. */
+-    if(s_hasMovedMloAnchor(pAP)) {
++    if(s_hasMovedMloAnchor(pAP) || s_hasPendingMldUnitChange(pAP)) {
++        /* MLDUnit is not a hostapd key. A secondary link can compare equal
++         * after its destination anchor moved first, while its old owner
++         * still records an unapplied numeric membership change. */
+         s_schedNextAction(SECDMN_ACTION_OK_NEED_RE_ADD_LINK, pAP, pRad);
+         return true;
+     }
+--- a/src/nl80211/wld_hostapd_ap_api.c
++++ b/src/nl80211/wld_hostapd_ap_api.c
+@@ -1717,6 +1717,116 @@
+     return SWL_RC_OK;
+ }
+ 
++static bool s_isLiveMbssidMloLink(T_AccessPoint* pAP);
++
++/* Match the destination in the ADD file to a verified live partner. WLD
++ * ownership may already have changed, so configured membership alone is
++ * insufficient. Cold starts and whole-MLD rebuilds retain normal cleanup. */
++static bool s_hasLiveMloAddPartner(T_AccessPoint* pAP, const char* iface) {
++    T_SSID* pSSID = pAP->pSSID;
++    if((pSSID == NULL) || (pSSID->pMldLink == NULL) || swl_str_isEmpty(iface)) {
++        return false;
++    }
++    wld_mld_t* pMld = pSSID->pMldLink->pMld;
++    if(pMld == NULL) {
++        return false;
++    }
++    wld_mldLink_t* pLink = NULL;
++    wld_for_eachNeighMldLink(pLink, pSSID->pMldLink) {
++        T_SSID* pPeerSSID = wld_mld_getLinkSsid(pLink);
++        T_AccessPoint* pPeer = (pPeerSSID != NULL) ? pPeerSSID->AP_HOOK : NULL;
++        char runIface[128] = {0};
++        if(!pMld->hostapdRemoved && !pMld->hostapdRebuildPending &&
++           (pPeer != NULL) && (pPeer != pAP) && (pPeerSSID->mldUnit == pSSID->mldUnit) &&
++           wld_ap_isEnabledWithRef(pPeer) && s_isLiveMbssidMloLink(pPeer) &&
++           swl_rc_isOk(wld_ap_hostapd_getRunIface(pPeer, runIface, sizeof(runIface))) &&
++           swl_str_matches(runIface, iface)) {
++            return true;
++        }
++    }
++    /* A move into a new one-link MLD can still have clients on the source
++     * MLD. Its pending-move marker survives until ADD completes. Avoid a
++     * broadcast from the reused link BSSID in this direction as well. */
++    T_Radio* pRad = NULL;
++    wld_for_eachRad(pRad) {
++        T_AccessPoint* pPeer = NULL;
++        wld_rad_forEachAp(pPeer, pRad) {
++            T_SSID* pPeerSSID = pPeer->pSSID;
++            wld_mld_t* pOld = ((pPeerSSID != NULL) && (pPeerSSID->pMldLink != NULL)) ?
++                pPeerSSID->pMldLink->pMld : NULL;
++            if((pPeer != pAP) && (pOld != NULL) && (pOld != pMld) &&
++               (pOld->pPendingMovedLink == pSSID) && (pOld->unit == pPeerSSID->mldUnit) &&
++               !pOld->hostapdRemoved && !pOld->hostapdRebuildPending &&
++               wld_ap_isEnabledWithRef(pPeer) && s_isLiveMbssidMloLink(pPeer)) {
++                return true;
++            }
++        }
++    }
++    return false;
++}
++
++/* Override only the final parameter of the generated single-BSS file. Do
++ * not parse/re-serialize credentials: their quoting and escapes must remain
++ * byte-for-byte unchanged. Remove only our exact suffix during recovery. */
++static bool s_quietMloAddConfig(const char* path, bool enable) {
++    const char suffix[] = "\n# pwhm temporary MLO link ADD\nbroadcast_deauth=0\n";
++    const size_t size = sizeof(suffix) - 1;
++    FILE* file = fopen(path, "r+");
++    ASSERT_NOT_NULL(file, false, ME, "Cannot open ADD config");
++    bool ok = false;
++    if(fseek(file, 0, SEEK_END) != 0) {
++        goto out;
++    }
++    long end = ftell(file);
++    if(end < 0) {
++        goto out;
++    }
++    bool present = false;
++    if(end >= (long) size) {
++        char tail[sizeof(suffix)];
++        if((fseek(file, end - (long) size, SEEK_SET) != 0) || (fread(tail, 1, size, file) != size)) {
++            goto out;
++        }
++        present = (memcmp(tail, suffix, size) == 0);
++    }
++    if(enable && !present) {
++        if(fseek(file, 0, SEEK_END) != 0) {
++            goto out;
++        }
++        ok = (fwrite(suffix, 1, size, file) == size);
++        ok = (fflush(file) == 0) && ok;
++        if(!ok && (ftruncate(fileno(file), end) != 0)) {
++            SAH_TRACEZ_ERROR(ME, "Cannot undo incomplete MLO ADD config override");
++        }
++    } else {
++        ok = enable || !present || (ftruncate(fileno(file), end - (long) size) == 0);
++    }
++out:
++    ok = (fclose(file) == 0) && ok;
++    return ok;
++}
++
++/* The ADD reply can precede discovery of the new per-link control socket.
++ * Retain the override until that exact BSS is verified; the ADD FSM retries
++ * this SET without removing or adding the already running link again. */
++swl_rc_ne wld_ap_hostapd_restoreMloAddDeauth(T_AccessPoint* pAP) {
++    ASSERT_NOT_NULL(pAP, SWL_RC_INVALID_PARAM, ME, "NULL AP");
++    if(!pAP->mloAddDeauthPending) {
++        return SWL_RC_OK;
++    }
++    ASSERT_TRUE(s_isLiveMbssidMloLink(pAP), SWL_RC_INVALID_STATE, ME,
++                "%s: waiting for added link before restoring deauth policy", pAP->alias);
++    /* A retry may skip an already accepted ADD. Restore its file too. */
++    const char* path = wld_wpaCtrlInterface_getCfgFilePath(pAP->wpaCtrlInterface);
++    ASSERT_TRUE(s_quietMloAddConfig(path, false), SWL_RC_ERROR, ME,
++                "%s: failed to restore ADD file policy", pAP->alias);
++    ASSERT_TRUE(wld_ap_hostapd_setParamValue(pAP, "broadcast_deauth",
++                                           pAP->mloAddDeauthValue ? "1" : "0", "mloAddComplete"),
++                SWL_RC_ERROR, ME, "%s: failed to restore deauth policy", pAP->alias);
++    pAP->mloAddDeauthPending = false;
++    return SWL_RC_OK;
++}
++
+ swl_rc_ne wld_ap_hostapd_addBssConf(T_AccessPoint* pAP) {
+     ASSERT_NOT_NULL(pAP, SWL_RC_INVALID_PARAM, ME, "NULL pAP");
+     T_Radio* pRad = pAP->pRadio;
+@@ -1727,10 +1837,38 @@
+     const char* confFilePath = wld_wpaCtrlInterface_getCfgFilePath(pAP->wpaCtrlInterface);
+     ASSERTI_FALSE(swl_str_isEmpty(confFilePath), SWL_RC_ERROR, ME, "%s: empty config file", pAP->alias);
+ 
++    wld_hostapd_config_t* config = NULL;
++    swl_mapChar_t* vap = NULL;
++    bool quietAdd = false;
++    if((pAP->pSSID != NULL) && (pAP->pSSID->pMldLink != NULL)) {
++        ASSERT_TRUE(wld_hostapd_loadConfig(&config, (char*) confFilePath), SWL_RC_ERROR,
++                    ME, "%s: cannot read ADD configuration", pAP->alias);
++        vap = wld_hostapd_getConfigMapByBssid(config, (swl_macBin_t*) wld_ssid_getLinkMac(pAP->pSSID));
++        quietAdd = (vap != NULL) && swl_str_matches(swl_mapChar_get(vap, "mld_ap"), "1") &&
++                   s_hasLiveMloAddPartner(pAP, swl_mapChar_get(vap, "interface"));
++        if(quietAdd) {
++            const char* value = swl_mapChar_get(vap, "broadcast_deauth");
++            pAP->mloAddDeauthValue = (value == NULL) || (atoi(value) != 0);
++            if(!s_quietMloAddConfig(confFilePath, true)) {
++                wld_hostapd_deleteConfig(config);
++                return SWL_RC_ERROR;
++            }
++            pAP->mloAddDeauthPending = true;
++            SAH_TRACEZ_WARNING(ME, "%s: suppress startup broadcast deauth when joining live MLD", pAP->alias);
++        }
++    }
++
+     SAH_TRACEZ_INFO(ME, "%s: adding bss config using %s", pAP->alias, confFilePath);
+     uint32_t radioIdx = wld_rad_nl80211_getRadioIdx(pRad);
+     swl_rc_ne rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pgIface, "OK", "ADD bss_config=%s.%u:%s",
+                                                        pRad->wiphyName, radioIdx, confFilePath);
++    if(quietAdd && !s_quietMloAddConfig(confFilePath, false)) {
++        SAH_TRACEZ_ERROR(ME, "%s: failed to restore ADD config file", pAP->alias);
++        rc = SWL_RC_ERROR;
++    }
++    if(config != NULL) {
++        wld_hostapd_deleteConfig(config);
++    }
+     ASSERT_TRUE(swl_rc_isOk(rc), rc, ME, "%s: fail to add bss config", pAP->alias);
+ 
+     return rc;
+--- a/src/nl80211/wld_ssid_nl80211.c
++++ b/src/nl80211/wld_ssid_nl80211.c
+@@ -81,6 +81,51 @@
+             (pIfaceInfo->isAp && (wld_ssid_getType(pSSID) == WLD_SSID_TYPE_AP)));
+ }
+ 
++/* A configured primary can already belong to the destination of an MLDUnit
++ * move. Cached link IDs can also have been reused. Match the requested link
++ * MAC and band before accepting any kernel interface. */
++static swl_rc_ne s_matchSsidLink(T_SSID* pSSID, wld_nl80211_ifaceInfo_t* pInfo, int32_t* pLinkId) {
++    if(!s_matchSsidIfType(pSSID, pInfo)) {
++        return SWL_RC_NOT_AVAILABLE;
++    }
++    swl_macBin_t* pMac = (swl_macBin_t*) wld_ssid_getLinkMac(pSSID);
++    int32_t linkId = MLO_LINK_ID_UNKNOWN;
++    if(pInfo->nMloLinks > 0) {
++        const wld_nl80211_ifaceMloLinkInfo_t* pLink = wld_nl80211_fetchIfaceMloLinkByMac(pInfo, pMac);
++        if((pLink == NULL) || (pLink->link.linkId < 0)) {
++            return SWL_RC_NOT_AVAILABLE;
++        }
++        linkId = pLink->link.linkId;
++    }
++    return wld_nl80211_fetchIfaceLinkInfo(pInfo, pSSID->RADIO_PARENT->operatingFrequencyBand,
++                                        pMac, linkId, pLinkId);
++}
++
++static swl_rc_ne s_findSsidLink(T_SSID* pSSID, wld_nl80211_ifaceInfo_t* pInfo, int32_t* pLinkId) {
++    wld_nl80211_ifaceInfo_t* pIfaces = NULL;
++    uint32_t count = 0;
++    swl_rc_ne rc = wld_nl80211_getInterfacesList(wld_nl80211_getSharedState(), &pIfaces, 0, &count);
++    if(swl_rc_isOk(rc)) {
++        rc = SWL_RC_NOT_AVAILABLE;
++        for(uint32_t i = 0; i < count; i++) {
++            int32_t linkId = MLO_LINK_ID_UNKNOWN;
++            /* AP/VLANs mirror their parent's MAC/link table. Continue the
++             * search past them instead of rejecting the last MAC match. */
++            if(!swl_rc_isOk(s_matchSsidLink(pSSID, &pIfaces[i], &linkId))) {
++                continue;
++            }
++            *pInfo = pIfaces[i];
++            *pLinkId = linkId;
++            rc = SWL_RC_OK;
++            if(linkId >= 0) {
++                break;
++            }
++        }
++    }
++    free(pIfaces);
++    return rc;
++}
++
+ swl_rc_ne wld_ssid_nl80211_getInterfaceInfoExt(T_SSID* pSSID, wld_nl80211_ifaceInfo_t* pIfaceInfo, int32_t* pLinkId) {
+     wld_nl80211_ifaceInfo_t ifaceInfo;
+     memset(&ifaceInfo, 0, sizeof(ifaceInfo));
+@@ -93,26 +138,27 @@
+     ASSERT_NOT_NULL(pSSID, SWL_RC_INVALID_PARAM, ME, "No ssid");
+     T_Radio* pRad = pSSID->RADIO_PARENT;
+     ASSERT_NOT_NULL(pRad, SWL_RC_INVALID_STATE, ME, "No mapped radio");
+-    swl_macBin_t* pLinkMac = (swl_macBin_t*) wld_ssid_getLinkMac(pSSID);
+-
+     swl_rc_ne rc = SWL_RC_NOT_AVAILABLE;
+     if(((wld_ssid_isMLDReady(pSSID) && wld_ssid_hasValidMLDRole(pSSID)) || wld_ssid_hasValidMLDLinkID(pSSID)) &&
+        ((ifIndex = wld_ssid_nl80211_getPrimaryLinkIfIndex(pSSID)) > 0) &&
+        (wld_nl80211_getInterfaceInfo(wld_nl80211_getSharedState(), ifIndex, &ifaceInfo) >= SWL_RC_OK) &&
+        s_matchSsidIfType(pSSID, &ifaceInfo)) {
+-        /** Fetch link in primary nl80211 iface info, with linkId and relative radio's freq band */
+-        rc = wld_nl80211_fetchIfaceLinkInfo(&ifaceInfo, pRad->operatingFrequencyBand, pLinkMac, wld_ssid_getMLDLinkID(pSSID), &linkId);
+-    }
+-    if(rc == SWL_RC_NOT_AVAILABLE) {
+-        /** Search link across all nl80211 ifaces, with linkMac and relative radio's freq band */
+-        if((wld_nl80211_findIfaceByLinkMac(wld_nl80211_getSharedState(), pLinkMac, &ifaceInfo, &linkId) >= SWL_RC_OK) &&
+-           s_matchSsidIfType(pSSID, &ifaceInfo)) {
+-            rc = wld_nl80211_fetchIfaceLinkInfo(&ifaceInfo, pRad->operatingFrequencyBand, pLinkMac, linkId, &linkId);
+-        }
++        if(wld_ssid_getType(pSSID) == WLD_SSID_TYPE_EP) {
++            /* The negotiated STA link MAC/ID may not be cached yet. Resolve
++             * by band only on this endpoint's configured primary interface;
++             * keep MAC validation for APs and the global fallback search. */
++            rc = wld_nl80211_fetchIfaceLinkInfo(&ifaceInfo, pRad->operatingFrequencyBand,
++                                              wld_ssid_getLinkMac(pSSID), MLO_LINK_ID_UNKNOWN, &linkId);
++        } else {
++            rc = s_matchSsidLink(pSSID, &ifaceInfo, &linkId);
++        }
++    }
++    if(!swl_rc_isOk(rc)) {
++        rc = s_findSsidLink(pSSID, &ifaceInfo, &linkId);
+     }
+     ASSERTI_TRUE(swl_rc_isOk(rc), rc, ME, "SSID[%s] link:Id(%d)/Band(%s)/Mac(%s) not found",
+                  pSSID->Name, wld_ssid_getMLDLinkID(pSSID),
+-                 swl_freqBandExt_str[pRad->operatingFrequencyBand], swl_typeMacBin_toBuf32Ref(pLinkMac).buf);
++                 swl_freqBandExt_str[pRad->operatingFrequencyBand], swl_typeMacBin_toBuf32Ref((swl_macBin_t*) wld_ssid_getLinkMac(pSSID)).buf);
+ 
+     if(linkId >= 0) {
+         const wld_nl80211_ifaceMloLinkInfo_t* pLinkInfo = wld_nl80211_fetchIfaceMloLinkById(&ifaceInfo, linkId);
