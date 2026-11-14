@@ -1,0 +1,83 @@
+From: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+Date: Thu, 13 Nov 2026 00:00:00 +0530
+Subject: [PATCH] pwhm: remove 6GHz automatic power-mode management
+
+The automatic 6GHz power-mode management code (PowerType DM restore in
+wld_rad_hostapd_setMiscParams and SET_6GHZ_PWR_MODE in the same function,
+plus the post-channel-switch wld_rad_hostapd_set6GHzPowerMode call in
+s_saveChanChanged) causes "Power mode change in progress" to be held for
+the entire CSA countdown window (~420ms) when the parent AP changes the
+6GHz channel along with a power-mode change (e.g. VLP -> SP/LPI).
+
+During this window all CHAN_SWITCH commands to the 6GHz FH AP are
+rejected, preventing mac80211 from creating the channel-context
+reservation for wlan2.1/wlan2.2, which forces the BH STA to disconnect.
+
+Also remove the dead //return; in s_chanSwitchStartedCb same-band path
+since the return was already disabled in patch 0091.
+
+Signed-off-by: Abhi Teja Cholleti <achollet@qti.qualcomm.com>
+---
+ src/nl80211/wld_rad_hostapd_api.c  | 24 ------------------------
+ src/Plugin/wifiGen_eventHandlers.c |  4 ----
+ 2 files changed, 28 deletions(-)
+
+--- a/src/nl80211/wld_rad_hostapd_api.c
++++ b/src/nl80211/wld_rad_hostapd_api.c
+@@ -382,19 +382,6 @@
+     T_AccessPoint* primaryVap = wld_rad_hostapd_getCfgMainVap(pRad);
+     ASSERT_NOT_NULL(primaryVap, SECDMN_ACTION_ERROR, ME, "NULL");
+
+-    /* Restore the persisted DM value before generating or applying radio config. */
+-    if(wld_rad_is_6ghz(pRad) && pRad->pBus != NULL) {
+-        char* powerType = amxd_object_get_cstring_t(pRad->pBus, "PowerType", NULL);
+-        if(powerType != NULL) {
+-            pRad->PowerType =
+-                swl_conv_charToEnum(powerType,
+-                                    swl_radpwr_str,
+-                                    SWL_RADPWR_MAX,
+-                                    SWL_RADPWR_INDOOR_AP);
+-            free(powerType);
+-        }
+-    }
+-
+     swl_mapChar_t radParams;
+     swl_mapChar_init(&radParams);
+     wld_hostapd_cfgFile_setRadioConfig(pRad, &radParams);
+@@ -416,16 +403,6 @@
+         wld_ap_hostapd_setParamValue(primaryVap, miscRadParams[i], swl_mapChar_get(&radParams, (char*) miscRadParams[i]), "");
+     }
+     swl_mapChar_cleanup(&radParams);
+-    if(wld_rad_is_6ghz(pRad)) {
+-        char pwrCmd[64];
+-        snprintf(pwrCmd, sizeof(pwrCmd), "SET_6GHZ_PWR_MODE %d", (int) pRad->PowerType);
+-        amxc_llist_for_each(it6g, &pRad->llAP) {
+-            T_AccessPoint* pAP6g = amxc_llist_it_get_data(it6g, T_AccessPoint, it);
+-            if(wld_wpaCtrlInterface_isReady(pAP6g->wpaCtrlInterface)) {
+-                wld_ap_hostapd_sendCommand(pAP6g, pwrCmd, "PowerType");
+-            }
+-        }
+-    }
+
+     swl_mapChar_t vapParams;
+     swl_mapChar_init(&vapParams);
+--- a/src/Plugin/wifiGen_eventHandlers.c
++++ b/src/Plugin/wifiGen_eventHandlers.c
+@@ -536,9 +536,6 @@
+     }
+     swl_rc_ne rc = wld_chanmgt_reportCurrentChanspec(pRad, *pChanSpec, reason);
+     ASSERTS_FALSE(rc < SWL_RC_OK, , ME, "no changes to be reported");
+-    if(wld_rad_is_6ghz(pRad)) {
+-        wld_rad_hostapd_set6GHzPowerMode(pRad);
+-    }
+     wld_rad_updateOperatingClass(pRad);
+     swl_chanspec_t savedChSpec = wld_rad_hostapd_getCfgChanspec(pRad);
+     if(!swl_typeChanspecExt_equals(pRad->targetChanspec.chanspec, savedChSpec)) {
+@@ -734,7 +731,6 @@
+         if((epConnState == EPCS_CONNECTED) || (epConnState == EPCS_CONNECTING)) {
+             SAH_TRACEZ_WARNING(ME, "%s: BH EP CONNECTED/CONNECTING on same radio, with Fix no skipping CSA to ch=%d to avoid DUAL_HOME conflict",
+                                pRad->Name, chanSpec->channel);
+-            return;
+         }
+         SAH_TRACEZ_WARNING(ME, "%s: BH EP + FH VAP on same radio (ch=%d bw=%s punct=0x%x): issuing CHAN_SWITCH",
+                            pRad->Name, chanSpec->channel,
