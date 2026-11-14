@@ -182,16 +182,15 @@ Signed-off-by: Nikhil Gurram <nikhgurr@qti.qualcomm.com>
      uint32_t nLinks = 0;
      bool isRemoveLinkSupported = s_isLinkRemoveSupported(pRad);
      if(!swl_rc_isOk(wld_ap_hostapd_getNumMldLinks(pAP, &nLinks))) {
-@@ -1446,6 +1521,21 @@
+@@ -1446,6 +1521,20 @@
          return false;
      }
      bool isMultiLink = (nLinks >= 2);
-+    if(wld_rad_hasMbssidAds(pRad) && s_isLinkRemoveSupported(pRad) &&
-+       (pAP->pSSID != NULL) && (pAP->pSSID->pMldLink != NULL) &&
-+       (isMultiLink || (wld_mld_countNeighLinks(pAP->pSSID->pMldLink) > 1))) {
++    if(isMultiLink && wld_rad_hasMbssidAds(pRad) && s_isLinkRemoveSupported(pRad) &&
++       (pAP->pSSID != NULL) && (pAP->pSSID->pMldLink != NULL)) {
 +        /* Recheck even when bss[0] names another AP: it may have been demoted. */
-+        /* MLDUnit may already name a one-link destination while this BSS
-+         * remains a transmitter in the old runtime MLD. */
++        /* Require runtime multi-link, not merely a configured destination
++         * group size: a non-live BSS cannot need a transmitter handover. */
 +        if(!swl_rc_isOk(wld_ap_hostapd_prepareMloRemoval(pAP))) {
 +            return s_retryMbssidRemoval(pAP, pRad);
 +        }
