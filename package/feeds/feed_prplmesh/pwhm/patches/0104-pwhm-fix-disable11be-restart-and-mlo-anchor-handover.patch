@@ -1,0 +1,160 @@
+From: Kartheek E <karte@qti.qualcomm.com>
+Subject: [PATCH] pwhm: fix hostapd restarts and stuck MLO anchors around Disable11be/Enable toggling
+
+Fixes hostapd restarts and stuck MLO links seen when toggling
+Disable11be (and plain Enable) on APs sharing a radio with other
+MBSSID/MLD members: avoid the combined-config ADD when some VAPs are
+still loaded, fix a misplaced liveness assert blocking MLO anchor
+removal, and hand over the MBSSID transmitter role before removing a
+plain BSS that still holds it.
+
+Signed-off-by: Kartheek E <karte@qti.qualcomm.com>
+
+ include/wld/wld_hostapd_ap_api.h  |  3 +++
+ src/nl80211/wld_hostapd_ap_api.c  | 45 ++++++++++++++++++++++++++++++++++++++++++++--
+ src/nl80211/wld_rad_hostapd_api.c | 35 +++++++++++++++++++++++++++++++++++
+ src/Plugin/wifiGen_fsm.c          |  6 ++++--
+ 4 files changed, 86 insertions(+), 3 deletions(-)
+
+--- a/include/wld/wld_hostapd_ap_api.h
++++ b/include/wld/wld_hostapd_ap_api.h
+@@ -107,6 +107,9 @@
+ swl_rc_ne wld_ap_hostapd_checkMbssidRemoval(T_AccessPoint* pAP);
+ /* Hand over a dependent MBSSID transmitter before removing an MLO link. */
+ swl_rc_ne wld_ap_hostapd_prepareMloRemoval(T_AccessPoint* pAP);
++/* Hand over the MBSSID transmitter role before removing a plain BSS that
++ * currently holds it, without requiring that BSS to remain live afterward. */
++swl_rc_ne wld_ap_hostapd_handoverMbssidTxForRemoval(T_AccessPoint* pAP);
+ 
+ /**
+  * @brief reload hostapd bss config from memory
+--- a/src/nl80211/wld_hostapd_ap_api.c
++++ b/src/nl80211/wld_hostapd_ap_api.c
+@@ -2065,10 +2065,10 @@
+     T_AccessPoint* replacement = NULL;
+     for(size_t i = 0; i < count; i++) {
+         T_AccessPoint* peer = members[i];
+-        ASSERT_TRUE(s_isLiveMbssidMloLink(peer), SWL_RC_ERROR, ME, "%s: MBSSID member not live", peer->alias);
+         if((peer == pAP) || !needsHandover) {
+             continue;
+         }
++        ASSERT_TRUE(s_isLiveMbssidMloLink(peer), SWL_RC_ERROR, ME, "%s: MBSSID member not live", peer->alias);
+         ASSERT_TRUE(wld_ap_isEnabledWithRef(peer), SWL_RC_ERROR, ME,
+                     "%s: do not restart a disabled MBSSID profile", peer->alias);
+         if(replacement == NULL) {
+@@ -2099,6 +2099,49 @@
+         ASSERT_TRUE(found && s_isLiveMbssidMloLink(members[i]), SWL_RC_ERROR, ME,
+                     "%s: waiting for MBSSID member recovery", members[i]->alias);
+     }
++    return SWL_RC_OK;
++}
++
++
++
++/* Transfer the MBSSID transmitter before removing a plain (non-MLO) BSS
++ * that currently holds the TX role, so hostapd's removal cannot disrupt a
++ * live MLD sharing this radio's physical MBSSID group. Unlike
++ * wld_ap_hostapd_prepareMloRemoval(), pAP itself is not expected to stay
++ * live afterward - it is the one being removed - so neither pAP's own
++ * liveness nor its post-handover survival is required. */
++swl_rc_ne wld_ap_hostapd_handoverMbssidTxForRemoval(T_AccessPoint* pAP) {
++    ASSERT_NOT_NULL(pAP, SWL_RC_INVALID_PARAM, ME, "NULL AP");
++    ASSERT_NOT_NULL(pAP->pRadio, SWL_RC_INVALID_PARAM, ME, "NULL radio");
++    T_AccessPoint* members[32];
++    size_t count = 0;
++    T_AccessPoint* tx = NULL;
++    swl_rc_ne rc = s_getMbssidGroup(pAP, members, SWL_ARRAY_SIZE(members), &count, &tx);
++    ASSERT_TRUE(swl_rc_isOk(rc), rc, ME, "%s: unknown MBSSID membership", pAP->alias);
++    if((tx != pAP) || (count == 1)) {
++        return SWL_RC_OK;
++    }
++    T_AccessPoint* replacement = NULL;
++    for(size_t i = 0; i < count; i++) {
++        T_AccessPoint* peer = members[i];
++        if((peer == pAP) || !wld_wpaCtrlInterface_isReady(peer->wpaCtrlInterface) ||
++           !wld_ap_isEnabledWithRef(peer)) {
++            continue;
++        }
++        replacement = peer;
++        break;
++    }
++    ASSERT_NOT_NULL(replacement, SWL_RC_ERROR, ME, "%s: no replacement MBSSID transmitter", pAP->alias);
++    SAH_TRACEZ_WARNING(ME, "%s: hand over MBSSID transmitter to %s before removal",
++                       pAP->alias, replacement->alias);
++    rc = wld_wpaCtrl_sendCmdFmtCheckResponseExt(replacement->wpaCtrlInterface, 10000, "OK",
++                                               "SET_MBSSID_TX auto_stop auto_start");
++    ASSERT_TRUE(swl_rc_isOk(rc), rc, ME, "%s: MBSSID handover failed", pAP->alias);
++    T_AccessPoint* after[32];
++    size_t afterCount = 0;
++    rc = s_getMbssidGroup(replacement, after, SWL_ARRAY_SIZE(after), &afterCount, &tx);
++    ASSERT_TRUE(swl_rc_isOk(rc) && (tx == replacement) && (afterCount == count),
++                SWL_RC_ERROR, ME, "%s: MBSSID handover not confirmed", pAP->alias);
+     return SWL_RC_OK;
+ }
+ 
+--- a/src/nl80211/wld_rad_hostapd_api.c
++++ b/src/nl80211/wld_rad_hostapd_api.c
+@@ -555,6 +555,41 @@
+     wld_wpaCtrlInterface_t* pgIface = wld_secDmn_getGlobalCtrlIface(pR->hostapd);
+     ASSERT_NOT_NULL(pgIface, SWL_RC_ERROR, ME, "%s: hostapd has no global iface ready", pR->Name);
+     ASSERT_STR(pR->wiphyName, SWL_RC_ERROR, ME, "%s: Empty wPhy name", pR->Name);
++
++    /* hostapd's "ADD bss_config=" only accepts a config file describing exactly
++     * one BSS: it rejects a file enumerating several bss= blocks with
++     * "Multiple BSSes specified in BSS-config". The radio's cfgFile lists every
++     * enabled VAP on the radio; if some of them are still loaded in hostapd
++     * (eg only one VAP of an MBSSID group was actually removed), re-add just
++     * the missing ones individually via their own scoped single-BSS config
++     * instead of the combined multi-BSS file. */
++    uint32_t nEnabledVaps = 0;
++    uint32_t nMissingVaps = 0;
++    T_AccessPoint* pAP = NULL;
++    wld_rad_forEachAp(pAP, pR) {
++        if(!wld_ap_isEnabledWithRef(pAP)) {
++            continue;
++        }
++        nEnabledVaps++;
++        if(!wld_wpaCtrlInterface_checkConnectionPath(pAP->wpaCtrlInterface)) {
++            nMissingVaps++;
++        }
++    }
++    if((nEnabledVaps > 1) && (nMissingVaps < nEnabledVaps)) {
++        swl_rc_ne addRc = SWL_RC_OK;
++        wld_rad_forEachAp(pAP, pR) {
++            if(!wld_ap_isEnabledWithRef(pAP) ||
++               wld_wpaCtrlInterface_checkConnectionPath(pAP->wpaCtrlInterface)) {
++                continue;
++            }
++            swl_rc_ne apRc = wld_ap_hostapd_addBssConf(pAP);
++            if(!swl_rc_isOk(apRc)) {
++                addRc = apRc;
++            }
++        }
++        return addRc;
++    }
++
+     swl_rc_ne rc;
+     uint32_t radioIdx = wld_rad_nl80211_getRadioIdx(pR);
+     rc = wld_wpaCtrl_sendCmdFmtCheckResponse(pgIface, "OK", "ADD bss_config=%s.%u:%s",
+--- a/src/Plugin/wifiGen_fsm.c
++++ b/src/Plugin/wifiGen_fsm.c
+@@ -908,7 +908,8 @@
+         setBitLongArray(pRad->fsmRad.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_REMOVE_LINK);
+         return true;
+     }
+-    if(!enable && s_isUnsafeMbssidRemoval(pAP, pRad)) {
++    if(!enable && s_isUnsafeMbssidRemoval(pAP, pRad) &&
++       !swl_rc_isOk(wld_ap_hostapd_handoverMbssidTxForRemoval(pAP))) {
+         return s_retryMbssidRemoval(pAP, pRad);
+     }
+     pAP->fsm.retryCount = 0;
+@@ -1631,7 +1632,8 @@
+         if(!swl_rc_isOk(wld_ap_hostapd_prepareMloRemoval(pAP))) {
+             return s_retryMbssidRemoval(pAP, pRad);
+         }
+-    } else if(s_isUnsafeMbssidRemoval(pAP, pRad)) {
++    } else if(s_isUnsafeMbssidRemoval(pAP, pRad) &&
++              !swl_rc_isOk(wld_ap_hostapd_handoverMbssidTxForRemoval(pAP))) {
+         return s_retryMbssidRemoval(pAP, pRad);
+     }
+     pAP->fsm.retryCount = 0;
